@@ -1,0 +1,26 @@
+{
+  "_help_mode": "maxReserve = rata kanan, cap maxAmount, sisakan reserveCC. minmax = amount acak minAmount..maxAmount, abaikan reserve (sisain fee). maxAmount 0 = tak terbatas.",
+  "swap": {
+    "mode": "minmax",
+    "minCC": "10.1",
+    "reserveCC": "5",
+    "minAmount": "10.1",
+    "maxAmount": "10.2",
+    "maxFeeCC": 3.6,
+    "feeSpikeWaitSec": 300,
+    "maxStuckBeforeStop": 2,
+    "stuckPollSec": 300
+  },
+  "dashboard": {
+    "refreshSec": 300
+  },
+  "schedule": {
+    "hour": 7,
+    "minute": 0,
+    "timezone": "Asia/Jakarta"
+  },
+  "proxy": {
+    "enabled": true,
+    "file": "proxy.txt"
+  }
+}

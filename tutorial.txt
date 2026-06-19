@@ -1,0 +1,215 @@
+SilvanaBot · Sipal — Tutorial dari Nol
+=====================================
+
+Bot Node.js untuk auto DAY_TRADER 10/10 harian di Silvana / Supanova:
+- Login Silvana via passkey kustom (zero-touch, 24/7)
+- Login Privy + baca balance Supanova (Canton)
+- Auto-swap CC ↔ USDCx tiap pagi sampai DAY_TRADER penuh
+- Dashboard ANSI mobile-friendly + cron jadwal harian
+
+────────────────────────────────────────
+1. INSTALL
+────────────────────────────────────────
+Wajib:
+  - Node.js v18+
+  - Akun Silvana yang sudah login & KYC approved
+  - Ada saldo USDCx & CC (untuk swap, fee Amulet)
+
+Langkah:
+  cd ~/Silvana                       # folder bot
+  npm install                        # install node-cron
+  cp accounts.example.json accounts.json
+  cp config.example.json   config.json
+  cp proxy.example.txt     proxy.txt   # opsional
+
+
+────────────────────────────────────────
+2. ISI accounts.json
+────────────────────────────────────────
+Format:
+{
+  "accounts": [
+    {
+      "label":      "akun-1",
+      "email":      "you@silvana.com",     ← email akun Silvana (passkey)
+      "privyEmail": "you@privy.com"        ← optional, kalau email Privy beda
+    }
+  ]
+}
+
+Catatan:
+  - "label" bebas, untuk identifikasi di dashboard
+  - "email" = email akun Silvana (target passkey)
+  - "privyEmail" optional. Kalau Silvana & Privy/Supanova pakai email sama, hapus
+    field ini. Kalau beda (mis. Silvana via Google → Privy via email lain),
+    isi sesuai email yang ke Privy.
+
+
+────────────────────────────────────────
+3. ISI config.json (opsional, default sudah aman)
+────────────────────────────────────────
+{
+  "swap": {
+    "minCC": "10",                    ← swap acak antara minCC..maxCC tiap kali
+    "maxCC": "11"
+  },
+  "dashboard": { "refreshSec": 300 },
+  "schedule": {                       ← waktu cron harian
+    "hour": 7, "minute": 0, "timezone": "Asia/Jakarta"
+  },
+  "proxy": {
+    "enabled": true,                  ← false = direct, no proxy
+    "file": "proxy.txt"
+  }
+}
+
+
+────────────────────────────────────────
+4. ISI proxy.txt (opsional, disarankan)
+────────────────────────────────────────
+Satu URL per baris:
+  http://user:pass@host:port
+  http://user:pass@host2:port2
+
+Bot pilih proxy deterministik per akun (1 akun = 1 proxy stabil).
+Set proxy.enabled = false di config.json untuk paksa direct.
+
+
+────────────────────────────────────────
+5. SETUP PASSKEY (one-time, ~1 menit/akun)
+────────────────────────────────────────
+Bot perlu passkey kustom yang private key-nya ada di sisi kita,
+supaya bisa login Silvana sendiri tanpa Touch ID.
+
+a) Login Silvana via browser seperti biasa (Touch ID / 1Password):
+     https://app.silvana.one
+
+b) Di terminal jalankan:
+     node index.js register
+
+c) Bot mencetak 1 blok script panjang. Copy semua-nya.
+
+d) Di tab Silvana, tekan F12 → tab Console.
+   Kalau ada warning self-XSS, ketik "allow pasting" lalu Enter.
+
+e) Paste script tadi → Enter. Console akan cetak 1 baris JSON
+   (auto tersalin ke clipboard).
+
+f) Balik ke terminal yang masih nunggu input. Paste 1 baris JSON itu → Enter.
+
+g) Selesai. Bot simpan passkey & userServiceCid ke session.json
+   (jangan share file ini, berisi private key).
+
+Ulangi a-f untuk setiap akun.
+
+
+────────────────────────────────────────
+6. JALANKAN BOT
+────────────────────────────────────────
+Mode utama (dashboard + cron harian):
+  node index.js
+
+Saat start:
+  - Bot fetch balance + DAY_TRADER count semua akun (sekali)
+  - Tunggu sampai jam jadwal (default 07:00 WIB) → mulai sesi auto-swap
+  - Swap berulang sampai DAY_TRADER 10/10 → berhenti, tunggu hari berikutnya
+  - Ctrl+C untuk berhenti
+
+Sub-command lain:
+  node index.js once       # render dashboard + fetch sekali, exit (no swap)
+  node index.js swap       # PAKSA jalankan 1 sesi DAY_TRADER langsung
+  node index.js register   # setup passkey baru (one-time per akun)
+  node index.js paste      # paste JSON passkey kalau register interrupted
+  node index.js help       # lihat semua sub-command
+
+
+────────────────────────────────────────
+7. ALUR AUTO-SWAP (saat sesi aktif)
+────────────────────────────────────────
+1. Cek DAY_TRADER count dari Silvana API
+2. Hitung selisih (perlu N swap lagi)
+3. Loop sampai N tercapai:
+   a. Cek balance USDCx + harga pasar
+   b. Pilih direction:
+      - Kalau USDCx cukup untuk amountCC × ask → BUY (USDCx → CC)
+      - Kalau tidak cukup → SELL (CC → USDCx)
+      - Auto-fallback BUY → SELL kalau gagal "insufficient balance"
+   c. Eksekusi swap (RFQ → accept → prepare → sign → submit)
+   d. Cooldown random 10-20 detik (anti-overcap)
+   e. Refresh balance + DAY_TRADER count
+   f. Ulangi
+4. Setelah penuh, tampilkan total & tunggu jadwal berikutnya
+
+
+────────────────────────────────────────
+8. TROUBLESHOOTING
+────────────────────────────────────────
+"accounts.json kosong":
+  Belum register passkey. Jalankan: node index.js register
+
+"prepare_transaction status=400 ... amount must be positive":
+  USDCx tidak cukup untuk swap. Cek balance USDCx, atau biarkan bot
+  fallback ke SELL (auto handled).
+
+"prepare_transaction status=400 ... actual admin DSO":
+  Sudah diperbaiki di v0.2. Kalau muncul lagi, lihat swap-debug.log
+  untuk full error & lapor ke maintainer.
+
+"init OTP rate-limited (429)":
+  Privy rate limit (5 req/menit per email). Tunggu 5-10 menit lalu coba lagi.
+
+"swap-debug.log":
+  Auto-generated kalau ada error. Berisi full request + response Canton.
+  Aman dishare untuk debug, tapi cek dulu jangan ada token sensitif.
+
+Bot stuck di "Menunggu harga…":
+  Likuiditas RFQ kosong. Bot otomatis polling 60s sekali sampai dapat.
+
+Status "● error" di dashboard:
+  Lihat baris di bawah status untuk detail error. Atau tail swap-debug.log
+
+
+────────────────────────────────────────
+9. STRUKTUR FILE
+────────────────────────────────────────
+SilvanaBot-Sipal/
+├── index.js                    main bot (single file)
+├── package.json
+├── config.json                 setting (swap, schedule, proxy)
+├── accounts.json               daftar akun (email + privyEmail)
+├── proxy.txt                   daftar proxy (opsional)
+├── session.json                AUTO-GENERATE: passkey + userServiceCid
+│                                + Privy token + Silvana cookie
+├── swap-debug.log              AUTO-GENERATE: log error swap (untuk debug)
+├── tutorial.txt                file ini
+└── *.example.*                 template kosong
+
+JANGAN COMMIT ke git public:
+  accounts.json   (email)
+  session.json    (private key passkey + token Privy)
+  proxy.txt       (credential proxy)
+  swap-debug.log  (mungkin ada token)
+
+Sudah otomatis di .gitignore.
+
+
+────────────────────────────────────────
+10. DEPLOY KE VPS (opsional)
+────────────────────────────────────────
+Setup passkey di laptop dulu (butuh browser):
+  laptop$ node index.js register   # selesai → session.json terisi
+
+Lalu copy ke VPS:
+  laptop$ scp -r SilvanaBot-Sipal/ vps:~/
+
+Di VPS:
+  vps$ cd SilvanaBot-Sipal
+  vps$ npm install
+  vps$ node index.js               # pakai session.json yang sudah ada
+
+Untuk run 24/7 di VPS, pakai screen/tmux/pm2:
+  vps$ pm2 start index.js --name silvana
+  vps$ pm2 save && pm2 startup     # auto-start on reboot
+
+
+Selesai. Happy trading.
