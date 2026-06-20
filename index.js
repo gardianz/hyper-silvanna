@@ -61,8 +61,9 @@ const SWAP_RESERVE = String((CONFIG.swap || {}).reserveCC || '5');
 //   "minmax":               tiap swap pilih amount ACAK antara minAmount..maxAmount.
 //                           Abaikan reserveCC; smart: tetap sisakan feeBufferCC buat fee.
 const SWAP_MODE = String((CONFIG.swap || {}).mode || 'maxReserve').toLowerCase();
-const SWAP_MIN_AMOUNT = Number((CONFIG.swap || {}).minAmount || SWAP_MIN);
-const SWAP_MAX_AMOUNT = Number((CONFIG.swap || {}).maxAmount || 0); // 0 = tak terbatas
+// let (bukan const) — bisa diubah live dari dashboard tool "set modal" + persist.
+let SWAP_MIN_AMOUNT = Number((CONFIG.swap || {}).minAmount || SWAP_MIN);
+let SWAP_MAX_AMOUNT = Number((CONFIG.swap || {}).maxAmount || 0); // 0 = tak terbatas
 const PROXY_ENABLED = (CONFIG.proxy || {}).enabled !== false;
 const PROXY_FILE = path.join(ROOT, (CONFIG.proxy || {}).file || 'proxy.txt');
 const PROXY_LIST = (PROXY_ENABLED && fs.existsSync(PROXY_FILE))
@@ -113,26 +114,33 @@ const SWAP = {
   // naik (pending akhirnya settle & unlock), baru lanjut swap lagi.
   maxStuckBeforeStop: Number((CONFIG.swap || {}).maxStuckBeforeStop) || 2,
   stuckPollSec: Number((CONFIG.swap || {}).stuckPollSec) || 300,
+  // closeWithCC: tutup hari pegang CC. Swap ke-9 (remaining<=2) dipaksa sell
+  // (restock USDCx) → swap ke-10 (remaining<=1) dipaksa buy SEMUA USDCx jadi CC
+  // (floor=minAmount, max BEBAS). Default ON; set false di config buat matiin.
+  closeWithCC: (CONFIG.swap || {}).closeWithCC !== false,
+  // === DAILY TARGET ===
+  // dailySwapCount: target jumlah swap per hari (default 10 = sesuai DAY_TRADER).
+  // allowOvercap: kalau true, boleh swap LEBIH dari batas DAY_TRADER API (mis. 15
+  //   swap walau task cuma 10/10). Verifikasi DAY_TRADER tetap jalan (di-log),
+  //   tapi tidak gate stop. Counter swap pakai settle on-chain saat overcap.
+  //   Default false (aman, anti-overcap).
+  allowOvercap: (CONFIG.swap || {}).allowOvercap === true,
+  dailySwapCount: Math.max(1, Number((CONFIG.swap || {}).dailySwapCount) || 10),
   privyAppId: PRIVY_APP_ID, privyClientId: PRIVY_CLIENT_ID,
   actionIds: {
-    forecast: '40676c60700e9ed1236f944d4b41a08bcf91bc9ee2',
-    getPrice: '40c4d9517caab6ab995effa94ac9d8b9f234b40cb9',
-    estimateFee: '40fbe337a317ee196e4d662061e1cecb8aaa3006fe',
-    acceptQuote: '40baa9946599cfdb0da587a64365c4e12945779e59',
-    recordEvent: '40af5b2fb87c0eb585f00202017a4d682dbb5eae9a',
-    listProposals: '400df0327d9072855e72c45c3fd49d7f93ebeedd4d',
-    pollProposal: '40c101001b1336b46e42acc85c5ff73fe93ed9090d',
-    getMultiCall: '40a8e24576d1a35a13da0935d1509e6ba3af10def5',
-    getUserService: '409cbd8909b14c90e789a5596881a5739c3d38c243',
-    prepareDvpFee: '4030273a5aedfa6bedc7a55a08d075991df400286b',
-    prepareTransfer: '40c65525e31c405dd14f5ded8cefed4cfad27f096b',
-    execSettle: '4041ab040bbaa5c3a983a0997382d0f1170c4e63f3',
-    // Untuk allocate token registry (USDCx, dll) — bukan Splice Amulet.
-    // Signature: getAllocationFactory(registry, choiceArgs).
-    getAllocationFactory: '60e3c0527836f673bf65661fb34a8195a3a848964f',
-    // Konfirmasi sisi pembeli/penjual setelah acceptQuote — INI yang trigger
-    // generation DvpProposal di ledger Canton. Tanpa ini, polling timeout.
-    submitPreconfirmation: '40af23346171bd93df282081a8bc847d682ecec9ff',
+    // Updated 2026-06-20 — Silvana redeployed frontend, semua next-action ID berubah.
+    // getAllocationFactory + submitPreconfirmation DIHAPUS dari flow baru.
+    // getPrice pindah ke REST /api/swap {op:"price"} — lihat sv.getPrice().
+    estimateFee: '400c57a2110a4336a5b615434850f11563623bf338',
+    acceptQuote: '4099612557ee022a2a78994954c158c4e01cd3b931',
+    recordEvent: '40727ac254af318d0c028321dac7ab8c86ef749c25',
+    listProposals: '40bd6bd86eefa2c90c8068cf0af03438f6dbd5e85f',
+    pollProposal: '401bc64b830c9949814e4a7a38805623a8ec05e5ab',
+    getMultiCall: '4098a1f92f014fc6d0bcdcc5b73954f2e75fa6b163',
+    prepareDvpFee: '40cf8e4843620df82ab116882f57b4d9ddb36da1f2',
+    prepareTransfer: '40f128fd516b7e56191c54baf36fc0ecc87576469d',
+    getAllocFactory: '60c923ff5915b45b2bdbb69efcd6cf1808d63579a1',
+    execSettle: '406104d4b9496f54e9d55bf9a464d416558d25bb76',
   },
   // Package ID untuk Splice.Api.Token.AllocationInstructionV1 — dipakai
   // saat membangun ExerciseCommand AllocationFactory_Allocate.
@@ -740,7 +748,7 @@ function buildMultiCallAccept(p) {
 // ============================================================================
 //  Silvana app client (passkey login, earn-hub, server actions, RFQ)
 // ============================================================================
-const SWAP_STATE_TREE = encodeURIComponent(JSON.stringify(['', { children: ['swap', { children: ['__PAGE__', {}, null, null] }, null, null] }, null, null, true]));
+const SWAP_STATE_TREE = encodeURIComponent(JSON.stringify(['', { children: ['(app)', { children: ['swap', { children: ['__PAGE__', {}, null, null] }, null, null] }, null, null] }, null, null, true]));
 // Server-action ID Silvana untuk discover party (POST /connect dari halaman /connect).
 // Hasilkan { partyId, partyName, userServiceCid, ... } dari on-chain.
 const CONNECT_RECOVER_ACTION = '40d678c69abe3b059b9ac71f04ee5e5b3393d56043';
@@ -781,14 +789,29 @@ class SilvanaClient {
     if (r.status !== 200) throw new Error(`tasks status=${r.status}`);
     return r.json;
   }
+  async earnStats() {
+    // Earn-hub stats: { displayName, totalPoints, activityCount, totalVolume, achievements }
+    const r = await request('GET', `${APP_BASE}/api/earn-hub/stats`, this._opts({ headers: this._hdr({ 'Referer': APP_BASE + '/earn-hub' }) }));
+    if (r.status === 401) { const e = new Error('stats 401'); e.unauthorized = true; throw e; }
+    if (r.status !== 200) throw new Error(`stats status=${r.status}`);
+    return r.json;
+  }
+  async getPrice(symbol) {
+    const r = await request('POST', `${APP_BASE}/api/swap`, this._opts({
+      headers: this._hdr({ 'Content-Type': 'application/json', 'Referer': APP_BASE + '/swap' }),
+      body: JSON.stringify({ op: 'price', symbol: symbol || 'CC-USDCx' }),
+    }));
+    if (r.status !== 200) return null;
+    return (r.json && r.json.data) || null;
+  }
   async swapAction(actionId, args, { timeoutMs } = {}) {
     const r = await request('POST', `${APP_BASE}/swap`, this._opts({
       timeoutMs: timeoutMs || this.timeoutMs,
       headers: this._hdr({ 'Accept': 'text/x-component', 'Content-Type': 'text/plain;charset=UTF-8', 'Referer': APP_BASE + '/swap', 'next-action': actionId, 'next-router-state-tree': SWAP_STATE_TREE }),
       body: JSON.stringify(args || []),
     }));
-    if (r.status === 401 || r.status === 403) { const e = new Error(`swapAction ${actionId} status=${r.status}`); e.unauthorized = true; throw e; }
-    if (r.status !== 200) throw new Error(`swapAction ${actionId} status=${r.status} body=${(r.text || '').slice(0, 160)}`);
+    if (r.status === 401 || r.status === 403) { const e = new Error(`swapAction ${actionId} status=${r.status}`); e.unauthorized = true; logDebug(`swapAction ${actionId} ${r.status}`, r.text || ''); throw e; }
+    if (r.status !== 200) { logDebug(`swapAction ${actionId} ${r.status}`, r.text || ''); throw new Error(`swapAction ${actionId} status=${r.status} body=${(r.text || '').slice(0, 160)}`); }
     return actionResult(r.text || '');
   }
 
@@ -820,37 +843,7 @@ class SilvanaClient {
     return null;
   }
 
-  /**
-   * Get AllocationFactory + choiceContext untuk allocate utility token (USDCx, dll).
-   * Mengembalikan { factoryId, choiceContextData, disclosedContracts }.
-   *
-   * Hanya untuk utility/registry token (non-Splice). Untuk CC/Amulet,
-   * pakai `prepareTransfer` (getTransferFactoryContextAction) yang biasa.
-   */
-  async getAllocationFactory(registryParty, choiceArgs) {
-    const r = await request('POST', `${APP_BASE}/swap`, this._opts({
-      timeoutMs: this.timeoutMs,
-      headers: this._hdr({
-        'Accept': 'text/x-component',
-        'Content-Type': 'text/plain;charset=UTF-8',
-        'Referer': APP_BASE + '/swap',
-        'next-action': SWAP.actionIds.getAllocationFactory,
-        'next-router-state-tree': SWAP_STATE_TREE,
-      }),
-      body: JSON.stringify([registryParty, choiceArgs]),
-    }));
-    if (r.status === 401 || r.status === 403) { const e = new Error(`getAllocationFactory status=${r.status}`); e.unauthorized = true; throw e; }
-    if (r.status !== 200) throw new Error(`getAllocationFactory status=${r.status} body=${(r.text || '').slice(0, 160)}`);
-    const result = actionResult(r.text || '');
-    if (!result || !result.success || !result.factory) {
-      throw new Error(`getAllocationFactory: ${(result && result.error) || 'no factory'}`);
-    }
-    return {
-      factoryId: result.factory.factoryId,
-      choiceContextData: result.factory.choiceContext.choiceContextData,
-      disclosedContracts: result.factory.choiceContext.disclosedContracts || [],
-    };
-  }
+
   async rfqStream({ partyId, marketId, direction, quantity }, { timeoutMs } = {}) {
     const r = await request('POST', `${APP_BASE}/api/rfq/stream`, this._opts({
       timeoutMs: timeoutMs || this.timeoutMs,
@@ -883,7 +876,7 @@ function patchAcctSession(email, patch) { const s = loadStore(); s[email] = { ..
 function getPasskey(email) { return acctSession(email).passkey || null; }
 function getUserServiceCid(email) { return acctSession(email).userServiceCid || null; }
 function loadCookies(email) { return acctSession(email).silvanaCookies || {}; }
-function saveCookies(email, obj) { patchAcctSession(email, { silvanaCookies: obj }); }
+function saveCookies(email, obj) { const c = { ...obj }; delete c.geo_status; patchAcctSession(email, { silvanaCookies: c }); }
 function silvanaAccessExpMs(email) {
   const c = loadCookies(email);
   const tok = c.access_token; if (!tok) return 0;
@@ -1013,11 +1006,14 @@ async function ensureSilvanaSession(state) {
   const pk = getPasskey(email);
   if (!pk) return null;
   const proxy = pickProxy(email);
-  const jar = new CookieJar(loadCookies(email));
+  const _rawCookies = loadCookies(email);
+  delete _rawCookies.geo_status; // never send geo_status=blocked — let server re-eval based on current IP
+  const jar = new CookieJar(_rawCookies);
   const client = new SilvanaClient({ jar, timeoutMs: REQ.timeoutMs, proxy });
-  // Cek expiry cookie proaktif: kalau sisa > 10 menit, validasi via authMe.
-  // Kalau sisa < 10 menit (atau gak ada), langsung re-login passkey.
-  const SAFETY_MS = 600_000;
+  // Re-login silvana proaktif kalau sisa < 15 menit (margin lebar biar gak pernah
+  // expired antar-sesi). authMe TIDAK nge-extend token; cuma re-login yg nge-renew,
+  // jadi margin harus > interval keep-alive.
+  const SAFETY_MS = 900_000;
   const exp = silvanaAccessExpMs(email);
   const stillFresh = exp && (exp - Date.now() > SAFETY_MS);
   if (stillFresh) {
@@ -1053,36 +1049,7 @@ function selectCcHoldings(amulets, needDecStr) {
   if (!out.length) throw new Error('tidak ada holding CC (Amulet)');
   return out;
 }
-/**
- * Mirror dari frontend Silvana `buildAllocationChoiceArguments`.
- * Membangun struktur arg untuk action `getAllocationFactory` & multi-call.
- */
-function buildAllocationChoiceArguments(p) {
-  return {
-    allocation: {
-      settlement: {
-        executor: p.settlementOperator,
-        settlementRef: { id: p.settlementId, cid: null },
-        requestedAt: p.requestedAt,
-        allocateBefore: p.allocateBefore,
-        settleBefore: p.settleBefore,
-        meta: { values: {} },
-      },
-      transferLegId: p.isBuyer ? '2' : '1',
-      transferLeg: {
-        sender: p.partyId,
-        receiver: p.counterpartyId,
-        instrumentId: { admin: p.registryParty, id: p.tokenId },
-        amount: p.amount,
-        meta: { values: {} },
-      },
-    },
-    inputHoldingCids: p.inputHoldingCids,
-    expectedAdmin: p.registryParty,
-    extraArgs: { context: { values: {} }, meta: { values: {} } },
-    requestedAt: p.requestedAt,
-  };
-}
+
 async function swapOnce(ctx, direction, quantityCC) {
   let { sv, privy, canton, partyId, userServiceCid, log = () => { }, shouldContinue, onWait } = ctx;
   if (!userServiceCid) throw new Error('userServiceCid belum ada — auto-discovery gagal, cek koneksi/passkey');
@@ -1090,8 +1057,8 @@ async function swapOnce(ctx, direction, quantityCC) {
   const role = direction === 'sell' ? 'seller' : 'buyer';
   const dirID = direction === 'sell' ? 'jual CC' : 'beli CC';
 
-  const price = await sv.swapAction(A.getPrice, [market]).catch(() => null);
-  const px = price && price.data ? String(direction === 'sell' ? price.data.bid : price.data.ask) : '0';
+  const price = await sv.getPrice(market).catch(() => null);
+  const px = price ? String(direction === 'sell' ? price.bid : price.ask) : '0';
   // FEE PROTECTION (early gate): cek estimasi fee SEBELUM bikin proposal on-chain.
   // Kalau fee > maxFeeCC, batal di sini — gak ada DvpProposal nyangkut.
   const feeEst = await sv.swapAction(A.estimateFee, [{ partyId, marketId: market, baseQuantity: amount, price: px }]).catch(() => null);
@@ -1153,16 +1120,6 @@ async function swapOnce(ctx, direction, quantityCC) {
   const acc = await sv.swapAction(A.acceptQuote, [{ partyId, rfqId: rfq.rfqId, quoteId: quote.quoteId || quote.id }]);
   if (!acc || !acc.proposalId) throw new Error(`acceptQuote gagal: ${JSON.stringify(acc).slice(0, 120)}`);
   const proposalId = acc.proposalId;
-
-  // Submit preconfirmation — INI trigger generation DvpProposal di ledger.
-  // Tanpa step ini, polling DvpProposal akan timeout selamanya.
-  const pre = await sv.swapAction(A.submitPreconfirmation, [{
-    proposalId, settlementId: proposalId, partyId, accept: true,
-  }]);
-  logDebug('submitPreconfirmation response', pre);
-  if (!pre || pre.success === false) {
-    throw new Error(`submitPreconfirmation gagal: ${(pre && pre.error) || 'unknown'}`);
-  }
 
   await sv.swapAction(A.recordEvent, [{ partyId, recordedByRole: role, eventType: `preconfirmation_${role}`, result: 'success', proposalId, metadata: { accept: true, source: 'rfq_accept' } }]).catch(() => { });
 
@@ -1257,16 +1214,24 @@ async function swapOnce(ctx, direction, quantityCC) {
   if (es && es._err) log(`⚠ execSettle gagal: ${es._err}`);
   else if (es && es.success === false) log('⚠ execSettle success=false');
 
+  const _now = new Date();
+  const _totalFee = addDp(feeCtx.feeAmountCC || '0', feeCtx.counterpartFeeAmountCC || '0');
+  const _prepTransferArgs = [{
+    sender: partyId,
+    receiver: feeCtx.feeParty,
+    amount: _totalFee,
+    instrumentId: { admin: dso, id: 'Amulet' },
+    inputHoldingCids: [...inputHoldingCids],
+    requestedAt: _now.toISOString(),
+    executeBefore: new Date(_now.getTime() + 24 * 3600_000 + 10_000).toISOString(),
+  }];
   let allocate;
   if (weAreBuyer) {
-    // Untuk buy: kita bayar USDCx (utility token, bukan Amulet/CC).
-    // Path-nya beda: pakai getAllocationFactory + buildAllocationChoiceArguments,
-    // bukan prepareTransfer (yang khusus Splice Amulet).
+    // BUY: kita bayar USDCx — fetch holdings buat inputHoldingCids + balance check
     const bal = await supaBalances(ctx.identityToken || canton.token, ctx.proxy || null);
     const usdcxToken = ((bal && bal.tokens) || []).find(t => String((t.instrumentId && t.instrumentId.id) || '').toUpperCase() === 'USDCX');
     const usdcxHoldings = (usdcxToken && usdcxToken.unlockedUtxos || []).map(u => u.contractId).filter(Boolean);
     if (!usdcxHoldings.length) throw new Error('tidak ada USDCx holding untuk swap buy');
-    // Pre-check: balance USDCx total harus ≥ amount yg mau dialokasi
     const totalUsdcx = (usdcxToken.unlockedUtxos || []).reduce((s, u) => s + Number(u.amount || 0), 0);
     const needUsdcx = Number(ourLeg.amount);
     if (totalUsdcx < needUsdcx) {
@@ -1274,51 +1239,52 @@ async function swapOnce(ctx, direction, quantityCC) {
       e.insufficientBalance = true;
       throw e;
     }
-
-    // Gabungkan CC (untuk fee) + USDCx (untuk allocation) di inputHoldings MultiCall
     for (const h of usdcxHoldings) { if (!inputHoldingCids.includes(h)) inputHoldingCids.push(h); }
-
-    // Build choice args (mirror persis frontend Silvana)
-    const choiceArgs = buildAllocationChoiceArguments({
-      partyId,
-      tokenId: ourLeg.instrument.id,                   // 'USDCx'
-      registryParty: ourLeg.instrument.admin,           // decentralized-usdc-...
-      amount: fmt10(ourLeg.amount),
-      settlementId: proposalId,
-      settlementOperator: dvp.executor,
-      counterpartyId: receiver,
-      isBuyer: true,
-      requestedAt: dvp.terms.createdAt,
-      allocateBefore: dvp.terms.allocateBefore,
-      settleBefore: dvp.terms.settleBefore,
-      inputHoldingCids: usdcxHoldings,
-    });
-
-    // Server-action: get factory + choice context
-    const fac = await sv.getAllocationFactory(ourLeg.instrument.admin, choiceArgs);
-    if (!fac || !fac.factoryId) throw new Error('getAllocationFactory tidak balikin factory');
-
-    // Pastikan disclosed contracts punya synchronizerId (server kadang kosongkan)
-    const disclosed = (fac.disclosedContracts || []).map(d => ({
-      ...d,
-      synchronizerId: d.synchronizerId || SWAP.synchronizerId,
-    }));
-
-    allocate = {
-      instrument: ourLeg.instrument,
-      amount: ourLeg.amount,
-      legId: ourLeg.legId,
-      factoryCid: fac.factoryId,
-      contextValues: (fac.choiceContextData && fac.choiceContextData.values) || {},
-      disclosed,
-    };
+    const t = await sv.swapAction(A.prepareTransfer, _prepTransferArgs);
+    logDebug('prepareTransfer (buy) response', t);
+    if (!t || !t.factoryId) throw new Error('prepareTransfer (buy) gagal');
+    // BUY allocationFactory = USDCx factory (bukan CC/Amulet ExternalPartyAmuletRules).
+    // prepareTransfer.factoryId = "004b73bef9..." (CC factory) → salah untuk BUY.
+    // getAllocFactory action 60c923ff... return "006289e882..." (USDCx factory) → benar.
+    const allocFact = await sv.swapAction(A.getAllocFactory, [
+      SWAP.usdcxAdmin,
+      {
+        allocation: {
+          settlement: {
+            executor: dvp.executor,
+            settlementRef: { id: proposalId, cid: null },
+            requestedAt: dvp.terms.createdAt,
+            allocateBefore: dvp.terms.allocateBefore,
+            settleBefore: dvp.terms.settleBefore,
+            meta: { values: {} },
+          },
+          transferLegId: ourLeg.legId,
+          transferLeg: {
+            sender: partyId,
+            receiver: dvp.proposer,
+            instrumentId: ourLeg.instrument,
+            amount: fmt10(ourLeg.amount),
+            meta: { values: {} },
+          },
+        },
+        inputHoldingCids: usdcxHoldings,
+        expectedAdmin: SWAP.usdcxAdmin,
+        extraArgs: { context: { values: {} }, meta: { values: {} } },
+        requestedAt: dvp.terms.createdAt,
+      },
+    ]);
+    logDebug('getAllocFactory (buy) response', allocFact);
+    if (!allocFact || !allocFact.factory || !allocFact.factory.factoryId) throw new Error('getAllocFactory (buy) gagal');
+    const _allocCtx = allocFact.factory.choiceContext || {};
+    allocate = { instrument: ourLeg.instrument, amount: ourLeg.amount, legId: ourLeg.legId, factoryCid: allocFact.factory.factoryId, contextValues: (_allocCtx.choiceContextData && _allocCtx.choiceContextData.values) || {}, disclosed: _allocCtx.disclosedContracts || [] };
   } else {
-    const t = await sv.swapAction(A.prepareTransfer, [{ sender: partyId, receiver, amount: ourLeg.amount, instrumentId: ourLeg.instrument, inputHoldingCids }]);
+    const t = await sv.swapAction(A.prepareTransfer, _prepTransferArgs);
+    logDebug('prepareTransfer (sell) response', t);
     if (!t || !t.factoryId) throw new Error('prepareTransfer gagal');
     allocate = { instrument: ourLeg.instrument, amount: ourLeg.amount, legId: ourLeg.legId, factoryCid: t.factoryId, contextValues: t.choiceContextData.values, disclosed: t.disclosedContracts };
   }
 
-  const body = buildMultiCallAccept({ party: partyId, inputHoldingCids, multiCall, userServiceCid, feeCtx, proposalId, dvpProposalCid: dvpCid, dvpTerms: dvp.terms, executor: dvp.executor, receiver, dso, allocate });
+  const body = buildMultiCallAccept({ party: partyId, inputHoldingCids, multiCall, userServiceCid, feeCtx, proposalId, dvpProposalCid: dvpCid, dvpTerms: dvp.terms, executor: dvp.executor, receiver, dso, allocate, now: _now });
   const prep = await canton.prepareTransaction(body);
   if (!prep || !prep.hash) throw new Error('gagal menyiapkan transaksi');
 
@@ -1356,7 +1322,7 @@ async function swapOnce(ctx, direction, quantityCC) {
   }
   // (execSettle sudah dipanggil SEBELUM prepare_transaction — lihat di atas.
   //  Tidak dipanggil lagi di sini; di flow manual web hanya 1x, pre-prepare.)
-  return { ok: true, direction, proposalId, submissionId: sub.submissionId, completed: !!completion };
+  return { ok: true, direction, proposalId, submissionId: sub.submissionId, completed: !!completion, feeCC: Number.isFinite(realFeeCC) ? realFeeCC : null };
 }
 
 // ============================================================================
@@ -1417,7 +1383,7 @@ function row2(left, right) {
 }
 
 function renderHeader() {
-  return [line(), row(paint('SilvanaBot V1.1 Auto Swap ', COLOR.bold + COLOR.cyan)), row(paint(new Date().toLocaleString('id-ID'), COLOR.gray))].join('\n');
+  return [line(), row(paint(' SilvanaBot V1.2 Auto Swap ', COLOR.bold + COLOR.cyan)), row(paint(new Date().toLocaleString('id-ID'), COLOR.gray))].join('\n');
 }
 function statusBadge(state) {
   const d = state.dayTrader;
@@ -1481,6 +1447,24 @@ function renderFooter() {
   return [sep(), row(paint('Jadwal harian ', COLOR.gray) + paint(jam + ' WIB', COLOR.cyan) + paint('   ·   Ctrl+C berhenti', COLOR.gray))].join('\n');
 }
 const ACTIVITY = []; const ACTIVITY_MAX = 1000;
+// Structured activity ring buffer — plain (no ANSI), untuk push ke web dashboard.
+const DASH_ACTIVITY = []; const DASH_ACTIVITY_MAX = 200;
+// Burn events — fee CC kebakar tiap swap sukses submit. Dashboard akumulasi
+// jadi total All Time + Today (dedupe by ts server-side).
+const BURN_EVENTS = []; const BURN_EVENTS_MAX = 200;
+function recordBurn(feeCC, label) {
+  const f = Number(feeCC);
+  if (!Number.isFinite(f) || f <= 0) return;
+  BURN_EVENTS.push({ ts: Date.now(), feeCC: f, label: String(label || '') });
+  if (BURN_EVENTS.length > BURN_EVENTS_MAX) BURN_EVENTS.splice(0, BURN_EVENTS.length - BURN_EVENTS_MAX);
+  logActivity(`[${label || 'swap'}] fee ${f.toFixed(4)} CC kebakar`, COLOR.yellow);
+}
+function colorToType(color) {
+  if (color === COLOR.green) return 'success';
+  if (color === COLOR.red) return 'error';
+  if (color === COLOR.yellow) return 'warn';
+  return 'info';
+}
 const DEBUG_LOG_PATH = path.join(ROOT, 'swap-debug.log');
 function logDebug(label, data) {
   try {
@@ -1492,6 +1476,9 @@ function logActivity(msg, color) {
   const ts = new Date().toLocaleTimeString('id-ID');
   ACTIVITY.push(paint(ts + ' ', COLOR.gray) + (color ? paint(msg, color) : msg));
   if (ACTIVITY.length > ACTIVITY_MAX) ACTIVITY.splice(0, ACTIVITY.length - ACTIVITY_MAX);
+  // mirror ke buffer terstruktur (plain) untuk dashboard
+  DASH_ACTIVITY.push({ ts: Date.now(), type: colorToType(color), category: 'bot', message: String(msg) });
+  if (DASH_ACTIVITY.length > DASH_ACTIVITY_MAX) DASH_ACTIVITY.splice(0, DASH_ACTIVITY.length - DASH_ACTIVITY_MAX);
   if (global.__states) render(global.__states);
 }
 function renderActivityLog(maxLines) {
@@ -1527,6 +1514,41 @@ function parseDayTrader(tasksArr) {
   const target = m ? Number(m[2]) : 10;
   return { current, target, completed: !!it.completed || current >= target };
 }
+// Unclaimed Points dari earn-hub (mis. 1,780.00). Cari di root + nested, robust ke nama field.
+function extractUnclaimedPoints(tasks) {
+  if (!tasks || typeof tasks !== 'object') return null;
+  const num = v => { if (v == null) return null; const n = Number(String(v).replace(/,/g, '').trim()); return Number.isFinite(n) ? n : null; };
+  const KEYS = ['unclaimedPoints', 'unclaimed_points', 'totalUnclaimedPoints', 'pointsUnclaimed', 'unclaimed', 'pointsBalance', 'availablePoints', 'points', 'totalPoints'];
+  for (const k of KEYS) if (k in tasks) { const n = num(tasks[k]); if (n != null) return n; }
+  for (const c of ['summary', 'earn', 'earnHub', 'rewards', 'data', 'pointsSummary', 'result']) {
+    const o = tasks[c]; if (o && typeof o === 'object') for (const k of KEYS) if (k in o) { const n = num(o[k]); if (n != null) return n; }
+  }
+  let found = null;
+  (function walk(o, d) {
+    if (found != null || !o || typeof o !== 'object' || d > 4) return;
+    for (const k of Object.keys(o)) {
+      const v = o[k];
+      if (/unclaim/i.test(k)) { const n = num(v); if (n != null) { found = n; return; } }
+      if (v && typeof v === 'object') walk(v, d + 1);
+    }
+  })(tasks, 0);
+  return found;
+}
+// Harga CC dalam USDCx (≈ USD). Diturunkan dari swap-quote getPrice (web.md §4e):
+// mid (bid+ask)/2 dari market CC-USDCx. Cache + fail-open (jangan zero-kan harga live).
+const CC_PRICE = { ccUsdcx: 0, ts: 0 };
+async function fetchCcPrice(sv) {
+  try {
+    const p = await sv.getPrice(SWAP.market);
+    if (!p) return;
+    const bid = Number(p.bid), ask = Number(p.ask);
+    let mid = 0;
+    if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0) mid = (bid + ask) / 2;
+    else if (Number.isFinite(ask) && ask > 0) mid = ask;
+    else if (Number.isFinite(bid) && bid > 0) mid = bid;
+    if (mid > 0) { CC_PRICE.ccUsdcx = mid; CC_PRICE.ts = Date.now(); }
+  } catch (_) { /* keep last cache */ }
+}
 async function tickAccount(state) {
   try {
     const proxy = pickProxy(state.privyEmail || state.email);
@@ -1540,12 +1562,37 @@ async function tickAccount(state) {
       const tasks = await sv.earnTasks(partyId).catch(() => null);
       const dt = parseDayTrader(tasks && tasks.items);
       if (dt) state.dayTrader = { count: dt.current, target: dt.target };
+      const stats = await sv.earnStats().catch(() => null);
+      const pts = (stats && stats.totalPoints != null && Number.isFinite(Number(stats.totalPoints)))
+        ? Number(stats.totalPoints) : extractUnclaimedPoints(tasks);
+      if (pts != null) state.points = pts;
+      await fetchCcPrice(sv);
     }
     state.status = 'ok'; state.message = '';
   } catch (e) { state.status = 'error'; state.message = (e && e.message) || String(e); }
   render(global.__states);
 }
 async function tickAll(states) { for (const s of states) await tickAccount(s); }
+
+// ============================================================================
+//  Keep-alive token (Privy/Supa + Silvana) — jalan TERUS walau quest selesai.
+//  Lebih sering & ringan dari tickAll (gak fetch balance/tasks), khusus jaga
+//  token gak expired antar-sesi. Per-akun try/catch biar 1 gagal gak blok lain.
+// ============================================================================
+async function keepAliveTokens(state) {
+  try {
+    await ensurePrivyToken(state);       // refresh Privy/Supa (update state.tokenExpMs)
+    await ensureSilvanaSession(state);   // re-login Silvana kalau mendekati expired
+    if (state.status === 'login') state.status = 'ok';
+    if (/login|keep-alive/i.test(state.message || '')) state.message = '';
+  } catch (e) {
+    logActivity(`[${state.label || state.email}] keep-alive gagal: ${(e && e.message || e).toString().slice(0, 50)}`, COLOR.yellow);
+  }
+}
+async function keepAliveAll(states) {
+  for (const s of states) { if (dtSessionRunning) return; await keepAliveTokens(s); }
+  render(states);
+}
 
 // ============================================================================
 //  DAY_TRADER engine — API-driven, anti-overcap (no local count file)
@@ -1769,10 +1816,16 @@ async function runDayTraderSession(reason) {
         const dt = await fetchDayTrader(sv, partyId);
         if (!dt) { logActivity(`[${tag}] DAY_TRADER tak terbaca dari API → tidak swap`, COLOR.yellow); continue; }
         state.dayTrader = { count: dt.current, target: dt.target }; render(global.__states);
-        if (dt.completed || dt.current >= dt.target) { logActivity(`[${tag}] DAY_TRADER ${dt.current}/${dt.target} sudah penuh ✓`, COLOR.green); continue; }
-
-        const need = dt.target - dt.current; // ANTI-OVERCAP: jumlah swap pasti dari API
-        logActivity(`[${tag}] DAY_TRADER ${dt.current}/${dt.target} — perlu ${need} swap lagi`, COLOR.cyan);
+        // Effective target: dailySwapCount di-cap oleh dt.target kecuali allowOvercap=true.
+        const apiCap = Number(dt.target) || 0;
+        const dailyCap = Math.max(1, Number(SWAP.dailySwapCount) || apiCap);
+        const effective = SWAP.allowOvercap ? dailyCap : Math.min(dailyCap, apiCap);
+        const apiHit = dt.completed || dt.current >= apiCap;
+        if (apiHit && !SWAP.allowOvercap) { logActivity(`[${tag}] DAY_TRADER ${dt.current}/${dt.target} sudah penuh ✓`, COLOR.green); continue; }
+        const need = Math.max(0, effective - dt.current);
+        if (need <= 0) { logActivity(`[${tag}] dailySwapCount ${dailyCap} sudah terpenuhi (count ${dt.current}) ✓`, COLOR.green); continue; }
+        const overcapTag = SWAP.allowOvercap && dailyCap > apiCap ? ` (overcap → target ${effective})` : '';
+        logActivity(`[${tag}] DAY_TRADER ${dt.current}/${dt.target}${overcapTag} — perlu ${need} swap lagi`, COLOR.cyan);
 
         // Anchor accounting ke API count. Optimistic visual tetap, tapi done counter
         // baru naik kalau DAY_TRADER beneran naik on-chain. Cegah silent-overcap
@@ -1803,7 +1856,12 @@ async function runDayTraderSession(reason) {
           }
 
           const chk = await fetchDayTrader(sv, partyId).catch(() => null);
-          if (chk) { state.dayTrader = { count: chk.current, target: chk.target }; render(global.__states); if (chk.completed || chk.current >= chk.target) { logActivity(`[${tag}] DAY_TRADER ${chk.current}/${chk.target} ✓ — berhenti`, COLOR.green); break; } }
+          if (chk) {
+            state.dayTrader = { count: chk.current, target: chk.target }; render(global.__states);
+            const chkApiHit = chk.completed || chk.current >= chk.target;
+            if (chkApiHit && !SWAP.allowOvercap) { logActivity(`[${tag}] DAY_TRADER ${chk.current}/${chk.target} ✓ — berhenti`, COLOR.green); break; }
+            if (chkApiHit && SWAP.allowOvercap) logActivity(`[${tag}] DAY_TRADER ${chk.current}/${chk.target} ✓ — lanjut overcap (${done + 1}/${need})`, COLOR.gray);
+          }
 
           // Pre-check: kalau ada settlement yang lagi in-progress (counterparty
           // belum allocate), tunggu dulu sebelum buka posisi baru. Hindari
@@ -1841,8 +1899,8 @@ async function runDayTraderSession(reason) {
 
           let ask = 0;
           try {
-            const priceRes = await sv.swapAction(SWAP.actionIds.getPrice, [SWAP.market]).catch(() => null);
-            ask = (priceRes && priceRes.data && Number(priceRes.data.ask)) || 0;
+            const priceRes = await sv.getPrice(SWAP.market).catch(() => null);
+            ask = (priceRes && Number(priceRes.ask)) || 0;
           } catch (_) { ask = 0; }
 
           const usdcxBudget = usdc * 0.95;                            // buffer slippage/fee
@@ -1862,8 +1920,8 @@ async function runDayTraderSession(reason) {
             const sellCapCC = floor4(ccUnlocked - feeBuf);         // sisakan CC buat fee
             maxSellCC = floor4(Math.min(target, sellCapCC));
             maxBuyCC = floor4(Math.min(target, buyCapCC));
-            canSell = sellCapCC >= lo && maxSellCC >= minSwap;
-            canBuy = buyCapCC >= lo && maxBuyCC >= minSwap && ccUnlocked >= feeBuf;
+            canSell = sellCapCC >= lo && maxSellCC >= lo;
+            canBuy = buyCapCC >= lo && maxBuyCC >= lo && ccUnlocked >= feeBuf;
             modeLabel = `minmax ${lo}..${SWAP_MAX_AMOUNT || '∞'}`;
           } else {
             // maxReserve (default): rata kanan, cap maxAmount.
@@ -1875,9 +1933,34 @@ async function runDayTraderSession(reason) {
           }
 
           let amountCC, direction;
-          const forcedDir = global.__forceDir || SWAP.forceDirection || null;
-          if (forcedDir === 'sell') { direction = 'sell'; amountCC = String(maxSellCC); logActivity(`[${tag}] arah dipaksa: sell (override)`, COLOR.gray); }
-          else if (forcedDir === 'buy') { direction = 'buy'; amountCC = String(maxBuyCC); logActivity(`[${tag}] arah dipaksa: buy (override)`, COLOR.gray); }
+          // closeWithCC: jamin hari berakhir pegang CC.
+          //   remaining<=2 → paksa SELL (restock USDCx buat buy penutup).
+          //   remaining<=1 → paksa BUY semua USDCx jadi CC (floor minAmount, max BEBAS).
+          const remaining = need - done;
+          let forcedDir = global.__forceDir || SWAP.forceDirection || null;
+          let closeBuyAll = false;
+          if (!forcedDir && SWAP.closeWithCC) {
+            if (remaining <= 1) { forcedDir = 'buy'; closeBuyAll = true; }
+            else if (remaining <= 2) { forcedDir = 'sell'; }
+          }
+          // Swap penutup: abaikan cap minmax/maxReserve, ambil SEMUA USDCx (rata kanan).
+          // Floor tetap minAmount (config). buyCapCC = kapasitas CC dari seluruh USDCx.
+          const closeBuyCC = floor4(buyCapCC);
+          const closeFloor = Math.max(minSwap, SWAP_MODE === 'minmax' ? Number(SWAP_MIN_AMOUNT) : minSwap);
+          if (forcedDir === 'sell') { direction = 'sell'; amountCC = String(maxSellCC); logActivity(`[${tag}] arah dipaksa: sell (restock USDCx, sisa ${remaining})`, COLOR.gray); }
+          else if (forcedDir === 'buy') {
+            direction = 'buy';
+            if (closeBuyAll && closeBuyCC >= closeFloor) {
+              amountCC = String(closeBuyCC); // habisin USDCx, max bebas
+              logActivity(`[${tag}] swap penutup: BUY semua USDCx (${closeBuyCC} CC, floor ${closeFloor}) → tutup pegang CC`, COLOR.cyan);
+            } else if (closeBuyAll) {
+              // USDCx < minAmount → gak bisa buy valid. Fallback sell biar gak stuck.
+              if (canSell) { direction = 'sell'; amountCC = String(maxSellCC); logActivity(`[${tag}] swap penutup: USDCx ${closeBuyCC} CC < min ${closeFloor} → fallback sell`, COLOR.yellow); }
+              else { direction = 'buy'; amountCC = String(maxBuyCC); logActivity(`[${tag}] swap penutup: USDCx kurang & sell gak bisa, coba buy seadanya`, COLOR.yellow); }
+            } else {
+              amountCC = String(maxBuyCC); logActivity(`[${tag}] arah dipaksa: buy (override)`, COLOR.gray);
+            }
+          }
           else if (canBuy) { direction = 'buy'; amountCC = String(maxBuyCC); }   // prefer buy → balik ke CC
           else if (canSell) { direction = 'sell'; amountCC = String(maxSellCC); }
           else {
@@ -1979,12 +2062,21 @@ async function runDayTraderSession(reason) {
             const label = direction === 'sell' ? 'jual CC→USDCx' : 'beli USDCx→CC';
             const res = await swapWithRetry(direction, amountCC, label);
             if (res && res.ok) {
+              if (res.feeCC) recordBurn(res.feeCC, tag);
               const realDt = await handleSuccess(label);
               if (realDt && realDt.current > beforeApi) {
                 done = Math.max(done + 1, realDt.current - startApi);
                 stuck = 0;
                 lowFeeStreak = 0;
                 logActivity(`[${tag}] ✓ confirmed on-chain (DAY_TRADER ${realDt.current}/${realDt.target})`, COLOR.green);
+              } else if (SWAP.allowOvercap && realDt && realDt.current >= realDt.target) {
+                // Sudah lewat batas API DAY_TRADER. Counter pakai settle on-chain
+                // (res.ok = settlement settled by waitForSettlement). Verifikasi
+                // DAY_TRADER tetap di-log walau gak naik.
+                done++;
+                stuck = 0;
+                lowFeeStreak = 0;
+                logActivity(`[${tag}] ✓ confirmed on-chain overcap ${done}/${need} (DAY_TRADER ${realDt.current}/${realDt.target} saturated)`, COLOR.green);
               } else {
                 stuck++;
                 logActivity(`[${tag}] ⚠ submitted tapi DAY_TRADER belum naik (LP lambat allocate) — stuck ${stuck}/${MAX_STUCK}`, COLOR.yellow);
@@ -2006,7 +2098,7 @@ async function runDayTraderSession(reason) {
                     if (wdt) state.dayTrader = { count: wdt.current, target: wdt.target };
                     await refreshBalances(state, identityToken, proxy);
                     render(global.__states);
-                    if (wdt && (wdt.completed || wdt.current >= wdt.target)) {
+                    if (wdt && (wdt.completed || wdt.current >= wdt.target) && !SWAP.allowOvercap) {
                       logActivity(`[${tag}] DAY_TRADER ${wdt.current}/${wdt.target} kebaca pas nunggu settle`, COLOR.green);
                       done = need; break;
                     }
@@ -2111,9 +2203,133 @@ function scheduleDaily({ hour, minute, timezone, fn }) {
 }
 
 // ============================================================================
+//  Web dashboard push (config-driven, no secrets in code) — lihat web.md §4d
+//  config.json "dashboard": { enabled, url, api_key, source_id, push_interval_seconds }
+//  Ship BLANK + disabled. Operator isi url + api_key sendiri lalu set enabled:true.
+// ============================================================================
+const DASH = Object.assign(
+  { enabled: false, url: '', api_key: '', source_id: 'node-1', push_interval_seconds: 30 },
+  CONFIG.dashboard || {}
+);
+const PROC_START = Date.now();
+
+// Ekstrak saldo CC (amulet) & USDCx dari state.balances → { unlocked, locked }.
+function balanceOf(state, tokenId) {
+  const arr = Array.isArray(state.balances) ? state.balances : [];
+  const b = arr.find(x => String((x.instrumentId && x.instrumentId.id) || '').toLowerCase() === tokenId);
+  if (!b) return { unlocked: 0, locked: 0 };
+  const unlocked = Number(b.totalUnlockedBalance ?? b.totalBalance ?? 0);
+  const total = Number(b.totalBalance ?? 0);
+  return { unlocked, locked: Math.max(0, total - unlocked) };
+}
+function buildDashboardItems(states) {
+  return (states || []).map(s => ({
+    label: s.label || s.email,
+    email: s.email,
+    status: s.status || 'idle',
+    message: s.message || '',
+    dayTrader: s.dayTrader ? { count: Number(s.dayTrader.count) || 0, target: Number(s.dayTrader.target) || 0 } : null,
+    points: (s.points != null && Number.isFinite(Number(s.points))) ? Number(s.points) : null,
+    cc: balanceOf(s, 'amulet'),
+    usdcx: balanceOf(s, 'usdcx'),
+    silvanaExpMs: s.silvanaExpMs || 0,
+    tokenExpMs: s.tokenExpMs || 0,
+  }));
+}
+function dashboardPayload(states) {
+  const recent = DASH_ACTIVITY.slice(-50);
+  return {
+    sourceId: DASH.source_id || 'node-1',
+    version: (typeof pkgVersion !== 'undefined' ? pkgVersion : undefined),
+    uptimeSec: Math.round((Date.now() - PROC_START) / 1000),
+    accounts: buildDashboardItems(states),
+    schedule: { hour: Number(SCHED.hour) || 7, minute: Number(SCHED.minute) || 0, timezone: SCHED.timezone || 'Asia/Jakarta' },
+    swapConfig: { mode: SWAP_MODE, minAmount: String(SWAP_MIN_AMOUNT), maxAmount: String(SWAP_MAX_AMOUNT), maxFeeCC: SWAP.maxFeeCC },
+    sessionRunning: !!dtSessionRunning,
+    prices: { ccUsdcx: CC_PRICE.ccUsdcx || 0 },
+    recentActivity: recent,
+    burnEvents: BURN_EVENTS.slice(-50),
+    timestamp: Date.now(),
+  };
+}
+async function pushToDashboard() {
+  if (!DASH.enabled || !DASH.url || !DASH.api_key) return; // hard gate — silent no-op
+  try {
+    const base = String(DASH.url).replace(/\/+$/, '');
+    await request('POST', base + '/api/push', {
+      headers: { 'Content-Type': 'application/json', 'X-API-Key': DASH.api_key },
+      body: JSON.stringify(dashboardPayload(global.__states || [])),
+      timeoutMs: 15000,
+    });
+  } catch (_) { /* silent — jangan spam, jangan print key */ }
+}
+// Tarik perintah dari dashboard (swap_now / refresh / cleanup), eksekusi, ack.
+async function pollDashboardCommands() {
+  if (!DASH.enabled || !DASH.url || !DASH.api_key) return;
+  const base = String(DASH.url).replace(/\/+$/, '');
+  let cmds = [];
+  try {
+    const r = await request('GET', base + `/api/commands?sourceId=${encodeURIComponent(DASH.source_id || 'node-1')}`, {
+      headers: { 'X-API-Key': DASH.api_key }, timeoutMs: 12000,
+    });
+    cmds = (r.json && Array.isArray(r.json.commands)) ? r.json.commands : [];
+  } catch (_) { return; }
+  for (const cmd of cmds) {
+    let status = 'done', result = null;
+    try {
+      if (cmd.type === 'swap_now') {
+        logActivity('Dashboard: jalankan sesi swap', COLOR.cyan);
+        runDayTraderSession('dashboard').catch(() => { });
+      } else if (cmd.type === 'refresh') {
+        logActivity('Dashboard: refresh data', COLOR.cyan);
+        if (!dtSessionRunning && global.__states) tickAll(global.__states).catch(() => { });
+      } else if (cmd.type === 'cleanup') {
+        logActivity('Dashboard: cleanup proposal nyangkut', COLOR.cyan);
+        for (const st of (global.__states || [])) {
+          try { const c = await buildSwapClients(st); await cleanupStaleProposals(c.sv, c.partyId); } catch (_) { }
+        }
+      } else if (cmd.type === 'set_modal') {
+        const a = cmd.args || {};
+        const newMin = Number(a.minAmount), newMax = Number(a.maxAmount);
+        if (Number.isFinite(newMin) && newMin >= 0) SWAP_MIN_AMOUNT = newMin;
+        if (Number.isFinite(newMax) && newMax >= 0) SWAP_MAX_AMOUNT = newMax;
+        // persist ke config.json biar survive restart
+        try {
+          const cfg = loadJSON(CFG_PATH, {});
+          cfg.swap = cfg.swap || {};
+          cfg.swap.minAmount = String(SWAP_MIN_AMOUNT);
+          cfg.swap.maxAmount = String(SWAP_MAX_AMOUNT);
+          saveJSON(CFG_PATH, cfg);
+        } catch (_) { }
+        result = `modal → min ${SWAP_MIN_AMOUNT} max ${SWAP_MAX_AMOUNT || '∞'}`;
+        logActivity(`Dashboard: set modal min ${SWAP_MIN_AMOUNT} max ${SWAP_MAX_AMOUNT || '∞'} CC`, COLOR.green);
+      } else { status = 'failed'; result = 'unknown command'; }
+    } catch (e) { status = 'failed'; result = (e && e.message) || String(e); }
+    try {
+      await request('POST', base + '/api/command-ack', {
+        headers: { 'Content-Type': 'application/json', 'X-API-Key': DASH.api_key },
+        body: JSON.stringify({ sourceId: DASH.source_id || 'node-1', id: cmd.id, status, result }),
+        timeoutMs: 12000,
+      });
+    } catch (_) { }
+  }
+}
+function startDashboardPush() {
+  if (!DASH.enabled || !DASH.url || !DASH.api_key) return null; // disabled by default
+  const ms = Math.max(5, Number(DASH.push_interval_seconds) || 30) * 1000;
+  setTimeout(pushToDashboard, 10000);     // biar app init dulu
+  setInterval(pushToDashboard, ms);
+  setInterval(pollDashboardCommands, Math.max(10000, ms)); // poll perintah
+  logActivity(`Dashboard push aktif → ${String(DASH.url).replace(/^https?:\/\//, '')} tiap ${Math.round(ms / 1000)}s`, COLOR.gray);
+  return true;
+}
+
+// ============================================================================
 //  Main + sub-command paste
 // ============================================================================
 async function runMain() {
+  logActivity(`Proxy: ${PROXIES.length} loaded (enabled=${PROXY_ENABLED}, file=${PROXY_FILE})`, PROXIES.length ? COLOR.green : COLOR.yellow);
+  if (PROXIES.length) PROXIES.forEach((p, i) => logActivity(`  proxy[${i}]: ${p.host}:${p.port} auth=${!!p.auth}`, COLOR.gray));
   const states = makeStates();
   global.__states = states;
   process.stdout.on('resize', () => { try { render(global.__states); } catch (_) { } });
@@ -2122,6 +2338,13 @@ async function runMain() {
   if (argv[0] === 'once') process.exit(0);
 
   scheduleDaily({ hour: Number(SCHED.hour) || 7, minute: Number(SCHED.minute) || 0, timezone: SCHED.timezone || 'Asia/Jakarta', fn: async (why) => { await runDayTraderSession(why); if (!dtSessionRunning) await tickAll(states).catch(() => { }); } });
+  startDashboardPush();
+
+  // Keep-alive token tiap KEEPALIVE_SEC (default 120s) — jaga Silvana+Supa gak
+  // pernah expired walau quest udah selesai. Ringan, skip saat sesi swap jalan.
+  const KA_MS = Math.max(60, Number((CONFIG.dashboard || {}).keepAliveSec) || 120) * 1000;
+  setInterval(() => { if (!dtSessionRunning) keepAliveAll(states).catch(() => { }); }, KA_MS);
+
   runDayTraderSession('startup').then(() => tickAll(states).catch(() => { })).catch(e => logActivity('sesi startup error: ' + e.message, COLOR.red));
 
   while (true) {
@@ -2375,9 +2598,39 @@ Usage:
       if (n) process.stdout.write(paint(`  ${n} proposal nyangkut dibersihin\n`, COLOR.green));
       process.exit(0);
     })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
-  } else {
+  } else if (argv.length === 0) {
     if (!ACCOUNTS.length) { console.error(paint('accounts.json kosong. Jalankan: node index.js register', COLOR.red)); process.exit(1); }
-    runMain().catch(e => { console.error(paint('FATAL: ' + (e && e.stack || e), COLOR.red)); process.exit(1); });
+    (async () => {
+      process.stdout.write('\n' + paint('SilvanaBot-Sipal', COLOR.bold + COLOR.cyan) + '\n');
+      process.stdout.write(paint('  1) run            — dashboard + auto DAY_TRADER', COLOR.gray) + '\n');
+      process.stdout.write(paint('  2) check balance  — cek CC & USDCx semua akun', COLOR.gray) + '\n');
+      const ans = (await prompt(paint('pilih [1/2]: ', COLOR.bold))).trim();
+      if (ans === '2') {
+        const states = makeStates();
+        for (const s of states) {
+          process.stdout.write('\n' + paint('▎ ' + (s.label || s.email), COLOR.bold + COLOR.cyan) + '\n');
+          try {
+            const proxy = pickProxy(s.privyEmail || s.email);
+            const token = await ensurePrivyToken(s);
+            const bal = await supaBalances(token, proxy);
+            s.balances = (bal && bal.tokens) || [];
+            const cc = balanceOf(s, 'amulet');
+            const usdcx = balanceOf(s, 'usdcx');
+            const fmt = (b) => paint(fmtNum(b.unlocked), COLOR.green) + (b.locked > 1e-8 ? paint(' (+' + fmtNum(b.locked) + ' locked)', COLOR.gray) : '');
+            process.stdout.write('  CC    : ' + fmt(cc) + '\n');
+            process.stdout.write('  USDCx : ' + fmt(usdcx) + '\n');
+          } catch (e) {
+            process.stdout.write(paint('  ERROR: ' + ((e && e.message) || e) + '\n', COLOR.red));
+          }
+        }
+        process.stdout.write('\n');
+        process.exit(0);
+      }
+      runMain().catch(e => { console.error(paint('FATAL: ' + (e && e.stack || e), COLOR.red)); process.exit(1); });
+    })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
+  } else {
+    console.error(paint('cmd tidak dikenal: ' + argv[0] + '. Lihat: node index.js help', COLOR.red));
+    process.exit(1);
   }
   process.on('SIGINT', () => { process.stdout.write('\n' + paint('bye 👋', COLOR.gray) + '\n'); process.exit(0); });
 }

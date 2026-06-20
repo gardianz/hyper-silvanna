@@ -19,11 +19,10 @@
   },
   "dashboard": {
     "refreshSec": 300,
-    "enabled": true,
+    "enabled": false,
     "url": "",
     "api_key": "",
     "source_id": "node-1",
-    "push_interval_seconds": 30,
     "_keterangan": "Push data ke web dashboard. Isi 'url' (mis. https://silvana.ipalta.site) + 'api_key' sendiri, lalu set enabled:true. JANGAN commit api_key asli. Tiap VPS pakai source_id unik."
   },
   "schedule": {
@@ -32,7 +31,7 @@
     "timezone": "Asia/Jakarta"
   },
   "proxy": {
-    "enabled": true,
+    "enabled": false,
     "file": "proxy.txt"
   }
 }
