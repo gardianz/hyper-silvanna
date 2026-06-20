@@ -128,19 +128,18 @@ const SWAP = {
   dailySwapCount: Math.max(1, Number((CONFIG.swap || {}).dailySwapCount) || 10),
   privyAppId: PRIVY_APP_ID, privyClientId: PRIVY_CLIENT_ID,
   actionIds: {
-    // Updated 2026-06-20 — Silvana redeployed frontend, semua next-action ID berubah.
-    // getAllocationFactory + submitPreconfirmation DIHAPUS dari flow baru.
-    // getPrice pindah ke REST /api/swap {op:"price"} — lihat sv.getPrice().
-    estimateFee: '400c57a2110a4336a5b615434850f11563623bf338',
-    acceptQuote: '4099612557ee022a2a78994954c158c4e01cd3b931',
-    recordEvent: '40727ac254af318d0c028321dac7ab8c86ef749c25',
-    listProposals: '40bd6bd86eefa2c90c8068cf0af03438f6dbd5e85f',
-    pollProposal: '401bc64b830c9949814e4a7a38805623a8ec05e5ab',
-    getMultiCall: '4098a1f92f014fc6d0bcdcc5b73954f2e75fa6b163',
-    prepareDvpFee: '40cf8e4843620df82ab116882f57b4d9ddb36da1f2',
-    prepareTransfer: '40f128fd516b7e56191c54baf36fc0ecc87576469d',
-    getAllocFactory: '60c923ff5915b45b2bdbb69efcd6cf1808d63579a1',
-    execSettle: '406104d4b9496f54e9d55bf9a464d416558d25bb76',
+    // Updated 2026-06-20 (2nd redeploy) — semua next-action ID berubah lagi.
+    // listInstruments (401909e5...) + null-returning mystery (40d18992...) tidak dipakai bot.
+    estimateFee: '40e9582b140c4343bb55af1eb88942d63c2d32c9be',
+    acceptQuote: '4012800870f813c34d04e05804d096f6deb11678cd',
+    recordEvent: '40d04468f868f0fcafe0127301da5c8fac97c4011e',
+    listProposals: '4096130905471284c9cc8a15f437ba491d444f5ce2',
+    pollProposal: '40422714ece14559f52f7b3673a391143bc676aa6b',
+    getMultiCall: '40420c6b4c45d1e4316f721f64e78b618c94d00d54',
+    prepareDvpFee: '401b91594a675ac0e6f79ae040b5348efa1e648096',
+    prepareTransfer: '40167a239de8cd6237c48f06fc6429c5a77acf4f82',
+    getAllocFactory: '605b531ec791633b68d16a40b01a7bd91581ffe3d7',
+    execSettle: '40492a3b5969d7933a4bfec7e6e970aade22bdda12',
   },
   // Package ID untuk Splice.Api.Token.AllocationInstructionV1 — dipakai
   // saat membangun ExerciseCommand AllocationFactory_Allocate.
@@ -315,6 +314,25 @@ function pickProxy(email) {
   if (!PROXIES.length) return null;
   const hash = parseInt(crypto.createHash('sha1').update(String(email)).digest('hex').slice(0, 8), 16);
   return PROXIES[hash % PROXIES.length];
+}
+
+// Proxy rotation — keyed on canonical account email (state.email).
+// Offset reset tiap bot restart. Naik 1 setiap proxy error terdeteksi.
+const _proxyOffset = {};
+function getProxy(email) {
+  if (!PROXIES.length) return null;
+  const off = _proxyOffset[email] || 0;
+  const hash = parseInt(crypto.createHash('sha1').update(String(email)).digest('hex').slice(0, 8), 16);
+  return PROXIES[(hash + off) % PROXIES.length];
+}
+function rotateProxy(email) {
+  if (PROXIES.length <= 1) return getProxy(email);
+  _proxyOffset[email] = ((_proxyOffset[email] || 0) + 1) % PROXIES.length;
+  return getProxy(email);
+}
+function isProxyErr(e) {
+  const m = (e && e.message) || String(e);
+  return /proxy connect timeout|proxy CONNECT failed/i.test(m);
 }
 
 // ============================================================================
@@ -964,7 +982,7 @@ function prompt(question) {
 async function ensurePrivyToken(state) {
   const email = state.email;
   const privyEmail = state.privyEmail || email;
-  const proxy = pickProxy(privyEmail);
+  const proxy = getProxy(email);
   state.proxyHost = proxy ? `${proxy.host}:${proxy.port}` : null;
 
   const cached = getValidPrivySession(email);
@@ -1005,7 +1023,7 @@ async function ensureSilvanaSession(state) {
   const email = state.email;
   const pk = getPasskey(email);
   if (!pk) return null;
-  const proxy = pickProxy(email);
+  const proxy = getProxy(email);
   const _rawCookies = loadCookies(email);
   delete _rawCookies.geo_status; // never send geo_status=blocked — let server re-eval based on current IP
   const jar = new CookieJar(_rawCookies);
@@ -1383,7 +1401,7 @@ function row2(left, right) {
 }
 
 function renderHeader() {
-  return [line(), row(paint(' SilvanaBot V1.2 Auto Swap ', COLOR.bold + COLOR.cyan)), row(paint(new Date().toLocaleString('id-ID'), COLOR.gray))].join('\n');
+  return [line(), row(paint(' SilvanaBot V1.3 Auto Swap ', COLOR.bold + COLOR.cyan)), row(paint(new Date().toLocaleString('id-ID'), COLOR.gray))].join('\n');
 }
 function statusBadge(state) {
   const d = state.dayTrader;
@@ -1626,7 +1644,7 @@ function shortSwapReason(err) {
 }
 async function buildSwapClients(state) {
   const email = state.email;
-  const proxy = pickProxy(state.privyEmail || email);
+  const proxy = getProxy(email);
   const identityToken = await ensurePrivyToken(state);
   const pat = (acctSession(email).privy || {}).privy_access_token;
   if (!pat) throw new Error('privy_access_token tidak ada di session');
@@ -1787,7 +1805,16 @@ async function runDayTraderSession(reason) {
       const state = (global.__states && global.__states[i]) || makeStates()[i];
       try {
         state.status = 'login'; render(global.__states);
-        let clients = await buildSwapClients(state);
+        let clients;
+        for (let _pb = 0; _pb <= Math.min(PROXIES.length - 1, 2); _pb++) {
+          try { clients = await buildSwapClients(state); break; }
+          catch (e) {
+            if (isProxyErr(e) && PROXIES.length > 1 && _pb < Math.min(PROXIES.length - 1, 2)) {
+              const np = rotateProxy(a.email);
+              logActivity(`[${tag}] proxy error saat login → rotate ke ${np ? np.host + ':' + np.port : '-'}`, COLOR.yellow);
+            } else { throw e; }
+          }
+        }
         let { sv, partyId, identityToken, proxy } = clients;
         state.status = 'ok';
         let userServiceCid = getUserServiceCid(a.email);
@@ -2049,6 +2076,18 @@ async function runDayTraderSession(reason) {
                 if (e && e.transient && attempt < TRANSIENT_MAX_RETRY) {
                   logActivity(`[${tag}] ${shortSwapReason(e)} — retry ${attempt}/${TRANSIENT_MAX_RETRY - 1}`, COLOR.yellow);
                   await sleep(TRANSIENT_RETRY_DELAY_MS);
+                  continue;
+                }
+                if (isProxyErr(e) && PROXIES.length > 1 && attempt < TRANSIENT_MAX_RETRY) {
+                  const np = rotateProxy(a.email);
+                  logActivity(`[${tag}] proxy error → rotate ke ${np ? np.host + ':' + np.port : '-'} (retry ${attempt}/${TRANSIENT_MAX_RETRY - 1})`, COLOR.yellow);
+                  try {
+                    clients = await buildSwapClients(state);
+                    ({ sv, partyId, identityToken, proxy } = clients);
+                  } catch (re) {
+                    logActivity(`[${tag}] rebuild clients gagal: ${(re && re.message) || re}`, COLOR.red);
+                  }
+                  await sleep(2000);
                   continue;
                 }
                 throw e;
