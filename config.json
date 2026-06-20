@@ -1,0 +1,38 @@
+{
+  "_help_mode": "maxReserve = rata kanan, cap maxAmount, sisakan reserveCC. minmax = amount acak minAmount..maxAmount, abaikan reserve (sisain fee). maxAmount 0 = tak terbatas.",
+  "swap": {
+    "mode": "minmax",
+    "minCC": "5",
+    "reserveCC": "5",
+    "minAmount": "5",
+    "maxAmount": "5.1",
+    "maxFeeCC": 3.6,
+    "feeSpikeWaitSec": 300,
+    "maxStuckBeforeStop": 2,
+    "stuckPollSec": 300,
+    "_help_closeWithCC": "true = tutup hari pegang CC. Swap ke-9 dipaksa sell (isi USDCx), swap ke-10 dipaksa buy SEMUA USDCx jadi CC (floor=minAmount, max bebas). false = matiin.",
+    "closeWithCC": true,
+    "_help_dailySwapCount": "Target swap per hari. Default 10 (sama dengan DAY_TRADER). Boleh diturunkan (mis 5) atau dinaikkan (butuh allowOvercap=true).",
+    "dailySwapCount": 10,
+    "_help_allowOvercap": "false = stop di batas DAY_TRADER API (anti-overcap, aman). true = boleh swap lebih dari 10/10; verifikasi DAY_TRADER tetap di-log tapi tidak gate stop. Pakai bareng dailySwapCount > 10.",
+    "allowOvercap": false
+  },
+  "dashboard": {
+    "refreshSec": 300,
+    "enabled": true,
+    "url": "",
+    "api_key": "",
+    "source_id": "node-1",
+    "push_interval_seconds": 30,
+    "_keterangan": "Push data ke web dashboard. Isi 'url' (mis. https://silvana.ipalta.site) + 'api_key' sendiri, lalu set enabled:true. JANGAN commit api_key asli. Tiap VPS pakai source_id unik."
+  },
+  "schedule": {
+    "hour": 7,
+    "minute": 0,
+    "timezone": "Asia/Jakarta"
+  },
+  "proxy": {
+    "enabled": true,
+    "file": "proxy.txt"
+  }
+}

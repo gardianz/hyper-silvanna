@@ -1,0 +1,13 @@
+{
+  "name": "silvana-bot-sipal",
+  "version": "0.2.0",
+  "description": "Silvana / Supanova auto bot - login, balance & auto-swap (DAY_TRADER 10/10 harian)",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "node-cron": "^3.0.3"
+  }
+}

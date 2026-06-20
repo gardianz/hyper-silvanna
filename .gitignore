@@ -1,0 +1,15 @@
+# Sensitive — JANGAN commit
+accounts.json
+session.json
+proxy.txt
+swap-debug.log
+proxy-assignments.json
+
+# Keep example files
+!accounts.example.json
+!config.example.json
+!proxy.example.txt
+
+# Node
+node_modules/
+__MACOSX/
