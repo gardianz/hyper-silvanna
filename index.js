@@ -769,7 +769,7 @@ function buildMultiCallAccept(p) {
 const SWAP_STATE_TREE = encodeURIComponent(JSON.stringify(['', { children: ['(app)', { children: ['swap', { children: ['__PAGE__', {}, null, null] }, null, null] }, null, null] }, null, null, true]));
 // Server-action ID Silvana untuk discover party (POST /connect dari halaman /connect).
 // Hasilkan { partyId, partyName, userServiceCid, ... } dari on-chain.
-const CONNECT_RECOVER_ACTION = '40d678c69abe3b059b9ac71f04ee5e5b3393d56043';
+const CONNECT_RECOVER_ACTION = '405be033668f041e0f52850927fc3bdc84afab50f4';
 const CONNECT_STATE_TREE = encodeURIComponent(JSON.stringify(['', { children: ['connect', { children: ['__PAGE__', {}, null, null] }, null, null] }, null, null, true]));
 
 class SilvanaClient {
@@ -1401,7 +1401,7 @@ function row2(left, right) {
 }
 
 function renderHeader() {
-  return [line(), row(paint(' SilvanaBot V1.3 Auto Swap ', COLOR.bold + COLOR.cyan)), row(paint(new Date().toLocaleString('id-ID'), COLOR.gray))].join('\n');
+  return [line(), row(paint(' SilvanaBot V1.4 Auto Swap ', COLOR.bold + COLOR.cyan)), row(paint(new Date().toLocaleString('id-ID'), COLOR.gray))].join('\n');
 }
 function statusBadge(state) {
   const d = state.dayTrader;
@@ -2366,7 +2366,26 @@ function startDashboardPush() {
 // ============================================================================
 //  Main + sub-command paste
 // ============================================================================
+function cleanGeoBlockedCookies() {
+  try {
+    const raw = fs.readFileSync(SESS_PATH, 'utf8');
+    const data = JSON.parse(raw);
+    let changed = 0;
+    for (const k of Object.keys(data)) {
+      if (data[k].silvanaCookies && data[k].silvanaCookies.geo_status) {
+        delete data[k].silvanaCookies.geo_status;
+        changed++;
+      }
+    }
+    if (changed) {
+      fs.writeFileSync(SESS_PATH, JSON.stringify(data, null, 2));
+      logActivity(`Startup: hapus geo_status dari ${changed} akun di session.json`, COLOR.yellow);
+    }
+  } catch (_) { }
+}
+
 async function runMain() {
+  cleanGeoBlockedCookies();
   logActivity(`Proxy: ${PROXIES.length} loaded (enabled=${PROXY_ENABLED}, file=${PROXY_FILE})`, PROXIES.length ? COLOR.green : COLOR.yellow);
   if (PROXIES.length) PROXIES.forEach((p, i) => logActivity(`  proxy[${i}]: ${p.host}:${p.port} auth=${!!p.auth}`, COLOR.gray));
   const states = makeStates();
