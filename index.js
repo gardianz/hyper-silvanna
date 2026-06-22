@@ -128,18 +128,18 @@ const SWAP = {
   dailySwapCount: Math.max(1, Number((CONFIG.swap || {}).dailySwapCount) || 10),
   privyAppId: PRIVY_APP_ID, privyClientId: PRIVY_CLIENT_ID,
   actionIds: {
-    // Updated 2026-06-20 (2nd redeploy) — semua next-action ID berubah lagi.
-    // listInstruments (401909e5...) + null-returning mystery (40d18992...) tidak dipakai bot.
-    estimateFee: '40e9582b140c4343bb55af1eb88942d63c2d32c9be',
-    acceptQuote: '4012800870f813c34d04e05804d096f6deb11678cd',
-    recordEvent: '40d04468f868f0fcafe0127301da5c8fac97c4011e',
-    listProposals: '4096130905471284c9cc8a15f437ba491d444f5ce2',
-    pollProposal: '40422714ece14559f52f7b3673a391143bc676aa6b',
-    getMultiCall: '40420c6b4c45d1e4316f721f64e78b618c94d00d54',
-    prepareDvpFee: '401b91594a675ac0e6f79ae040b5348efa1e648096',
-    prepareTransfer: '40167a239de8cd6237c48f06fc6429c5a77acf4f82',
-    getAllocFactory: '605b531ec791633b68d16a40b01a7bd91581ffe3d7',
-    execSettle: '40492a3b5969d7933a4bfec7e6e970aade22bdda12',
+    // Updated 2026-06-21 (3rd redeploy) — dari swapp.har.
+    // getAllocFactory belum ada di HAR ini (SELL flow) — perlu HAR BUY untuk update.
+    estimateFee: '40853d23d8306529ee1f7f23ebb36c4ad446695769',
+    acceptQuote: '409a00670bd1e00775bcd352cfc4979b770dfbc02c',
+    recordEvent: '402a33e59e5c86c4e5ba1d565cba09e8bb313b5cde',
+    listProposals: '4040d62927d651f05abd73eb555d2f9db111028663',
+    pollProposal: '404979975fca8a5d8622b6673fb9813ce2c3a856f3',
+    getMultiCall: '40a9512ff6bbcfefa6aed524d334e85f87972cfc9e',
+    prepareDvpFee: '4005408113b0c46df28d99b0a5f4ec39b25ca45fa5',
+    prepareTransfer: '40931cb0b1328dc766d7ea45bf30fda928a2f18377',
+    getAllocFactory: '60bf0f74aebba9dbfd31bebe76e9e478478330ade0',
+    execSettle: '409855e46c145fc27b64e0496bbdce2ee0938e528c',
   },
   // Package ID untuk Splice.Api.Token.AllocationInstructionV1 — dipakai
   // saat membangun ExerciseCommand AllocationFactory_Allocate.
@@ -1255,6 +1255,8 @@ async function swapOnce(ctx, direction, quantityCC) {
     if (totalUsdcx < needUsdcx) {
       const e = new Error(`USDCx kurang: butuh ${needUsdcx.toFixed(4)} hanya punya ${totalUsdcx.toFixed(4)}`);
       e.insufficientBalance = true;
+      e.usdcxNeeded = needUsdcx;
+      e.usdcxHave = totalUsdcx;
       throw e;
     }
     for (const h of usdcxHoldings) { if (!inputHoldingCids.includes(h)) inputHoldingCids.push(h); }
@@ -1401,7 +1403,7 @@ function row2(left, right) {
 }
 
 function renderHeader() {
-  return [line(), row(paint(' SilvanaBot V1.4 Auto Swap ', COLOR.bold + COLOR.cyan)), row(paint(new Date().toLocaleString('id-ID'), COLOR.gray))].join('\n');
+  return [line(), row(paint(' SilvanaBot V1.5 Auto Swap ', COLOR.bold + COLOR.cyan)), row(paint(new Date().toLocaleString('id-ID'), COLOR.gray))].join('\n');
 }
 function statusBadge(state) {
   const d = state.dayTrader;
@@ -1930,7 +1932,7 @@ async function runDayTraderSession(reason) {
             ask = (priceRes && Number(priceRes.ask)) || 0;
           } catch (_) { ask = 0; }
 
-          const usdcxBudget = usdc * 0.95;                            // buffer slippage/fee
+          const usdcxBudget = usdc * 0.95;                            // buffer slippage/fee; kalau actual LP rate lebih mahal, auto-adjust di catch handler
           const buyCapCC = ask > 0 ? floor4(usdcxBudget / ask) : 0;    // kapasitas CC dari USDCx
           const feeBuf = Math.max(0, Number(SWAP.feeBufferCC) || 0);   // CC disisain buat fee (smart)
           const maxAmt = SWAP_MAX_AMOUNT > 0 ? SWAP_MAX_AMOUNT : Infinity;
@@ -2190,18 +2192,37 @@ async function runDayTraderSession(reason) {
               await sleep(waitS * 1000);
               continue;
             }
-            // Kalau buy gagal karena USDCx kurang, fallback ke sell otomatis
+            // Kalau buy gagal karena USDCx kurang, auto-adjust amount berdasarkan
+            // actual LP rate, lalu retry buy. Fallback sell hanya kalau adjusted < min.
             if (e && e.insufficientBalance && direction === 'buy') {
-              logActivity(`[${tag}] ${e.message} → coba sell sebagai gantinya`, COLOR.yellow);
-              try {
-                const res2 = await swapWithRetry('sell', amountCC, 'jual CC→USDCx');
-                if (res2 && res2.ok) {
-                  await handleSuccess('jual CC→USDCx');
-                  continue;
+              let retried = false;
+              if (e.usdcxNeeded && e.usdcxHave && Number(amountCC) > 0) {
+                const lpRatio = e.usdcxNeeded / Number(amountCC); // USDCx per CC (actual LP rate)
+                const adjCC = floor4(e.usdcxHave * 0.94 / lpRatio); // 6% safety margin
+                if (adjCC >= minSwap) {
+                  logActivity(`[${tag}] USDCx kurang (LP rate ${lpRatio.toFixed(6)}/CC) → retry buy ${adjCC} CC (auto-adjusted)`, COLOR.yellow);
+                  try {
+                    const res2 = await swapWithRetry('buy', String(adjCC), 'beli CC (adj)');
+                    if (res2 && res2.ok) {
+                      if (res2.feeCC) recordBurn(res2.feeCC, tag);
+                      await handleSuccess('beli CC (adj)');
+                      done++; stuck = 0; lowFeeStreak = 0;
+                      retried = true;
+                    }
+                  } catch (e2) {
+                    logActivity(`[${tag}] buy adj gagal: ${shortSwapReason(e2)}`, COLOR.yellow);
+                  }
                 }
-              } catch (e2) {
-                if (e2 && e2.noLiquidity) { logActivity(`[${tag}] likuiditas sell belum ada, retry…`, COLOR.gray); await sleep(SWAP.delayBetweenSwapsSec * 1000); continue; }
-                logActivity(`[${tag}] swap sell juga gagal: ${shortSwapReason(e2)}`, COLOR.red);
+              }
+              if (!retried) {
+                logActivity(`[${tag}] ${e.message} → coba sell sebagai gantinya`, COLOR.yellow);
+                try {
+                  const res2 = await swapWithRetry('sell', amountCC, 'jual CC→USDCx');
+                  if (res2 && res2.ok) { await handleSuccess('jual CC→USDCx'); continue; }
+                } catch (e2) {
+                  if (e2 && e2.noLiquidity) { logActivity(`[${tag}] likuiditas sell belum ada, retry…`, COLOR.gray); await sleep(SWAP.delayBetweenSwapsSec * 1000); continue; }
+                  logActivity(`[${tag}] swap sell juga gagal: ${shortSwapReason(e2)}`, COLOR.red);
+                }
               }
             } else {
               logActivity(`[${tag}] swap ${direction} gagal: ${shortSwapReason(e)}`, COLOR.red);
