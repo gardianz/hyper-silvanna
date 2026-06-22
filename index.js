@@ -128,18 +128,24 @@ const SWAP = {
   dailySwapCount: Math.max(1, Number((CONFIG.swap || {}).dailySwapCount) || 10),
   privyAppId: PRIVY_APP_ID, privyClientId: PRIVY_CLIENT_ID,
   actionIds: {
-    // Updated 2026-06-21 (3rd redeploy) — dari swapp.har.
-    // getAllocFactory belum ada di HAR ini (SELL flow) — perlu HAR BUY untuk update.
-    estimateFee: '40853d23d8306529ee1f7f23ebb36c4ad446695769',
-    acceptQuote: '409a00670bd1e00775bcd352cfc4979b770dfbc02c',
-    recordEvent: '402a33e59e5c86c4e5ba1d565cba09e8bb313b5cde',
-    listProposals: '4040d62927d651f05abd73eb555d2f9db111028663',
-    pollProposal: '404979975fca8a5d8622b6673fb9813ce2c3a856f3',
-    getMultiCall: '40a9512ff6bbcfefa6aed524d334e85f87972cfc9e',
-    prepareDvpFee: '4005408113b0c46df28d99b0a5f4ec39b25ca45fa5',
-    prepareTransfer: '40931cb0b1328dc766d7ea45bf30fda928a2f18377',
-    getAllocFactory: '60bf0f74aebba9dbfd31bebe76e9e478478330ade0',
-    execSettle: '409855e46c145fc27b64e0496bbdce2ee0938e528c',
+    // Updated 2026-06-22 (5th redeploy) — fingerprint-verified live (probe RPC).
+    // FALLBACK saja: di-refresh otomatis tiap sesi via discoverActionIds() yg
+    // map by nama RPC (stabil antar-deploy), BUKAN by hash/urutan bundle.
+    // execSettle DIHAPUS: gone dari Silvana, settlement skrg lewat Canton RPC
+    //   (prepare_transaction → submit_prepared). getConsumedHoldings = step baru
+    //   (tak dipakai swapOnce, cuma utk discovery completeness).
+    estimateFee: '404abc7ea1d65345082e03db03333da64750e823c0',
+    acceptQuote: '4057796d62f720638e26d927a2e83d7850ca3b581d',
+    recordEvent: '407e9c97b7a1316ec392e6a3137e29a469be3d0134',
+    listProposals: '40fee850f4e3e17be2ff8dfb9b01f0639837563cc4',
+    pollProposal: '40ebacceda3bbfde913a7538b7c27c1d078ed97a83',
+    getMultiCall: '402b9a131aee87c88b3e81434b418f3250f6c0d3dd',
+    prepareDvpFee: '40e0588ffa9c2d58d0265729be25772f10798a0241',
+    getConsumedHoldings: '408f0c4b9ea4a50b22123ad26dacaf6892e6840877',
+    // prepareTransfer balik blob factory (verified byte-identik vs 30.har).
+    // BUKAN 40bbe26c — itu helper getDisclosedContracts yg butuh Canton Bearer.
+    prepareTransfer: '40fabd13d8301102f24bbea9bf9b12ce644195719e',
+    getAllocFactory: '60a079cd069468ad246fea274b8533eeebfa18d1c6',
   },
   // Package ID untuk Splice.Api.Token.AllocationInstructionV1 — dipakai
   // saat membangun ExerciseCommand AllocationFactory_Allocate.
@@ -769,7 +775,10 @@ function buildMultiCallAccept(p) {
 const SWAP_STATE_TREE = encodeURIComponent(JSON.stringify(['', { children: ['(app)', { children: ['swap', { children: ['__PAGE__', {}, null, null] }, null, null] }, null, null] }, null, null, true]));
 // Server-action ID Silvana untuk discover party (POST /connect dari halaman /connect).
 // Hasilkan { partyId, partyName, userServiceCid, ... } dari on-chain.
-const CONNECT_RECOVER_ACTION = '405be033668f041e0f52850927fc3bdc84afab50f4';
+// Fallback saja — di-refresh otomatis via SilvanaClient.discoverConnectAction()
+// kalau /connect redeploy bikin ID stale (lihat recoverParty self-heal).
+// Updated 2026-06-22 (fingerprint-verified: response {success:true, party:{...}}).
+let CONNECT_RECOVER_ACTION = '4060ed8c2112383dd540bec9a67f031d18f20eaf4a';
 const CONNECT_STATE_TREE = encodeURIComponent(JSON.stringify(['', { children: ['connect', { children: ['__PAGE__', {}, null, null] }, null, null] }, null, null, true]));
 
 class SilvanaClient {
@@ -829,8 +838,163 @@ class SilvanaClient {
       body: JSON.stringify(args || []),
     }));
     if (r.status === 401 || r.status === 403) { const e = new Error(`swapAction ${actionId} status=${r.status}`); e.unauthorized = true; logDebug(`swapAction ${actionId} ${r.status}`, r.text || ''); throw e; }
-    if (r.status !== 200) { logDebug(`swapAction ${actionId} ${r.status}`, r.text || ''); throw new Error(`swapAction ${actionId} status=${r.status} body=${(r.text || '').slice(0, 160)}`); }
+    if (r.status !== 200) {
+      // 404 = next-action ID gak dikenal server → kemungkinan Silvana redeploy
+      // mid-run. Tandai perlu re-discover di sesi berikutnya (self-heal).
+      if (r.status === 404) actionIdsVerified = false;
+      logDebug(`swapAction ${actionId} ${r.status}`, r.text || '');
+      throw new Error(`swapAction ${actionId} status=${r.status} body=${(r.text || '').slice(0, 160)}`);
+    }
     return actionResult(r.text || '');
+  }
+
+  /**
+   * Probe mentah 1 next-action (tanpa throw). Balikin status + raw RSC text +
+   * value baris "1:" (kalau JSON). Dipakai discoverActionIds buat fingerprint
+   * tanpa kehilangan raw text (blob prepareDvpFee ada di baris "2:T...").
+   */
+  async _probeAction(actionId, args, timeoutMs = 9000) {
+    try {
+      const r = await request('POST', `${APP_BASE}/swap`, this._opts({
+        timeoutMs,
+        headers: this._hdr({ 'Accept': 'text/x-component', 'Content-Type': 'text/plain;charset=UTF-8', 'Referer': APP_BASE + '/swap', 'next-action': actionId, 'next-router-state-tree': SWAP_STATE_TREE }),
+        body: JSON.stringify(args || []),
+      }));
+      const text = r.text || '';
+      const line1 = text.split('\n').find(l => l.startsWith('1:'));
+      let val = null;
+      if (line1) { try { val = JSON.parse(line1.slice(2)); } catch (_) { } }
+      return { status: r.status, text, val };
+    } catch (_) { return { status: 0, text: '', val: null }; }
+  }
+
+  /**
+   * Cek cepat (1 request) apakah SWAP.actionIds.listProposals masih valid.
+   * listProposals([partyId]) balikin {success:true, proposals:[...]} kalau ID
+   * benar (BUKAN array telanjang — itu bug fetch_id lama); 404/null kalau stale.
+   */
+  async validateActionIds(partyId) {
+    if (!partyId) return false;
+    const r = await this._probeAction(SWAP.actionIds.listProposals, [partyId]);
+    return !!(r.status === 200 && r.val && Array.isArray(r.val.proposals));
+  }
+
+  /**
+   * Auto-discover next-action IDs dari bundle JS Silvana, FINGERPRINT-BASED.
+   *
+   * Silvana redeploy ~harian → hash next-action berubah + urutan bundle acak,
+   * JADI mapping by-order (fetch_id.js lama) tidak reliable. Tapi nama RPC di
+   * pesan error server STABIL antar-deploy. Strategi:
+   *   1. Scan semua chunk /_next → kumpulkan kandidat ID 0x40/0x60.
+   *   2. Probe tiap kandidat dgn [partyId], cocokkan signature (nama RPC/shape).
+   *   3. prepareDvpFee + getConsumedHoldings balik null ke probe [partyId] →
+   *      pass-2: probe pakai proposalId asli dari listProposals; prepareDvpFee
+   *      balik blob fee-context (CgMyL / baris "2:T"), getConsumedHoldings balik
+   *      {consumedAmuletCids}.
+   * Mutasi SWAP.actionIds in-place. Tidak butuh urutan bundle sama sekali.
+   *
+   * @param {string} partyId
+   * @returns {{ok:boolean, changed:string[], found:string[], missing:string[]}}
+   */
+  async discoverActionIds(partyId) {
+    // 1. Fetch /swap page + kumpulkan URL chunk (+ _buildManifest.js).
+    const page = await request('GET', `${APP_BASE}/swap`, this._opts({
+      headers: this._hdr({ 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8', 'Referer': APP_BASE + '/' }),
+    }));
+    const html = page.text || '';
+    const chunkUrls = new Set();
+    let m;
+    const reChunk = /\/_next\/static\/chunks\/[^"' \n\r]+\.js/g;
+    while ((m = reChunk.exec(html)) !== null) chunkUrls.add(m[0]);
+    const buildMatch = html.match(/"buildId"\s*:\s*"([^"]+)"/);
+    if (buildMatch) {
+      try {
+        const bm = await request('GET', `${APP_BASE}/_next/static/${buildMatch[1]}/_buildManifest.js`, this._opts({ timeoutMs: 8000 }));
+        for (const cc of ((bm.text || '').match(/static\/chunks\/[^"'\\]+\.js/g) || [])) chunkUrls.add('/_next/' + cc);
+      } catch (_) { }
+    }
+
+    // 2. Scan chunk → kandidat ID.
+    const ids = [], seen = new Set();
+    for (const url of chunkUrls) {
+      try {
+        const js = await request('GET', `${APP_BASE}${url}`, this._opts({ headers: this._hdr({ 'Referer': APP_BASE + '/swap' }), timeoutMs: 12000 }));
+        if (js.status !== 200) continue;
+        const re = /["']([46][0-9a-f]{41})["']/g;
+        while ((m = re.exec(js.text || '')) !== null) { if (!seen.has(m[1])) { seen.add(m[1]); ids.push(m[1]); } }
+      } catch (_) { }
+    }
+    const out = {};
+    if (!ids.length || !partyId) return { ok: false, changed: [], found: [], missing: Object.keys(SWAP.actionIds) };
+
+    // 3. Pass-1: probe [partyId], fingerprint by nama RPC di error / shape sukses.
+    //    CATATAN: prepareDvpFee & prepareTransfer TIDAK di-fingerprint di sini —
+    //    keduanya balik blob factory ("2:T…CgMyL") yg butuh body khusus; di
+    //    pass-2. JANGAN pakai error "getDisclosedContracts" buat prepareTransfer:
+    //    itu helper standalone yg butuh Canton Bearer (BUKAN prepareTransfer).
+    //    Kandidat blob = yg balik null / E-digest / 500 ke probe [partyId].
+    const blobCands = [];
+    for (const id of ids) {
+      const { status, text, val } = await this._probeAction(id, [partyId]);
+      if (status === 0) continue;
+      const err = (val && (val.error || val.message)) || '';
+      if (val && Array.isArray(val.proposals)) out.listProposals = out.listProposals || id;
+      else if (/estimateSettlementFees/.test(err)) out.estimateFee = id;
+      else if (/\bacceptQuote\b/.test(err)) out.acceptQuote = id;
+      else if (/Unknown event type/.test(err)) out.recordEvent = id;
+      else if (/getSettlementStatus/.test(err)) out.pollProposal = id;
+      else if (/choiceArguments/.test(err) || /DownField\(choiceArguments\)/.test(text)) out.getAllocFactory = id;
+      else if (val && typeof val.contractId === 'string' && val.success === undefined) out.getMultiCall = id;
+      else if (val && Array.isArray(val.consumedAmuletCids)) out.getConsumedHoldings = id;
+      else if (val === null || /^1:E\{/m.test(text) || status === 500) blobCands.push(id); // prepare*-family
+    }
+
+    // 4. Pass-2: prepareDvpFee & prepareTransfer dibedakan dari blobCands lewat
+    //    BENTUK BODY masing-masing — tiap action cuma balik blob ("CgMyL") buat
+    //    body yg sesuai (shape lain → null/error). Body transfer tak butuh
+    //    proposal; body dvpFee butuh proposalId asli dari listProposals.
+    const isBlob = (t) => /CgMyL/.test(t) || /^2:T/m.test(t);
+    if (blobCands.length) {
+      const _now = new Date();
+      const transferBody = [{ sender: partyId, receiver: partyId, amount: '1', instrumentId: { admin: SWAP.dsoPartyId, id: 'Amulet' }, inputHoldingCids: [], requestedAt: _now.toISOString(), executeBefore: new Date(_now.getTime() + 86400000).toISOString() }];
+      let dvpBody = null;
+      if (out.listProposals) {
+        const lp = await this._probeAction(out.listProposals, [partyId]);
+        const props = (lp.val && lp.val.proposals) || [];
+        const mine = props.find(p => p.seller === partyId) || props.find(p => p.buyer === partyId) || props[0];
+        if (mine && mine.proposalId) {
+          const role = mine.seller === partyId ? 'seller' : 'buyer';
+          dvpBody = [{ partyId, feeType: 'dvp_contract', role, proposalId: mine.proposalId, inputHoldingCids: [] }];
+        }
+      }
+      for (const id of blobCands) {
+        if (!out.prepareTransfer) {
+          const rt = await this._probeAction(id, transferBody);
+          if (isBlob(rt.text)) { out.prepareTransfer = id; continue; }
+        }
+        if (!out.prepareDvpFee && dvpBody) {
+          const rd = await this._probeAction(id, dvpBody);
+          if (isBlob(rd.text)) { out.prepareDvpFee = id; continue; }
+        }
+        if (out.prepareTransfer && out.prepareDvpFee) break;
+      }
+    }
+
+    // 5. Terapkan: mutasi SWAP.actionIds in-place, catat yg berubah.
+    const changed = [], found = [], missing = [];
+    for (const name of Object.keys(SWAP.actionIds)) {
+      if (out[name]) {
+        found.push(name);
+        if (SWAP.actionIds[name] !== out[name]) { SWAP.actionIds[name] = out[name]; changed.push(name); }
+      } else {
+        missing.push(name);
+      }
+    }
+    // Wajib ketemu buat swap SELL berjalan. getConsumedHoldings/getAllocFactory
+    // opsional (getConsumedHoldings tak dipakai; getAllocFactory cuma BUY).
+    const critical = ['estimateFee', 'acceptQuote', 'recordEvent', 'listProposals', 'pollProposal', 'getMultiCall', 'prepareDvpFee', 'prepareTransfer'];
+    const ok = critical.every(n => out[n]);
+    return { ok, changed, found, missing };
   }
 
   /**
@@ -841,22 +1005,79 @@ class SilvanaClient {
    * @param {string} partyId  e.g. 'supa1::1220abc...'
    * @returns {object|null}   { partyId, partyName, userServiceCid, ... }
    */
+  // Satu raw POST /connect dgn next-action tertentu (no-throw → status+result).
+  async _connectProbe(actionId, partyId) {
+    try {
+      const r = await request('POST', `${APP_BASE}/connect`, this._opts({
+        timeoutMs: this.timeoutMs,
+        headers: this._hdr({
+          'Accept': 'text/x-component',
+          'Content-Type': 'text/plain;charset=UTF-8',
+          'Referer': APP_BASE + '/connect',
+          'next-action': actionId,
+          'next-router-state-tree': CONNECT_STATE_TREE,
+        }),
+        body: JSON.stringify([partyId]),
+      }));
+      return { status: r.status, result: r.status === 200 ? actionResult(r.text || '') : null };
+    } catch (_) { return { status: 0, result: null }; }
+  }
+
+  /**
+   * Auto-discover CONNECT_RECOVER_ACTION dari bundle /connect (fingerprint).
+   * /connect redeploy juga re-hash ID. Scan bundle → probe tiap kandidat dgn
+   * [partyId] → action yg benar balik {success:true, party:{...}}. Mutasi
+   * CONNECT_RECOVER_ACTION in-place.
+   * @returns {{ok:boolean, id:string|null, changed:boolean}}
+   */
+  async discoverConnectAction(partyId) {
+    if (!partyId) return { ok: false, id: null, changed: false };
+    const page = await request('GET', `${APP_BASE}/connect`, this._opts({
+      headers: this._hdr({ 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8', 'Referer': APP_BASE + '/' }),
+    }));
+    const html = page.text || '';
+    const chunkUrls = new Set();
+    let m;
+    const reChunk = /\/_next\/static\/chunks\/[^"' \n\r]+\.js/g;
+    while ((m = reChunk.exec(html)) !== null) chunkUrls.add(m[0]);
+    const buildMatch = html.match(/"buildId"\s*:\s*"([^"]+)"/);
+    if (buildMatch) {
+      try {
+        const bm = await request('GET', `${APP_BASE}/_next/static/${buildMatch[1]}/_buildManifest.js`, this._opts({ timeoutMs: 8000 }));
+        for (const cc of ((bm.text || '').match(/static\/chunks\/[^"'\\]+\.js/g) || [])) chunkUrls.add('/_next/' + cc);
+      } catch (_) { }
+    }
+    const ids = [], seen = new Set();
+    for (const url of chunkUrls) {
+      try {
+        const js = await request('GET', `${APP_BASE}${url}`, this._opts({ headers: this._hdr({ 'Referer': APP_BASE + '/connect' }), timeoutMs: 12000 }));
+        if (js.status !== 200) continue;
+        const re = /["']([46][0-9a-f]{41})["']/g;
+        while ((m = re.exec(js.text || '')) !== null) { if (!seen.has(m[1])) { seen.add(m[1]); ids.push(m[1]); } }
+      } catch (_) { }
+    }
+    for (const id of ids) {
+      const { status, result } = await this._connectProbe(id, partyId);
+      if (status === 200 && result && result.party && typeof result.party === 'object') {
+        const changed = id !== CONNECT_RECOVER_ACTION;
+        CONNECT_RECOVER_ACTION = id;
+        return { ok: true, id, changed };
+      }
+    }
+    return { ok: false, id: null, changed: false };
+  }
+
   async recoverParty(partyId) {
     if (!partyId) throw new Error('partyId required');
-    const r = await request('POST', `${APP_BASE}/connect`, this._opts({
-      timeoutMs: this.timeoutMs,
-      headers: this._hdr({
-        'Accept': 'text/x-component',
-        'Content-Type': 'text/plain;charset=UTF-8',
-        'Referer': APP_BASE + '/connect',
-        'next-action': CONNECT_RECOVER_ACTION,
-        'next-router-state-tree': CONNECT_STATE_TREE,
-      }),
-      body: JSON.stringify([partyId]),
-    }));
-    if (r.status === 401 || r.status === 403) { const e = new Error(`connect recover status=${r.status}`); e.unauthorized = true; throw e; }
-    if (r.status !== 200) throw new Error(`connect recover status=${r.status} body=${(r.text || '').slice(0, 160)}`);
-    const result = actionResult(r.text || '');
+    let { status, result } = await this._connectProbe(CONNECT_RECOVER_ACTION, partyId);
+    // Self-heal: 404 = ID stale (redeploy) → discover & retry sekali.
+    if (status === 404) {
+      logDebug('recoverParty: CONNECT_RECOVER_ACTION stale (404) → discover');
+      const d = await this.discoverConnectAction(partyId);
+      if (d.ok) ({ status, result } = await this._connectProbe(CONNECT_RECOVER_ACTION, partyId));
+    }
+    if (status === 401 || status === 403) { const e = new Error(`connect recover status=${status}`); e.unauthorized = true; throw e; }
+    if (status !== 200) throw new Error(`connect recover status=${status}`);
     if (result && result.success && result.party) return result.party;
     return null;
   }
@@ -1222,15 +1443,10 @@ async function swapOnce(ctx, direction, quantityCC) {
     throw e;
   }
 
-  // execSettle HARUS dipanggil SEBELUM prepare_transaction (terbukti di 14/14
-  // HAR manual yg sukses: prepareDvpFee → execSettle → prepareTransfer → prepare).
-  // Ini yg menyiapkan/men-trigger eksekusi settlement di sisi Silvana. Tanpa ini
-  // tx Canton tetap ke-submit (valid) TAPI DvP gak pernah finalize → DAY_TRADER
-  // gak naik → bot keliatan "stuck submitted tapi gak settle".
-  const es = await sv.swapAction(A.execSettle, [{ proposalId, partyId }]).catch(e => ({ _err: (e && e.message) || String(e) }));
-  logDebug('execSettle (pre-prepare) response', es);
-  if (es && es._err) log(`⚠ execSettle gagal: ${es._err}`);
-  else if (es && es.success === false) log('⚠ execSettle success=false');
+  // execSettle DIHAPUS (4th redeploy / swap_sell/30.har): action ini sudah gone
+  // dari Silvana. Flow SELL skrg: prepareDvpFee → getConsumedHoldings →
+  // prepareTransfer → getAllocFactory → prepare_transaction → submit_prepared.
+  // Settlement di-trigger oleh submit_prepared (Canton RPC), bukan execSettle.
 
   const _now = new Date();
   const _totalFee = addDp(feeCtx.feeAmountCC || '0', feeCtx.counterpartFeeAmountCC || '0');
@@ -1340,8 +1556,8 @@ async function swapOnce(ctx, direction, quantityCC) {
     if (q && (q.status === 'failed' || q.status === 'rejected')) throw new Error(`transaksi ${q.status}: ${q.message || ''}`);
     await sleep(SWAP.completionPollMs);
   }
-  // (execSettle sudah dipanggil SEBELUM prepare_transaction — lihat di atas.
-  //  Tidak dipanggil lagi di sini; di flow manual web hanya 1x, pre-prepare.)
+  // Settlement di-finalize oleh submit_prepared (Canton RPC) di atas — tidak ada
+  // execSettle lagi (gone sejak 4th redeploy).
   return { ok: true, direction, proposalId, submissionId: sub.submissionId, completed: !!completion, feeCC: Number.isFinite(realFeeCC) ? realFeeCC : null };
 }
 
@@ -1618,6 +1834,9 @@ async function keepAliveAll(states) {
 //  DAY_TRADER engine — API-driven, anti-overcap (no local count file)
 // ============================================================================
 let dtSessionRunning = false;
+// Sekali per-proses: true setelah action IDs diverifikasi/di-discover valid.
+// Reset jadi false otomatis saat swapAction kena 404 (redeploy mid-run).
+let actionIdsVerified = false;
 function makeStates() {
   return ACCOUNTS.map((a, i) => ({ label: a.label || `akun-${i + 1}`, email: a.email, privyEmail: a.privyEmail || null, status: 'idle', message: '', balances: null, dayTrader: null }));
 }
@@ -1835,6 +2054,27 @@ async function runDayTraderSession(reason) {
             logActivity(`[${tag}] recoverParty gagal: ${(e && e.message) || e}`, COLOR.red);
           }
         }
+        // AUTO-DISCOVER next-action IDs: cek murah dulu (probe listProposals).
+        // Kalau stale (Silvana redeploy) → scan bundle JS & remap SWAP.actionIds.
+        // Self-heal: gak perlu lagi update ID manual dari HAR tiap redeploy.
+        if (!actionIdsVerified) {
+          try {
+            const valid = await sv.validateActionIds(partyId);
+            if (valid) {
+              actionIdsVerified = true;
+              logActivity(`[${tag}] action IDs valid ✓`, COLOR.gray);
+            } else {
+              logActivity(`[${tag}] action ID stale (Silvana redeploy) → scan bundle…`, COLOR.yellow);
+              const r = await sv.discoverActionIds(partyId);
+              if (r.changed.length) logActivity(`[${tag}] action IDs di-refresh (${r.changed.length}): ${r.changed.join(', ')}`, COLOR.green);
+              actionIdsVerified = r.ok;
+              if (!r.ok) logActivity(`[${tag}] discovery: action kritis tak ketemu: ${r.missing.join(', ')} (cookie/VPN/no-proposal?) — pakai ID fallback`, COLOR.red);
+            }
+          } catch (e) {
+            logActivity(`[${tag}] discovery action IDs gagal: ${(e && e.message) || e}`, COLOR.yellow);
+          }
+        }
+
         await refreshBalances(state, identityToken, proxy); render(global.__states);
 
         // Auto-cleanup sampah proposal nyangkut (0 dana kelock) dari sesi/feecheck
