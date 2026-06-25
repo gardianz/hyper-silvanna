@@ -876,7 +876,11 @@ class SilvanaClient {
   async validateActionIds(partyId) {
     if (!partyId) return false;
     const r = await this._probeAction(SWAP.actionIds.listProposals, [partyId]);
-    return !!(r.status === 200 && r.val && Array.isArray(r.val.proposals));
+    // 404 "Server action not found" = ID stale (redeploy). 200 = ID masih
+    // terdaftar (walau cookie expired → body unauthenticated; ID-nya valid).
+    // JANGAN cek val.proposals: cookie expired balik {proposals:[]} → false
+    // positive "valid" / atau salah trigger. Status-based = akurat.
+    return r.status === 200;
   }
 
   /**
@@ -1835,8 +1839,37 @@ async function keepAliveAll(states) {
 // ============================================================================
 let dtSessionRunning = false;
 // Sekali per-proses: true setelah action IDs diverifikasi/di-discover valid.
-// Reset jadi false otomatis saat swapAction kena 404 (redeploy mid-run).
+// Reset jadi false otomatis saat swapAction kena 404 (redeploy mid-run) →
+// ensureActionIds di loop swap re-discover otomatis (self-heal mid-run).
 let actionIdsVerified = false;
+let lastDiscoverMs = 0; // throttle scan bundle (anti-hammer kalau discover gagal)
+
+// Pastikan SWAP.actionIds current: validate murah (1 req) → kalau stale (404,
+// Silvana redeploy) scan bundle & remap fingerprint. Dipanggil di session-start
+// DAN tiap iterasi loop swap (murah kalau sudah verified). Aman dipanggil
+// berulang. Throttle scan 30s biar gak hammer pas discover gagal (cookie dead).
+async function ensureActionIds(sv, partyId, tag) {
+  if (actionIdsVerified) return;
+  try {
+    if (await sv.validateActionIds(partyId)) {
+      actionIdsVerified = true;
+      logActivity(`[${tag}] action IDs valid ✓`, COLOR.gray);
+      return;
+    }
+    if (Date.now() - lastDiscoverMs < 30000) return; // baru scan <30s lalu, tunggu
+    lastDiscoverMs = Date.now();
+    logActivity(`[${tag}] action ID stale (Silvana redeploy) → scan bundle…`, COLOR.yellow);
+    const r = await sv.discoverActionIds(partyId);
+    if (r.changed.length) logActivity(`[${tag}] action IDs di-refresh (${r.changed.length}): ${r.changed.join(', ')}`, COLOR.green);
+    // verified = listProposals sekarang valid (gak 404 lagi). Walau prepareDvpFee
+    // belum kebagi (cookie expired/no-proposal), minimal stop hammer 404; sisa ID
+    // ke-heal saat cookie fresh (404-nya reset flag lagi → re-discover).
+    actionIdsVerified = await sv.validateActionIds(partyId);
+    if (!actionIdsVerified) logActivity(`[${tag}] discovery belum lengkap (${r.missing.join(', ')}) — cookie/VPN/proposal? pakai fallback`, COLOR.red);
+  } catch (e) {
+    logActivity(`[${tag}] discovery action IDs gagal: ${(e && e.message) || e}`, COLOR.yellow);
+  }
+}
 function makeStates() {
   return ACCOUNTS.map((a, i) => ({ label: a.label || `akun-${i + 1}`, email: a.email, privyEmail: a.privyEmail || null, status: 'idle', message: '', balances: null, dayTrader: null }));
 }
@@ -2054,26 +2087,11 @@ async function runDayTraderSession(reason) {
             logActivity(`[${tag}] recoverParty gagal: ${(e && e.message) || e}`, COLOR.red);
           }
         }
-        // AUTO-DISCOVER next-action IDs: cek murah dulu (probe listProposals).
-        // Kalau stale (Silvana redeploy) → scan bundle JS & remap SWAP.actionIds.
-        // Self-heal: gak perlu lagi update ID manual dari HAR tiap redeploy.
-        if (!actionIdsVerified) {
-          try {
-            const valid = await sv.validateActionIds(partyId);
-            if (valid) {
-              actionIdsVerified = true;
-              logActivity(`[${tag}] action IDs valid ✓`, COLOR.gray);
-            } else {
-              logActivity(`[${tag}] action ID stale (Silvana redeploy) → scan bundle…`, COLOR.yellow);
-              const r = await sv.discoverActionIds(partyId);
-              if (r.changed.length) logActivity(`[${tag}] action IDs di-refresh (${r.changed.length}): ${r.changed.join(', ')}`, COLOR.green);
-              actionIdsVerified = r.ok;
-              if (!r.ok) logActivity(`[${tag}] discovery: action kritis tak ketemu: ${r.missing.join(', ')} (cookie/VPN/no-proposal?) — pakai ID fallback`, COLOR.red);
-            }
-          } catch (e) {
-            logActivity(`[${tag}] discovery action IDs gagal: ${(e && e.message) || e}`, COLOR.yellow);
-          }
-        }
+        // AUTO-DISCOVER next-action IDs (Silvana redeploy ~harian re-hash semua ID).
+        // Self-heal: validate murah → scan+remap fingerprint kalau stale. Juga
+        // dipanggil ulang tiap iterasi loop swap (lihat di bawah) buat tangkap
+        // redeploy MID-RUN (404 reset actionIdsVerified → re-discover otomatis).
+        await ensureActionIds(sv, partyId, tag);
 
         await refreshBalances(state, identityToken, proxy); render(global.__states);
 
@@ -2123,6 +2141,11 @@ async function runDayTraderSession(reason) {
           } catch (e) {
             logActivity(`[${tag}] refresh token gagal: ${(e && e.message) || e}`, COLOR.yellow);
           }
+
+          // Self-heal MID-RUN: kalau redeploy bikin ID 404 di tengah loop,
+          // swapAction set actionIdsVerified=false → re-discover SEBELUM swap
+          // berikut (token udah di-refresh di atas → cookie fresh buat discovery).
+          await ensureActionIds(sv, partyId, tag);
 
           const chk = await fetchDayTrader(sv, partyId).catch(() => null);
           if (chk) {
