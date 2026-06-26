@@ -128,24 +128,24 @@ const SWAP = {
   dailySwapCount: Math.max(1, Number((CONFIG.swap || {}).dailySwapCount) || 10),
   privyAppId: PRIVY_APP_ID, privyClientId: PRIVY_CLIENT_ID,
   actionIds: {
-    // Updated 2026-06-22 (5th redeploy) — fingerprint-verified live (probe RPC).
-    // FALLBACK saja: di-refresh otomatis tiap sesi via discoverActionIds() yg
-    // map by nama RPC (stabil antar-deploy), BUKAN by hash/urutan bundle.
-    // execSettle DIHAPUS: gone dari Silvana, settlement skrg lewat Canton RPC
-    //   (prepare_transaction → submit_prepared). getConsumedHoldings = step baru
-    //   (tak dipakai swapOnce, cuma utk discovery completeness).
-    estimateFee: '404abc7ea1d65345082e03db03333da64750e823c0',
-    acceptQuote: '4057796d62f720638e26d927a2e83d7850ca3b581d',
-    recordEvent: '407e9c97b7a1316ec392e6a3137e29a469be3d0134',
-    listProposals: '40fee850f4e3e17be2ff8dfb9b01f0639837563cc4',
-    pollProposal: '40ebacceda3bbfde913a7538b7c27c1d078ed97a83',
-    getMultiCall: '402b9a131aee87c88b3e81434b418f3250f6c0d3dd',
-    prepareDvpFee: '40e0588ffa9c2d58d0265729be25772f10798a0241',
-    getConsumedHoldings: '408f0c4b9ea4a50b22123ad26dacaf6892e6840877',
-    // prepareTransfer balik blob factory (verified byte-identik vs 30.har).
-    // BUKAN 40bbe26c — itu helper getDisclosedContracts yg butuh Canton Bearer.
-    prepareTransfer: '40fabd13d8301102f24bbea9bf9b12ce644195719e',
-    getAllocFactory: '60a079cd069468ad246fea274b8533eeebfa18d1c6',
+    // Updated 2026-06-26 — dari jual_cc/9.har (deploy terbaru, flow SELL lengkap).
+    // FALLBACK: di-refresh otomatis tiap sesi via discoverActionIds() (fingerprint
+    // by nama RPC). execSettle gone (settlement via Canton prepare→submit_prepared).
+    // listProposals BUKAN server action lagi di flow baru (frontend pakai
+    //   pollProposal by settlementId + REST /api/parties) → id di bawah stale,
+    //   cuma dipakai validate/cleanup; swap core gak butuh.
+    estimateFee: '40457c5f4a7d7959a169dc3d2eae5bc9f1f4004dd0',
+    acceptQuote: '40c0ab95ea3845858996609baed07422f36f71c679',
+    recordEvent: '4063f49548d368ae947f76b1603247757e6001cdeb',
+    listProposals: '40fee850f4e3e17be2ff8dfb9b01f0639837563cc4', // stale (lihat catatan)
+    pollProposal: '40c65938d2db9fc4228eda8359066b88a86d4f5415',
+    getMultiCall: '4011e2e86c6943dcbc8d384003ec12a9151875114e',
+    prepareDvpFee: '404e4dbc98cfdf6e8c37a605c5c1cd62f482776598',
+    getConsumedHoldings: '40cbce44ab4a53a4c5d396ad8a9c2095dd53837cfb',
+    prepareTransfer: '405670cb34707e2f946b2794ace4c13600a8336aec',
+    // getAllocFactory = action AllocationFactory_Allocate (0x60, "choiceArguments"),
+    // dipakai BUY buat factory USDCx. BUKAN 402e8596 (itu alloc SELL ["supa"]).
+    getAllocFactory: '603aef8e2cc8143c6fee9ae86138625a65ec2acecf',
   },
   // Package ID untuk Splice.Api.Token.AllocationInstructionV1 — dipakai
   // saat membangun ExerciseCommand AllocationFactory_Allocate.
@@ -159,14 +159,22 @@ const SWAP = {
 };
 
 // ---- UI constants ----
-const HIDE_TOKENS = ['hecto', 'cbtc'];
-// Token yang ditampilkan di dashboard (id Canton lowercase). 'amulet' = CC.
-const SHOW_TOKENS = ['amulet', 'usdcx'];
-// Label friendly utk display di dashboard
-const TOKEN_LABEL = { amulet: 'CC', usdcx: 'USDCx' };
 const MIN_ACTIVITY_LINES = 4;
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+// Map paralel dgn batas konkurensi. Jaga urutan hasil = urutan input. Error per
+// item → undefined (gak gagalin yg lain). Dipakai biar discovery (fetch chunk +
+// probe action) jalan barengan, bukan satu-satu (jauh lebih cepat).
+async function mapLimit(items, limit, fn) {
+  const ret = new Array(items.length);
+  let i = 0;
+  const n = Math.max(1, Math.min(limit, items.length));
+  const workers = Array.from({ length: n }, async () => {
+    while (i < items.length) { const idx = i++; try { ret[idx] = await fn(items[idx], idx); } catch (_) { ret[idx] = undefined; } }
+  });
+  await Promise.all(workers);
+  return ret;
+}
 
 // ============================================================================
 //  HTTP (native, + cookie jar, gzip/br, proxy CONNECT tunnel)
@@ -773,17 +781,15 @@ function buildMultiCallAccept(p) {
 //  Silvana app client (passkey login, earn-hub, server actions, RFQ)
 // ============================================================================
 const SWAP_STATE_TREE = encodeURIComponent(JSON.stringify(['', { children: ['(app)', { children: ['swap', { children: ['__PAGE__', {}, null, null] }, null, null] }, null, null] }, null, null, true]));
-// Server-action ID Silvana untuk discover party (POST /connect dari halaman /connect).
-// Hasilkan { partyId, partyName, userServiceCid, ... } dari on-chain.
-// Fallback saja — di-refresh otomatis via SilvanaClient.discoverConnectAction()
-// kalau /connect redeploy bikin ID stale (lihat recoverParty self-heal).
-// Updated 2026-06-22 (fingerprint-verified: response {success:true, party:{...}}).
-let CONNECT_RECOVER_ACTION = '4060ed8c2112383dd540bec9a67f031d18f20eaf4a';
-const CONNECT_STATE_TREE = encodeURIComponent(JSON.stringify(['', { children: ['connect', { children: ['__PAGE__', {}, null, null] }, null, null] }, null, null, true]));
+// recoverParty (party + userServiceCid) skrg lewat REST GET /api/parties/{id},
+// bukan server action /connect lagi (lihat SilvanaClient.recoverParty).
 
 class SilvanaClient {
-  constructor({ jar, timeoutMs = REQ.timeoutMs, proxy = null } = {}) { this.jar = jar || new CookieJar(); this.timeoutMs = timeoutMs; this.proxy = proxy; }
+  constructor({ jar, timeoutMs = REQ.timeoutMs, proxy = null, bearer = null } = {}) { this.jar = jar || new CookieJar(); this.timeoutMs = timeoutMs; this.proxy = proxy; this.bearer = bearer; }
   _hdr(extra = {}) { return { 'User-Agent': UA, 'Accept': 'application/json, text/plain, */*', 'Accept-Language': 'en-US,en;q=0.9,id;q=0.8', 'Origin': APP_BASE, 'Referer': APP_BASE + '/', ...extra }; }
+  // Server action /swap & /connect skrg butuh Canton Bearer (supa identity token);
+  // cookie aja gak cukup (Canton balik "Missing authentication. Use Bearer").
+  get _bearerHdr() { const t = typeof this.bearer === 'function' ? this.bearer() : this.bearer; return t ? { 'Authorization': 'Bearer ' + t } : {}; }
   _opts(extra = {}) { return { jar: this.jar, timeoutMs: this.timeoutMs, proxy: this.proxy, ...extra }; }
   async passkeyLoginOptions(email) {
     const r = await request('POST', `${APP_BASE}/api/auth/passkey/login/options`, this._opts({ headers: this._hdr({ 'Referer': APP_BASE + '/login' }), body: JSON.stringify({ email }) }));
@@ -834,7 +840,7 @@ class SilvanaClient {
   async swapAction(actionId, args, { timeoutMs } = {}) {
     const r = await request('POST', `${APP_BASE}/swap`, this._opts({
       timeoutMs: timeoutMs || this.timeoutMs,
-      headers: this._hdr({ 'Accept': 'text/x-component', 'Content-Type': 'text/plain;charset=UTF-8', 'Referer': APP_BASE + '/swap', 'next-action': actionId, 'next-router-state-tree': SWAP_STATE_TREE }),
+      headers: this._hdr({ 'Accept': 'text/x-component', 'Content-Type': 'text/plain;charset=UTF-8', 'Referer': APP_BASE + '/swap', 'next-action': actionId, 'next-router-state-tree': SWAP_STATE_TREE, ...this._bearerHdr }),
       body: JSON.stringify(args || []),
     }));
     if (r.status === 401 || r.status === 403) { const e = new Error(`swapAction ${actionId} status=${r.status}`); e.unauthorized = true; logDebug(`swapAction ${actionId} ${r.status}`, r.text || ''); throw e; }
@@ -857,7 +863,7 @@ class SilvanaClient {
     try {
       const r = await request('POST', `${APP_BASE}/swap`, this._opts({
         timeoutMs,
-        headers: this._hdr({ 'Accept': 'text/x-component', 'Content-Type': 'text/plain;charset=UTF-8', 'Referer': APP_BASE + '/swap', 'next-action': actionId, 'next-router-state-tree': SWAP_STATE_TREE }),
+        headers: this._hdr({ 'Accept': 'text/x-component', 'Content-Type': 'text/plain;charset=UTF-8', 'Referer': APP_BASE + '/swap', 'next-action': actionId, 'next-router-state-tree': SWAP_STATE_TREE, ...this._bearerHdr }),
         body: JSON.stringify(args || []),
       }));
       const text = r.text || '';
@@ -869,17 +875,14 @@ class SilvanaClient {
   }
 
   /**
-   * Cek cepat (1 request) apakah SWAP.actionIds.listProposals masih valid.
-   * listProposals([partyId]) balikin {success:true, proposals:[...]} kalau ID
-   * benar (BUKAN array telanjang — itu bug fetch_id lama); 404/null kalau stale.
+   * Cek cepat (1 request) apakah SWAP.actionIds masih valid. Anchor = estimateFee
+   * (BUKAN listProposals — itu bukan server action lagi di flow baru). estimateFee
+   * id valid → 200 (walau body "Market not found"); stale → 404 "Server action not
+   * found". Status-based = akurat, gak peduli auth/cookie.
    */
   async validateActionIds(partyId) {
     if (!partyId) return false;
-    const r = await this._probeAction(SWAP.actionIds.listProposals, [partyId]);
-    // 404 "Server action not found" = ID stale (redeploy). 200 = ID masih
-    // terdaftar (walau cookie expired → body unauthenticated; ID-nya valid).
-    // JANGAN cek val.proposals: cookie expired balik {proposals:[]} → false
-    // positive "valid" / atau salah trigger. Status-based = akurat.
+    const r = await this._probeAction(SWAP.actionIds.estimateFee, [partyId]);
     return r.status === 200;
   }
 
@@ -900,8 +903,9 @@ class SilvanaClient {
    * @param {string} partyId
    * @returns {{ok:boolean, changed:string[], found:string[], missing:string[]}}
    */
-  async discoverActionIds(partyId) {
-    // 1. Fetch /swap page + kumpulkan URL chunk (+ _buildManifest.js).
+  // Scan bundle JS /swap → daftar kandidat next-action ID (0x40/0x60). Fetch chunk
+  // PARALEL (8 sekaligus). Dipakai discoverActionIds + discoverActionByProbe.
+  async _scanSwapBundleIds() {
     const page = await request('GET', `${APP_BASE}/swap`, this._opts({
       headers: this._hdr({ 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8', 'Referer': APP_BASE + '/' }),
     }));
@@ -917,19 +921,40 @@ class SilvanaClient {
         for (const cc of ((bm.text || '').match(/static\/chunks\/[^"'\\]+\.js/g) || [])) chunkUrls.add('/_next/' + cc);
       } catch (_) { }
     }
-
-    // 2. Scan chunk → kandidat ID.
     const ids = [], seen = new Set();
-    for (const url of chunkUrls) {
-      try {
-        const js = await request('GET', `${APP_BASE}${url}`, this._opts({ headers: this._hdr({ 'Referer': APP_BASE + '/swap' }), timeoutMs: 12000 }));
-        if (js.status !== 200) continue;
-        const re = /["']([46][0-9a-f]{41})["']/g;
-        while ((m = re.exec(js.text || '')) !== null) { if (!seen.has(m[1])) { seen.add(m[1]); ids.push(m[1]); } }
-      } catch (_) { }
+    const chunkTexts = await mapLimit([...chunkUrls], 8, url =>
+      request('GET', `${APP_BASE}${url}`, this._opts({ headers: this._hdr({ 'Referer': APP_BASE + '/swap' }), timeoutMs: 12000 }))
+        .then(r => r.status === 200 ? (r.text || '') : '').catch(() => ''));
+    for (const txt of chunkTexts) {
+      const re = /["']([46][0-9a-f]{41})["']/g;
+      while ((m = re.exec(txt)) !== null) { if (!seen.has(m[1])) { seen.add(m[1]); ids.push(m[1]); } }
     }
+    return ids;
+  }
+
+  /**
+   * Cari 1 action yg balik BLOB factory ("CgMyL"/"2:T") buat body tertentu.
+   * Dipakai discover prepareDvpFee just-in-time (body butuh proposalId ASLI yg
+   * cuma ada saat swap) tanpa bergantung listProposals (yg udah mati). Skip id
+   * yg udah kepetakan biar gak salah ambil. Balikin id atau null.
+   * @param {Array} probeBody  body persis yg mau dikirim (mis. dvpFee args)
+   * @param {Set<string>} skipIds  id yg udah dipakai action lain
+   */
+  async discoverActionByProbe(probeBody, isMatch, skipIds = new Set()) {
+    const ids = await this._scanSwapBundleIds();
+    const cands = await mapLimit(ids.filter(id => !skipIds.has(id)), 6, id => this._probeAction(id, probeBody).then(r => ({ id, r })));
+    for (const c of cands) { if (c && c.r && isMatch(c.r)) return c.id; }
+    return null;
+  }
+  // prepareDvpFee/prepareTransfer balik BLOB factory ("CgMyL"/"2:T").
+  static _isBlob(r) { return /CgMyL/.test(r.text) || /^2:T/m.test(r.text); }
+  // getAllocFactory balik {success, factory:{factoryId, choiceContext}}.
+  static _isAllocFactory(r) { return !!(r.val && r.val.factory && r.val.factory.factoryId); }
+
+  async discoverActionIds(partyId) {
+    const ids = await this._scanSwapBundleIds();
     const out = {};
-    if (!ids.length || !partyId) return { ok: false, changed: [], found: [], missing: Object.keys(SWAP.actionIds) };
+    if (!ids.length || !partyId) return { ok: false, changed: [], found: [], missing: Object.keys(SWAP.actionIds), missingCritical: ['estimateFee'] };
 
     // 3. Pass-1: probe [partyId], fingerprint by nama RPC di error / shape sukses.
     //    CATATAN: prepareDvpFee & prepareTransfer TIDAK di-fingerprint di sini —
@@ -938,11 +963,21 @@ class SilvanaClient {
     //    itu helper standalone yg butuh Canton Bearer (BUKAN prepareTransfer).
     //    Kandidat blob = yg balik null / E-digest / 500 ke probe [partyId].
     const blobCands = [];
-    for (const id of ids) {
-      const { status, text, val } = await this._probeAction(id, [partyId]);
+    const probeLog = []; // dump ke swap-debug.log kalau discovery gak lengkap
+    // Probe semua id PARALEL (6 sekaligus), lalu assign berurutan (jaga first-match).
+    const probes = await mapLimit(ids, 6, id => this._probeAction(id, [partyId]).then(r => ({ id, ...r })));
+    for (const p of probes) {
+      if (!p) continue;
+      const { id, status, text, val } = p;
+      const _line1 = (val !== null ? JSON.stringify(val) : ((text || '').split('\n').find(l => l.startsWith('1:')) || (text || '').split('\n')[0] || ''));
+      probeLog.push(`${id} ${status} ${String(_line1).replace(/\s+/g, ' ').slice(0, 160)}`);
       if (status === 0) continue;
       const err = (val && (val.error || val.message)) || '';
-      if (val && Array.isArray(val.proposals)) out.listProposals = out.listProposals || id;
+      // listProposals: array di key proposals/settlements/settlementProposals
+      // (Silvana kadang rename), ATAU error nyebut getSettlementProposals (nama
+      // RPC stabil — kematch walau cookie expired). Tahan rename antar-redeploy.
+      const propArr = val && (val.proposals || val.settlements || val.settlementProposals);
+      if (Array.isArray(propArr) || /getSettlementProposals/.test(err)) out.listProposals = out.listProposals || id;
       else if (/estimateSettlementFees/.test(err)) out.estimateFee = id;
       else if (/\bacceptQuote\b/.test(err)) out.acceptQuote = id;
       else if (/Unknown event type/.test(err)) out.recordEvent = id;
@@ -994,95 +1029,33 @@ class SilvanaClient {
         missing.push(name);
       }
     }
-    // Wajib ketemu buat swap SELL berjalan. getConsumedHoldings/getAllocFactory
-    // opsional (getConsumedHoldings tak dipakai; getAllocFactory cuma BUY).
-    const critical = ['estimateFee', 'acceptQuote', 'recordEvent', 'listProposals', 'pollProposal', 'getMultiCall', 'prepareDvpFee', 'prepareTransfer'];
-    const ok = critical.every(n => out[n]);
-    return { ok, changed, found, missing };
+    // Critical = action yg WAJIB ke-fingerprint di session-start.
+    //   - listProposals: BUKAN server action lagi (mati) → keluarin.
+    //   - prepareDvpFee: butuh proposalId asli → di-discover JUST-IN-TIME di
+    //     swapOnce (discoverActionByProbe pakai proposal dari acceptQuote) → keluarin.
+    //   - getConsumedHoldings: tak dipakai. getAllocFactory: cuma BUY.
+    const critical = ['estimateFee', 'acceptQuote', 'recordEvent', 'pollProposal', 'getMultiCall', 'prepareTransfer'];
+    const missingCritical = critical.filter(n => !out[n]);
+    const ok = missingCritical.length === 0;
+    if (!ok) logDebug(`discoverActionIds INCOMPLETE — missing: ${missingCritical.join(', ')} | found: ${found.join(', ')}`, probeLog.join('\n'));
+    return { ok, changed, found, missing, missingCritical };
   }
 
   /**
-   * Discover party Silvana on-chain (recover dari userService DSO contract).
-   * Setara dengan klik halaman /connect di UI, dia balikin party termasuk
-   * `userServiceCid` yang dibutuhkan untuk swap finalize.
-   *
-   * @param {string} partyId  e.g. 'supa1::1220abc...'
-   * @returns {object|null}   { partyId, partyName, userServiceCid, ... }
+   * Recover party + userServiceCid dari on-chain UserService.
+   * BUKAN server action /connect lagi (itu udah mati) — sekarang REST endpoint
+   * stabil: GET /api/parties/{partyId} → {success, party:{userServiceCid,...}}.
+   * Auth cookie (jar). Tahan redeploy (gak ada hash next-action).
    */
-  // Satu raw POST /connect dgn next-action tertentu (no-throw → status+result).
-  async _connectProbe(actionId, partyId) {
-    try {
-      const r = await request('POST', `${APP_BASE}/connect`, this._opts({
-        timeoutMs: this.timeoutMs,
-        headers: this._hdr({
-          'Accept': 'text/x-component',
-          'Content-Type': 'text/plain;charset=UTF-8',
-          'Referer': APP_BASE + '/connect',
-          'next-action': actionId,
-          'next-router-state-tree': CONNECT_STATE_TREE,
-        }),
-        body: JSON.stringify([partyId]),
-      }));
-      return { status: r.status, result: r.status === 200 ? actionResult(r.text || '') : null };
-    } catch (_) { return { status: 0, result: null }; }
-  }
-
-  /**
-   * Auto-discover CONNECT_RECOVER_ACTION dari bundle /connect (fingerprint).
-   * /connect redeploy juga re-hash ID. Scan bundle → probe tiap kandidat dgn
-   * [partyId] → action yg benar balik {success:true, party:{...}}. Mutasi
-   * CONNECT_RECOVER_ACTION in-place.
-   * @returns {{ok:boolean, id:string|null, changed:boolean}}
-   */
-  async discoverConnectAction(partyId) {
-    if (!partyId) return { ok: false, id: null, changed: false };
-    const page = await request('GET', `${APP_BASE}/connect`, this._opts({
-      headers: this._hdr({ 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8', 'Referer': APP_BASE + '/' }),
-    }));
-    const html = page.text || '';
-    const chunkUrls = new Set();
-    let m;
-    const reChunk = /\/_next\/static\/chunks\/[^"' \n\r]+\.js/g;
-    while ((m = reChunk.exec(html)) !== null) chunkUrls.add(m[0]);
-    const buildMatch = html.match(/"buildId"\s*:\s*"([^"]+)"/);
-    if (buildMatch) {
-      try {
-        const bm = await request('GET', `${APP_BASE}/_next/static/${buildMatch[1]}/_buildManifest.js`, this._opts({ timeoutMs: 8000 }));
-        for (const cc of ((bm.text || '').match(/static\/chunks\/[^"'\\]+\.js/g) || [])) chunkUrls.add('/_next/' + cc);
-      } catch (_) { }
-    }
-    const ids = [], seen = new Set();
-    for (const url of chunkUrls) {
-      try {
-        const js = await request('GET', `${APP_BASE}${url}`, this._opts({ headers: this._hdr({ 'Referer': APP_BASE + '/connect' }), timeoutMs: 12000 }));
-        if (js.status !== 200) continue;
-        const re = /["']([46][0-9a-f]{41})["']/g;
-        while ((m = re.exec(js.text || '')) !== null) { if (!seen.has(m[1])) { seen.add(m[1]); ids.push(m[1]); } }
-      } catch (_) { }
-    }
-    for (const id of ids) {
-      const { status, result } = await this._connectProbe(id, partyId);
-      if (status === 200 && result && result.party && typeof result.party === 'object') {
-        const changed = id !== CONNECT_RECOVER_ACTION;
-        CONNECT_RECOVER_ACTION = id;
-        return { ok: true, id, changed };
-      }
-    }
-    return { ok: false, id: null, changed: false };
-  }
-
   async recoverParty(partyId) {
     if (!partyId) throw new Error('partyId required');
-    let { status, result } = await this._connectProbe(CONNECT_RECOVER_ACTION, partyId);
-    // Self-heal: 404 = ID stale (redeploy) → discover & retry sekali.
-    if (status === 404) {
-      logDebug('recoverParty: CONNECT_RECOVER_ACTION stale (404) → discover');
-      const d = await this.discoverConnectAction(partyId);
-      if (d.ok) ({ status, result } = await this._connectProbe(CONNECT_RECOVER_ACTION, partyId));
-    }
-    if (status === 401 || status === 403) { const e = new Error(`connect recover status=${status}`); e.unauthorized = true; throw e; }
-    if (status !== 200) throw new Error(`connect recover status=${status}`);
-    if (result && result.success && result.party) return result.party;
+    const r = await request('GET', `${APP_BASE}/api/parties/${encodeURIComponent(partyId)}`, this._opts({
+      headers: this._hdr({ 'Accept': '*/*', 'Referer': APP_BASE + '/connect?returnTo=/swap', ...this._bearerHdr }),
+    }));
+    if (r.status === 401 || r.status === 403) { const e = new Error(`parties status=${r.status}`); e.unauthorized = true; throw e; }
+    if (r.status !== 200) throw new Error(`parties status=${r.status} body=${(r.text || '').slice(0, 160)}`);
+    let j = r.json; if (!j) { try { j = JSON.parse(r.text); } catch (_) { } }
+    if (j && j.success && j.party && j.party.userServiceCid) return j.party;
     return null;
   }
 
@@ -1421,8 +1394,22 @@ async function swapOnce(ctx, direction, quantityCC) {
   const ccNeed = weAreBuyer ? SWAP.feeBufferCC : addDp(amount, SWAP.feeBufferCC);
   const inputHoldingCids = selectCcHoldings(amulets, ccNeed);
 
-  const feeCtx = await sv.swapAction(A.prepareDvpFee, [{ partyId, feeType: 'dvp_contract', role, proposalId, inputHoldingCids }]);
-  if (!feeCtx || !feeCtx.choiceContextData) throw new Error('prepareDvpFee gagal');
+  const dvpFeeArgs = [{ partyId, feeType: 'dvp_contract', role, proposalId, inputHoldingCids }];
+  let feeCtx = await sv.swapAction(A.prepareDvpFee, dvpFeeArgs).catch(e => ({ _err: (e && e.message) || String(e) }));
+  // JUST-IN-TIME discover: kalau prepareDvpFee stale (404, redeploy) → scan bundle,
+  // cari action yg balik blob fee-context buat body INI (proposalId asli udah ada
+  // dari acceptQuote) → update SWAP.actionIds.prepareDvpFee → retry. Gak butuh
+  // listProposals (mati). Ini bikin auto-fetch prepareDvpFee jalan tiap redeploy.
+  if (!feeCtx || feeCtx._err || !feeCtx.choiceContextData) {
+    const skip = new Set(Object.values(A).filter(id => id !== A.prepareDvpFee));
+    const newId = await sv.discoverActionByProbe(dvpFeeArgs, SilvanaClient._isBlob, skip).catch(() => null);
+    if (newId && newId !== A.prepareDvpFee) {
+      log(`prepareDvpFee stale → ditemukan ID baru ${newId.slice(0, 10)}… (auto-fetch)`);
+      SWAP.actionIds.prepareDvpFee = newId;
+      feeCtx = await sv.swapAction(newId, dvpFeeArgs).catch(e => ({ _err: (e && e.message) || String(e) }));
+    }
+  }
+  if (!feeCtx || feeCtx._err || !feeCtx.choiceContextData) throw new Error(`prepareDvpFee gagal: ${(feeCtx && feeCtx._err) || 'no choiceContextData'}`);
 
   // FEE PROTECTION (authoritative): feeCtx punya angka fee CC sebenarnya.
   // Batalkan SEBELUM execSettle/prepare/submit → belum ada CC kebayar.
@@ -1486,7 +1473,7 @@ async function swapOnce(ctx, direction, quantityCC) {
     // BUY allocationFactory = USDCx factory (bukan CC/Amulet ExternalPartyAmuletRules).
     // prepareTransfer.factoryId = "004b73bef9..." (CC factory) → salah untuk BUY.
     // getAllocFactory action 60c923ff... return "006289e882..." (USDCx factory) → benar.
-    const allocFact = await sv.swapAction(A.getAllocFactory, [
+    const allocFactArgs = [
       SWAP.usdcxAdmin,
       {
         allocation: {
@@ -1512,9 +1499,22 @@ async function swapOnce(ctx, direction, quantityCC) {
         extraArgs: { context: { values: {} }, meta: { values: {} } },
         requestedAt: dvp.terms.createdAt,
       },
-    ]);
+    ];
+    let allocFact = await sv.swapAction(A.getAllocFactory, allocFactArgs).catch(e => ({ _err: (e && e.message) || String(e) }));
+    // JUST-IN-TIME discover getAllocFactory (BUY) kalau stale (404, redeploy) →
+    // scan bundle, cari action yg balik {factory:{factoryId}} buat body INI →
+    // update + retry. Auto-fetch tiap redeploy tanpa update manual.
+    if (!allocFact || allocFact._err || !allocFact.factory || !allocFact.factory.factoryId) {
+      const skip = new Set(Object.values(A).filter(id => id !== A.getAllocFactory));
+      const newId = await sv.discoverActionByProbe(allocFactArgs, SilvanaClient._isAllocFactory, skip).catch(() => null);
+      if (newId && newId !== A.getAllocFactory) {
+        log(`getAllocFactory stale → ditemukan ID baru ${newId.slice(0, 10)}… (auto-fetch)`);
+        SWAP.actionIds.getAllocFactory = newId;
+        allocFact = await sv.swapAction(newId, allocFactArgs).catch(e => ({ _err: (e && e.message) || String(e) }));
+      }
+    }
     logDebug('getAllocFactory (buy) response', allocFact);
-    if (!allocFact || !allocFact.factory || !allocFact.factory.factoryId) throw new Error('getAllocFactory (buy) gagal');
+    if (!allocFact || allocFact._err || !allocFact.factory || !allocFact.factory.factoryId) throw new Error(`getAllocFactory (buy) gagal: ${(allocFact && allocFact._err) || 'no factory'}`);
     const _allocCtx = allocFact.factory.choiceContext || {};
     allocate = { instrument: ourLeg.instrument, amount: ourLeg.amount, legId: ourLeg.legId, factoryCid: allocFact.factory.factoryId, contextValues: (_allocCtx.choiceContextData && _allocCtx.choiceContextData.values) || {}, disclosed: _allocCtx.disclosedContracts || [] };
   } else {
@@ -1573,13 +1573,19 @@ const c = (code) => useColor ? `\x1b[${code}m` : '';
 const COLOR = { reset: c(0), dim: c(2), bold: c(1), red: c(31), green: c(32), yellow: c(33), blue: c(34), mag: c(35), cyan: c(36), white: c(37), gray: c(90) };
 const paint = (txt, ...codes) => codes.join('') + txt + COLOR.reset;
 function visLen(s) { return s.replace(/\x1b\[[0-9;]*m/g, '').length; }
-function pad(s, w, side = 'right') { const len = visLen(s); if (len >= w) return s; const sp = ' '.repeat(w - len); return side === 'right' ? s + sp : sp + s; }
+function pad(s, w, side = 'right') {
+  const len = visLen(s); if (len >= w) return s;
+  const total = w - len;
+  if (side === 'center') { const l = Math.floor(total / 2); return ' '.repeat(l) + s + ' '.repeat(total - l); }
+  const sp = ' '.repeat(total);
+  return side === 'right' ? s + sp : sp + s;
+}
 
 let W = 44, ROWS = 24;
 function computeLayout() {
   const cols = process.stdout.columns || 0, rows = process.stdout.rows || 0;
   ROWS = rows > 0 ? rows : 24;
-  W = cols > 0 ? Math.max(30, Math.min(cols, 100)) : 44;
+  W = cols > 0 ? Math.max(30, Math.min(cols, 160)) : 44;
 }
 const BOX = { tl: '╭', tr: '╮', bl: '╰', br: '╯', h: '─', v: '│', tee: '├', tee2: '┤' };
 const line = () => paint(BOX.tl + BOX.h.repeat(W - 2) + BOX.tr, COLOR.cyan);
@@ -1599,88 +1605,93 @@ function row(content) {
 }
 function clearScreen() { if (useColor) process.stdout.write('\x1b[2J\x1b[H'); }
 function fmtNum(s, maxDp = 4) { if (s == null) return '-'; const n = Number(s); if (!isFinite(n)) return String(s); if (n === 0) return '0'; const t = (Math.abs(n) >= 1 ? n.toFixed(maxDp) : n.toFixed(6)); return t.includes('.') ? t.replace(/0+$/, '').replace(/\.$/, '') : t; }
-function progressBar(cur, max, width = 12) { const filled = max > 0 ? Math.max(0, Math.min(width, Math.round((cur / max) * width))) : 0; return paint('▓'.repeat(filled), COLOR.green) + paint('░'.repeat(width - filled), COLOR.gray); }
-/** Format sisa waktu sampai expMs jadi "47m" / "2h" / "expired" */
-function expIn(expMs) {
-  if (!expMs) return paint('-', COLOR.gray);
+// Sisa umur sesi → [teks, warna] (buat sel table; warna diterapkan saat render).
+function expParts(expMs) {
+  if (!expMs) return ['-', COLOR.gray];
   const ms = Number(expMs) - Date.now();
-  if (ms <= 0) return paint('expired', COLOR.red);
+  if (ms <= 0) return ['expired', COLOR.red];
   const m = Math.round(ms / 60000);
-  if (m < 60) return paint(m + 'm', m < 5 ? COLOR.yellow : COLOR.cyan);
+  if (m < 60) return [m + 'm', m < 5 ? COLOR.yellow : COLOR.cyan];
   const h = Math.round(m / 60);
-  if (h < 48) return paint(h + 'h', COLOR.cyan);
-  return paint(Math.round(h / 24) + 'd', COLOR.cyan);
+  if (h < 48) return [h + 'h', COLOR.cyan];
+  return [Math.round(h / 24) + 'd', COLOR.cyan];
 }
-/** Render dua field, KEDUANYA rata kiri dengan gap tetap. Kalau gak muat,
- *  tumpuk jadi dua baris (tetap rata kiri). */
-function row2(left, right) {
-  const inner = W - 4; // total inner width tanpa border
-  const GAP = 3;
-  if (visLen(left) + GAP + visLen(right) <= inner) {
-    return row(left + ' '.repeat(GAP) + right);
-  }
-  return row(left) + '\n' + row(right); // gak muat → tumpuk, dua-duanya rata kiri
-}
-
 function renderHeader() {
-  return [line(), row(paint(' SilvanaBot V1.5 Auto Swap ', COLOR.bold + COLOR.cyan)), row(paint(new Date().toLocaleString('id-ID'), COLOR.gray))].join('\n');
+  return [line(), row(paint(' SilvanaBot V1.6 Auto Swap ', COLOR.bold + COLOR.cyan)), row(paint(new Date().toLocaleString('id-ID'), COLOR.gray))].join('\n');
 }
-function statusBadge(state) {
+// Status akun → [teks, warna]. Dipakai sel STATUS di table.
+function statusInfo(state) {
   const d = state.dayTrader;
-  if (state.status === 'error') return paint('● Error', COLOR.red);
-  if (d && d.count >= d.target) return paint('● Selesai ✓', COLOR.green);
-  if (dtSessionRunning) return paint('● Swap…', COLOR.yellow);
-  if (state.status === 'login') return paint('● Login…', COLOR.yellow);
-  if (state.status === 'ok') return paint('● Aktif', COLOR.green);
-  return paint('● Siap', COLOR.gray);
+  if (state.status === 'error') return ['● Error', COLOR.red];
+  if (d && d.count >= d.target) return ['● Selesai', COLOR.green];
+  if (dtSessionRunning) return ['● Swap', COLOR.yellow];
+  if (state.status === 'login') return ['● Login', COLOR.yellow];
+  if (state.status === 'ok') return ['● Aktif', COLOR.green];
+  return ['● Siap', COLOR.gray];
 }
-function renderAccount(state) {
-  const lines = [sep()];
-  // baris 1: label kiri, status kanan
-  lines.push(row2(paint(state.label || '-', COLOR.bold), statusBadge(state)));
-
-  // baris 2: progress kiri, count kanan
-  const d = state.dayTrader;
-  if (d) {
-    const left = progressBar(d.count, d.target);
-    const right = paint(`${d.count}/${d.target}`, d.count >= d.target ? COLOR.green : COLOR.bold) + paint(' swap', COLOR.gray);
-    lines.push(row2(left, right));
-  } else {
-    lines.push(row(paint('DAY_TRADER  —  (memuat…)', COLOR.gray)));
+// ── Helper kolom table (compact 2-baris/akun) ────────────────────────────────
+function truncVis(s, w) { s = String(s); return s.length > w ? s.slice(0, Math.max(0, w - 1)) + '…' : s; }
+function fmtThousand(n) { const x = Math.round(Number(n)); return Number.isFinite(x) ? x.toLocaleString('en-US') : '-'; }
+function balOf(state, idUpper) {
+  const t = (Array.isArray(state.balances) ? state.balances : []).find(b => String((b.instrumentId && b.instrumentId.id) || '').toUpperCase() === idUpper);
+  if (!t) return null;
+  const u = Number(t.totalUnlockedBalance ?? t.totalBalance ?? 0);
+  const tot = Number(t.totalBalance ?? 0);
+  return { unlocked: u, locked: Math.max(0, tot - u) };
+}
+// Grid akun: 1 baris/akun, kolom dipisah border │, ada header kolom. Lebar &
+// set kolom dihitung SEKALI dari semua akun → align rapi. Kolom prioritas-rendah
+// (prio besar) didrop SERAGAM kalau terminal sempit; AKUN nyerap sisa lebar.
+function renderAccountsTable(states) {
+  // TANPA pembatas kolom (no │/┬/┼/┴). Semua sel CENTER, compact (lebar natural),
+  // blok di-center dalam frame. cell(s) → [teks polos, warna]. prio 0 = wajib.
+  const COLS = [
+    { title: 'AKUN', prio: 0, cap: 16, align: 'l', cell: s => [truncVis(s.label || '-', 16), COLOR.bold] },
+    { title: 'STATUS', prio: 1, cap: 10, cell: s => statusInfo(s) },
+    { title: 'SWAP', prio: 0, cap: 7, cell: s => [s.dayTrader ? `${s.dayTrader.count}/${s.dayTrader.target}` : '-', s.dayTrader && s.dayTrader.count >= s.dayTrader.target ? COLOR.green : COLOR.white] },
+    { title: 'CC', prio: 1, cap: 12, cell: s => { const b = balOf(s, 'AMULET'); return [b ? fmtCC(b.unlocked) + (b.locked > 1e-8 ? '+' + fmtCC(b.locked) : '') : '-', COLOR.green]; } },
+    { title: 'USDCx', prio: 1, cap: 12, cell: s => { const b = balOf(s, 'USDCX'); return [b ? fmtUSDC(b.unlocked) + (b.locked > 1e-8 ? '+' + fmtUSDC(b.locked) : '') : '-', COLOR.green]; } },
+    { title: 'POIN', prio: 3, cap: 9, cell: s => [s.points != null ? fmtThousand(s.points) : '-', COLOR.mag] },
+    { title: 'STREAK', prio: 4, cap: 6, cell: s => [s.streak != null ? String(s.streak) : '-', COLOR.yellow] },
+    { title: 'SILV', prio: 2, cap: 8, cell: s => expParts(s.silvanaExpMs) },
+    { title: 'SUPA', prio: 2, cap: 8, cell: s => expParts(s.tokenExpMs) },
+  ];
+  // Natural width = max(title, isi sel) di-cap per kolom.
+  for (const c of COLS) {
+    let w = c.title.length;
+    for (const s of states) { const t = String(c.cell(s)[0]); if (t.length > w) w = t.length; }
+    c.w = Math.min(c.cap, w);
   }
-
-  // baris balance: CC | USDCx (2 kolom)
-  const bals = (Array.isArray(state.balances) ? state.balances : []).filter(b => {
-    const id = String((b.instrumentId && b.instrumentId.id) || '').toLowerCase();
-    if (HIDE_TOKENS.includes(id)) return false;
-    return SHOW_TOKENS.length ? SHOW_TOKENS.includes(id) : true;
-  });
-  const balCells = bals.map(b => {
-    const rawId = (b.instrumentId && b.instrumentId.id) || '?';
-    const label = TOKEN_LABEL[String(rawId).toLowerCase()] || rawId;
-    const unlocked = Number(b.totalUnlockedBalance ?? b.totalBalance ?? 0);
-    const total = Number(b.totalBalance ?? 0);
-    const locked = total - unlocked;
-    let s = paint(label, COLOR.bold) + paint(' ', COLOR.gray) + paint(fmtNum(unlocked), COLOR.green);
-    if (locked > 1e-8) s += paint(' (+' + fmtNum(locked) + ')', COLOR.gray);
-    return s;
-  });
-  if (balCells.length === 2) {
-    lines.push(row2(balCells[0], balCells[1]));
-  } else {
-    balCells.forEach(c => lines.push(row(c)));
+  // Fit compact: gap 2 spasi antar kolom, JANGAN distribusi slack (biar compact).
+  // Drop prioritas-rendah kalau total > inner. inner = lebar konten (W-4).
+  const inner = W - 4, GAP = 2;
+  const total = arr => arr.reduce((a, c, i) => a + c.w + (i ? GAP : 0), 0);
+  let kept = COLS.slice();
+  while (kept.length > 2 && total(kept) > inner) {
+    let di = -1;
+    for (let i = 0; i < kept.length; i++) if (kept[i].prio > 0 && (di < 0 || kept[i].prio >= kept[di].prio)) di = i;
+    if (di < 0) break;
+    kept.splice(di, 1);
   }
-
-  // baris session info: silv expiry kiri, supa expiry kanan
-  const silv = expIn(state.silvanaExpMs);
-  const supa = expIn(state.tokenExpMs);
-  lines.push(row2(
-    paint('silv ', COLOR.gray) + silv,
-    paint('supa ', COLOR.gray) + supa
-  ));
-
-  if (state.status === 'error' && state.message) lines.push(row(paint('⚠ ' + state.message, COLOR.red)));
-  return lines.join('\n');
+  // Render: tiap sel di-center ke lebar kolom, gabung pakai GAP spasi, blok
+  // di-center dalam inner. Header titles gray bold, baris data warna per sel.
+  const gapStr = ' '.repeat(GAP);
+  const blockW = total(kept);
+  const leftPad = ' '.repeat(Math.max(0, Math.floor((inner - blockW) / 2)));
+  const sideOf = a => a === 'l' ? 'right' : a === 'r' ? 'left' : 'center'; // l=rata kiri, r=rata kanan, default center
+  const buildRow = (cellsTC, header) => {
+    const cells = kept.map((c, i) => {
+      let [t, col] = cellsTC[i];
+      t = String(t); if (visLen(t) > c.w) t = truncVis(t, c.w);
+      return paint(pad(t, c.w, sideOf(c.align)), header ? COLOR.bold + COLOR.gray : col);
+    });
+    return row(leftPad + cells.join(gapStr));
+  };
+  const out = [sep()];
+  out.push(buildRow(kept.map(c => [c.title, null]), true)); // header kolom (center)
+  out.push(sep());
+  for (const s of states) out.push(buildRow(kept.map(c => c.cell(s)))); // 1 baris/akun
+  return out.join('\n');
 }
 function renderFooter() {
   const jam = String(SCHED.hour).padStart(2, '0') + ':' + String(SCHED.minute).padStart(2, '0');
@@ -1734,7 +1745,7 @@ function render(states) {
   if (!Array.isArray(states)) return; // dipanggil dari path non-dashboard (wallets/register) sebelum __states init
   computeLayout(); clearScreen();
   const out = [renderHeader()];
-  states.forEach(s => out.push(renderAccount(s)));
+  out.push(renderAccountsTable(states));
   out.push(renderFooter());
   const used = out.join('\n').split('\n').length;
   const avail = Math.max(MIN_ACTIVITY_LINES, ROWS - used - 3);
@@ -1754,6 +1765,23 @@ function parseDayTrader(tasksArr) {
   const target = m ? Number(m[2]) : 10;
   return { current, target, completed: !!it.completed || current >= target };
 }
+// Streak dari task MONTHLY_TRADER earn-hub. Robust ke nama field (streak/
+// currentStreak/progress "X/Y"). Balikin angka streak atau null.
+function parseMonthlyStreak(tasksArr) {
+  const arr = Array.isArray(tasksArr) ? tasksArr : (tasksArr && tasksArr.items) || [];
+  const it = arr.find(t => /MONTHLY/i.test(String((t && t.code) || '')));
+  if (!it) return null;
+  const num = v => { if (v == null) return null; const n = Number(String(v).replace(/,/g, '').trim()); return Number.isFinite(n) ? n : null; };
+  for (const k of ['streak', 'currentStreak', 'dayStreak', 'consecutiveDays', 'streakDays', 'value', 'count']) {
+    if (k in it) { const n = num(it[k]); if (n != null) return n; }
+  }
+  const m = String(it.progress || '').match(/(\d+)/); // "5/30" → 5
+  if (m) return Number(m[1]);
+  return it.completed ? 1 : 0;
+}
+// Format balance: CC = 1 desimal, USDCx = 3 desimal (tetap, gak strip nol).
+function fmtCC(n) { const x = Number(n); return Number.isFinite(x) ? x.toFixed(1) : '-'; }
+function fmtUSDC(n) { const x = Number(n); return Number.isFinite(x) ? x.toFixed(3) : '-'; }
 // Unclaimed Points dari earn-hub (mis. 1,780.00). Cari di root + nested, robust ke nama field.
 function extractUnclaimedPoints(tasks) {
   if (!tasks || typeof tasks !== 'object') return null;
@@ -1802,17 +1830,26 @@ async function tickAccount(state) {
       const tasks = await sv.earnTasks(partyId).catch(() => null);
       const dt = parseDayTrader(tasks && tasks.items);
       if (dt) state.dayTrader = { count: dt.current, target: dt.target };
+      const stk = parseMonthlyStreak(tasks && tasks.items);
+      if (stk != null) state.streak = stk;
       const stats = await sv.earnStats().catch(() => null);
       const pts = (stats && stats.totalPoints != null && Number.isFinite(Number(stats.totalPoints)))
         ? Number(stats.totalPoints) : extractUnclaimedPoints(tasks);
       if (pts != null) state.points = pts;
+      // Earn-hub lengkap buat kolom dashboard table.
+      if (stats && stats.totalVolume != null && Number.isFinite(Number(stats.totalVolume))) state.volume = Number(stats.totalVolume);
+      if (stats && stats.activityCount != null && Number.isFinite(Number(stats.activityCount))) state.activity = Number(stats.activityCount);
+      if (stats && stats.displayName) state.displayName = stats.displayName;
       await fetchCcPrice(sv);
     }
     state.status = 'ok'; state.message = '';
   } catch (e) { state.status = 'error'; state.message = (e && e.message) || String(e); }
   render(global.__states);
 }
-async function tickAll(states) { for (const s of states) await tickAccount(s); }
+// Konkurensi login/keep-alive antar-akun. Tiap akun independen (proxy/cookie/
+// privy sendiri) → aman paralel. Batasi biar gak overload proxy/rate-limit.
+const ACCT_CONCURRENCY = Math.max(1, Number((CONFIG.swap || {}).loginConcurrency) || 5);
+async function tickAll(states) { await mapLimit(states, ACCT_CONCURRENCY, s => tickAccount(s)); }
 
 // ============================================================================
 //  Keep-alive token (Privy/Supa + Silvana) — jalan TERUS walau quest selesai.
@@ -1830,7 +1867,8 @@ async function keepAliveTokens(state) {
   }
 }
 async function keepAliveAll(states) {
-  for (const s of states) { if (dtSessionRunning) return; await keepAliveTokens(s); }
+  if (dtSessionRunning) return;
+  await mapLimit(states, ACCT_CONCURRENCY, s => dtSessionRunning ? null : keepAliveTokens(s));
   render(states);
 }
 
@@ -1861,17 +1899,18 @@ async function ensureActionIds(sv, partyId, tag) {
     logActivity(`[${tag}] action ID stale (Silvana redeploy) → scan bundle…`, COLOR.yellow);
     const r = await sv.discoverActionIds(partyId);
     if (r.changed.length) logActivity(`[${tag}] action IDs di-refresh (${r.changed.length}): ${r.changed.join(', ')}`, COLOR.green);
-    // verified = listProposals sekarang valid (gak 404 lagi). Walau prepareDvpFee
-    // belum kebagi (cookie expired/no-proposal), minimal stop hammer 404; sisa ID
-    // ke-heal saat cookie fresh (404-nya reset flag lagi → re-discover).
-    actionIdsVerified = await sv.validateActionIds(partyId);
-    if (!actionIdsVerified) logActivity(`[${tag}] discovery belum lengkap (${r.missing.join(', ')}) — cookie/VPN/proposal? pakai fallback`, COLOR.red);
+    // verified = SEMUA action kritis ketemu. prepareDvpFee butuh proposal aktif
+    // buat di-fingerprint → kalau akun belum punya proposal, baru ke-heal setelah
+    // swap pertama bikin proposal (loop berikut re-discover). getConsumedHoldings
+    // opsional (tak dipakai) → gak masuk hitungan.
+    actionIdsVerified = r.ok;
+    if (!r.ok) logActivity(`[${tag}] discovery belum lengkap: ${r.missingCritical.join(', ')} — auto-retry tiap loop (prepareDvpFee perlu proposal aktif)`, COLOR.yellow);
   } catch (e) {
     logActivity(`[${tag}] discovery action IDs gagal: ${(e && e.message) || e}`, COLOR.yellow);
   }
 }
 function makeStates() {
-  return ACCOUNTS.map((a, i) => ({ label: a.label || `akun-${i + 1}`, email: a.email, privyEmail: a.privyEmail || null, status: 'idle', message: '', balances: null, dayTrader: null }));
+  return ACCOUNTS.map((a, i) => ({ label: a.label || `akun-${i + 1}`, email: a.email, privyEmail: a.privyEmail || null, status: 'idle', message: '', balances: null, dayTrader: null, points: null, volume: null, activity: null, streak: null }));
 }
 
 /**
@@ -1904,6 +1943,9 @@ async function buildSwapClients(state) {
   if (!pat) throw new Error('privy_access_token tidak ada di session');
   const sv = await ensureSilvanaSession(state);
   if (!sv) throw new Error('passkey belum di-set (paste dulu)');
+  // Server action /swap & /connect skrg butuh Canton Bearer (supa identity token).
+  // Pakai fungsi biar selalu baca token terbaru dari session (auto-refresh).
+  sv.bearer = () => { try { return acctSession(email).privy.token || identityToken; } catch (_) { return identityToken; } };
   const me = await supaMe(identityToken, proxy);
   const partyId = me.data && me.data.partyId;
   if (!partyId) throw new Error('partyId tidak ditemukan');
