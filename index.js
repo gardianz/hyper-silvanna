@@ -92,8 +92,8 @@ const SWAP = {
   feeBufferCC: '10',
   minUsdcxToBuy: '0.5',
   rfqMaxTries: 5, rfqRetryMs: 30000, quoteTimeoutSec: 25,
-  pollIntervalMs: 2000, pollMaxTries: 40,
-  completionPollMs: 2000, completionMaxTries: 30,
+  pollIntervalMs: 1000, pollMaxTries: 80,
+  completionPollMs: 1000, completionMaxTries: 60,
   delayBetweenSwapsSec: 5,
   // Cooldown random setelah swap sukses sebelum cek DAY_TRADER ulang.
   // Tujuan: anti-overcap karena server butuh waktu update count.
@@ -102,7 +102,10 @@ const SWAP = {
   // Tunggu max berapa detik kalau ada settlement aktif (counterparty belum
   // allocate) sebelum lanjut buka posisi baru. Default 4 menit. Setelah ini,
   // bot lanjut walau ada yang masih in-progress (asumsi stale/dead).
-  activeSettlementWaitSec: 120,
+  activeSettlementWaitSec: 45,
+  // Stuck (2 swap submit tapi count gak naik): poll settle maks N putaran lalu
+  // LEWATI akun (jangan nunggu selamanya). N × stuckPollSec = batas tunggu.
+  maxStuckPollRounds: 3,
   // === FEE PROTECTION ===
   // Kalau fee swap (CC) > maxFeeCC, JANGAN swap (walau DAY_TRADER belum kelar).
   // Tunggu feeSpikeWaitSec lalu cek ulang, retry SAMPAI fee turun (infinity).
@@ -127,25 +130,28 @@ const SWAP = {
   allowOvercap: (CONFIG.swap || {}).allowOvercap === true,
   dailySwapCount: Math.max(1, Number((CONFIG.swap || {}).dailySwapCount) || 10),
   privyAppId: PRIVY_APP_ID, privyClientId: PRIVY_CLIENT_ID,
+  // CATATAN: ID di bawah = FALLBACK (snapshot manual). Saat runtime di-OVERRIDE
+  // oleh refreshSwapActionIds() yang auto-discover dari bundle frontend Silvana
+  // (lihat SWAP_ACTION_NAMES). Next.js server-action ID = hash build → ROTATE tiap
+  // Silvana redeploy → "Server action not found" (404). Auto-discovery bikin
+  // tahan-redeploy; snapshot ini cuma dipakai kalau discovery gagal (offline dll).
   actionIds: {
-    // Updated 2026-06-26 — dari jual_cc/9.har (deploy terbaru, flow SELL lengkap).
-    // FALLBACK: di-refresh otomatis tiap sesi via discoverActionIds() (fingerprint
-    // by nama RPC). execSettle gone (settlement via Canton prepare→submit_prepared).
-    // listProposals BUKAN server action lagi di flow baru (frontend pakai
-    //   pollProposal by settlementId + REST /api/parties) → id di bawah stale,
-    //   cuma dipakai validate/cleanup; swap core gak butuh.
-    estimateFee: '40457c5f4a7d7959a169dc3d2eae5bc9f1f4004dd0',
-    acceptQuote: '40c0ab95ea3845858996609baed07422f36f71c679',
-    recordEvent: '4063f49548d368ae947f76b1603247757e6001cdeb',
-    listProposals: '40fee850f4e3e17be2ff8dfb9b01f0639837563cc4', // stale (lihat catatan)
-    pollProposal: '40c65938d2db9fc4228eda8359066b88a86d4f5415',
-    getMultiCall: '4011e2e86c6943dcbc8d384003ec12a9151875114e',
-    prepareDvpFee: '404e4dbc98cfdf6e8c37a605c5c1cd62f482776598',
-    getConsumedHoldings: '40cbce44ab4a53a4c5d396ad8a9c2095dd53837cfb',
-    prepareTransfer: '405670cb34707e2f946b2794ace4c13600a8336aec',
-    // getAllocFactory = action AllocationFactory_Allocate (0x60, "choiceArguments"),
-    // dipakai BUY buat factory USDCx. BUKAN 402e8596 (itu alloc SELL ["supa"]).
-    getAllocFactory: '603aef8e2cc8143c6fee9ae86138625a65ec2acecf',
+    // Snapshot 2026-06-26 (redeploy ke-4) — diverifikasi argumen-per-argumen dari
+    // bundle live. Komentar = nama fungsi server-action Silvana (kunci mapping).
+    estimateFee: '40d6977a20aeac583cfc5fa8cbe872d85ae9bc82f4',     // estimateSettlementFees
+    acceptQuote: '40aff5660a04bdbbd67870609ea13675bc19ec29c9',     // acceptQuote
+    recordEvent: '404d82f86c4385e2e9f0e2877085e4d9a032ee53fa',     // recordSettlementEventAction
+    pollProposal: '40aaffde73563a30353e9f8b6859c8de02912abcec',    // getSettlementStatus
+    getMultiCall: '40e8d0e3789177ee9d51c5a561b3e6eb0c3aa262c5',    // getMulticallConfigAction
+    prepareDvpFee: '40cafe349886e39e6d4884c870e55918dd468cffdd',   // buildFeeTransferDataAction
+    prepareTransfer: '402dfbb59ab09fcf8f325738a06b6378e3dbe1ffc8', // getTransferFactoryContextAction
+    getAllocFactory: '60889ee9785221b9ad0a1f6de3db6772bd1d1748bc', // getAllocationFactory
+    submitPreconfirmation: '4037e89fd40a98b76323740635210d4cfd9beeceda', // submitPreconfirmation
+    // listProposals & execSettle: TIDAK ada padanan di frontend Silvana terbaru
+    // (dihapus dari flow mereka). Keduanya dipanggil non-fatal (.catch) → biarkan
+    // ID lama; kalau 404 cuma di-skip (cleanup) / warning (execSettle), bukan blocker.
+    listProposals: '4040d62927d651f05abd73eb555d2f9db111028663',
+    execSettle: '409855e46c145fc27b64e0496bbdce2ee0938e528c',
   },
   // Package ID untuk Splice.Api.Token.AllocationInstructionV1 — dipakai
   // saat membangun ExerciseCommand AllocationFactory_Allocate.
@@ -159,22 +165,14 @@ const SWAP = {
 };
 
 // ---- UI constants ----
+const HIDE_TOKENS = ['hecto', 'cbtc'];
+// Token yang ditampilkan di dashboard (id Canton lowercase). 'amulet' = CC.
+const SHOW_TOKENS = ['amulet', 'usdcx'];
+// Label friendly utk display di dashboard
+const TOKEN_LABEL = { amulet: 'CC', usdcx: 'USDCx' };
 const MIN_ACTIVITY_LINES = 4;
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-// Map paralel dgn batas konkurensi. Jaga urutan hasil = urutan input. Error per
-// item → undefined (gak gagalin yg lain). Dipakai biar discovery (fetch chunk +
-// probe action) jalan barengan, bukan satu-satu (jauh lebih cepat).
-async function mapLimit(items, limit, fn) {
-  const ret = new Array(items.length);
-  let i = 0;
-  const n = Math.max(1, Math.min(limit, items.length));
-  const workers = Array.from({ length: n }, async () => {
-    while (i < items.length) { const idx = i++; try { ret[idx] = await fn(items[idx], idx); } catch (_) { ret[idx] = undefined; } }
-  });
-  await Promise.all(workers);
-  return ret;
-}
 
 // ============================================================================
 //  HTTP (native, + cookie jar, gzip/br, proxy CONNECT tunnel)
@@ -182,11 +180,18 @@ async function mapLimit(items, limit, fn) {
 function tunnelThroughProxy(proxy, targetHost, targetPort, timeoutMs) {
   return new Promise((resolve, reject) => {
     const sock = net.connect({ host: proxy.host, port: proxy.port });
-    sock.setTimeout(timeoutMs, () => { sock.destroy(new Error('proxy connect timeout')); });
+    // Settle-guard + timer KERAS: jamin promise SELALU selesai dalam timeoutMs walau
+    // proxy menggantung di fase DNS/TCP/CONNECT/TLS. (socket idle-timeout kadang tak
+    // nyala saat handshake → dulu request beku selamanya & seluruh bot hang.)
+    let settled = false;
+    const fail = (e) => { if (settled) return; settled = true; clearTimeout(timer); try { sock.destroy(); } catch (_) { } reject(e); };
+    const ok = (tlsSock) => { if (settled) return; settled = true; clearTimeout(timer); resolve(tlsSock); };
+    const timer = setTimeout(() => fail(new Error('proxy tunnel timeout')), timeoutMs);
+    sock.setTimeout(timeoutMs, () => fail(new Error('proxy connect timeout')));
     let connectReq = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n`;
     if (proxy.auth) connectReq += `Proxy-Authorization: Basic ${Buffer.from(proxy.auth, 'utf8').toString('base64')}\r\n`;
     connectReq += 'Proxy-Connection: keep-alive\r\n\r\n';
-    sock.once('error', reject);
+    sock.once('error', fail);
     let buf = '';
     const onData = (chunk) => {
       buf += chunk.toString('latin1');
@@ -194,9 +199,9 @@ function tunnelThroughProxy(proxy, targetHost, targetPort, timeoutMs) {
       if (end < 0) return;
       sock.removeListener('data', onData);
       const status = buf.split('\r\n')[0] || '';
-      if (!/^HTTP\/1\.[01]\s+2\d\d/.test(status)) { sock.destroy(); return reject(new Error(`proxy CONNECT failed: ${status.trim() || 'no response'}`)); }
-      const tlsSock = tls.connect({ socket: sock, servername: targetHost, ALPNProtocols: ['http/1.1'] }, () => resolve(tlsSock));
-      tlsSock.once('error', reject);
+      if (!/^HTTP\/1\.[01]\s+2\d\d/.test(status)) { return fail(new Error(`proxy CONNECT failed: ${status.trim() || 'no response'}`)); }
+      const tlsSock = tls.connect({ socket: sock, servername: targetHost, ALPNProtocols: ['http/1.1'] }, () => ok(tlsSock));
+      tlsSock.once('error', fail);
     };
     sock.on('data', onData);
     sock.on('connect', () => sock.write(connectReq));
@@ -781,15 +786,25 @@ function buildMultiCallAccept(p) {
 //  Silvana app client (passkey login, earn-hub, server actions, RFQ)
 // ============================================================================
 const SWAP_STATE_TREE = encodeURIComponent(JSON.stringify(['', { children: ['(app)', { children: ['swap', { children: ['__PAGE__', {}, null, null] }, null, null] }, null, null] }, null, null, true]));
-// recoverParty (party + userServiceCid) skrg lewat REST GET /api/parties/{id},
-// bukan server action /connect lagi (lihat SilvanaClient.recoverParty).
+// [DEPRECATED] Server-action ID Silvana untuk discover party (POST /connect).
+// MATI sejak Silvana redeploy frontend → "Server action not found" (404). ID
+// server-action di-rotate tiap build. Diganti discovery on-chain via ACS di
+// bawah (discoverUserServiceCid) — sama seperti frontend baru. Dipertahankan
+// hanya sebagai referensi; jangan dipakai lagi.
+const CONNECT_RECOVER_ACTION = '405be033668f041e0f52850927fc3bdc84afab50f4';
+const CONNECT_STATE_TREE = encodeURIComponent(JSON.stringify(['', { children: ['connect', { children: ['__PAGE__', {}, null, null] }, null, null] }, null, null, true]));
+
+// Discovery userServiceCid LANGSUNG dari Active Contract Set (ACS) — pengganti
+// server-action /connect yang mati. Frontend Silvana baru pun pakai cara ini:
+// query template UserService, lalu cocokkan createArgument.user === partyId dan
+// operator === SILVANA_OPERATOR; contractId-nya = userServiceCid. Tahan-redeploy
+// karena template ID Daml stabil (tidak ikut rotasi server-action Next.js).
+const USER_SERVICE_TEMPLATE = '#utility-settlement-app-v1:Utility.Settlement.App.V1.Service.User:UserService';
+const SILVANA_OPERATOR = 'silvana-orderbook::1220997446016f1e96be9215bab224eace372752853ef99175c332307489bccbb07b';
 
 class SilvanaClient {
-  constructor({ jar, timeoutMs = REQ.timeoutMs, proxy = null, bearer = null } = {}) { this.jar = jar || new CookieJar(); this.timeoutMs = timeoutMs; this.proxy = proxy; this.bearer = bearer; }
+  constructor({ jar, timeoutMs = REQ.timeoutMs, proxy = null } = {}) { this.jar = jar || new CookieJar(); this.timeoutMs = timeoutMs; this.proxy = proxy; }
   _hdr(extra = {}) { return { 'User-Agent': UA, 'Accept': 'application/json, text/plain, */*', 'Accept-Language': 'en-US,en;q=0.9,id;q=0.8', 'Origin': APP_BASE, 'Referer': APP_BASE + '/', ...extra }; }
-  // Server action /swap & /connect skrg butuh Canton Bearer (supa identity token);
-  // cookie aja gak cukup (Canton balik "Missing authentication. Use Bearer").
-  get _bearerHdr() { const t = typeof this.bearer === 'function' ? this.bearer() : this.bearer; return t ? { 'Authorization': 'Bearer ' + t } : {}; }
   _opts(extra = {}) { return { jar: this.jar, timeoutMs: this.timeoutMs, proxy: this.proxy, ...extra }; }
   async passkeyLoginOptions(email) {
     const r = await request('POST', `${APP_BASE}/api/auth/passkey/login/options`, this._opts({ headers: this._hdr({ 'Referer': APP_BASE + '/login' }), body: JSON.stringify({ email }) }));
@@ -840,222 +855,57 @@ class SilvanaClient {
   async swapAction(actionId, args, { timeoutMs } = {}) {
     const r = await request('POST', `${APP_BASE}/swap`, this._opts({
       timeoutMs: timeoutMs || this.timeoutMs,
-      headers: this._hdr({ 'Accept': 'text/x-component', 'Content-Type': 'text/plain;charset=UTF-8', 'Referer': APP_BASE + '/swap', 'next-action': actionId, 'next-router-state-tree': SWAP_STATE_TREE, ...this._bearerHdr }),
+      headers: this._hdr({ 'Accept': 'text/x-component', 'Content-Type': 'text/plain;charset=UTF-8', 'Referer': APP_BASE + '/swap', 'next-action': actionId, 'next-router-state-tree': SWAP_STATE_TREE }),
       body: JSON.stringify(args || []),
     }));
     if (r.status === 401 || r.status === 403) { const e = new Error(`swapAction ${actionId} status=${r.status}`); e.unauthorized = true; logDebug(`swapAction ${actionId} ${r.status}`, r.text || ''); throw e; }
     if (r.status !== 200) {
-      // 404 = next-action ID gak dikenal server → kemungkinan Silvana redeploy
-      // mid-run. Tandai perlu re-discover di sesi berikutnya (self-heal).
-      if (r.status === 404) actionIdsVerified = false;
       logDebug(`swapAction ${actionId} ${r.status}`, r.text || '');
-      throw new Error(`swapAction ${actionId} status=${r.status} body=${(r.text || '').slice(0, 160)}`);
+      // Server-action ID basi (Silvana redeploy mid-session) → "Server action not
+      // found" 404. Picu refresh ID di background (force) supaya iterasi swap
+      // berikutnya self-heal pakai ID baru. Fire-and-forget (jangan blok throw).
+      // TAPI hanya untuk action yg MEMANG bisa di-discover dari bundle (ada di
+      // SWAP_ACTION_NAMES). listProposals/execSettle tak ada padanan → 404-nya
+      // permanen; tanpa guard ini, tiap akun memicu re-scan 1-2 menit (lambat
+      // beruntun). Kalau yg 404 action mappable → redeploy beneran → refresh.
+      if (r.status === 404 && /Server action not found/i.test(r.text || '')) {
+        const mappable = Object.keys(SWAP_ACTION_NAMES).some(k => SWAP.actionIds[k] === actionId);
+        if (mappable) refreshSwapActionIds({ proxy: this.proxy, force: true, log: (m, c) => logActivity(m, c) }).catch(() => { });
+      }
+      const err = new Error(`swapAction ${actionId} status=${r.status} body=${(r.text || '').slice(0, 160)}`);
+      // IP proxy kena geoblock Silvana (307 → /join/geoblocked). Tandai supaya
+      // swapWithRetry rotate ke session proxy lain (negara lolos) lalu retry.
+      if (r.status === 307 || /\/join\/geoblocked/i.test(r.text || '')) err.geoblocked = true;
+      throw err;
     }
     return actionResult(r.text || '');
   }
 
   /**
-   * Probe mentah 1 next-action (tanpa throw). Balikin status + raw RSC text +
-   * value baris "1:" (kalau JSON). Dipakai discoverActionIds buat fingerprint
-   * tanpa kehilangan raw text (blob prepareDvpFee ada di baris "2:T...").
-   */
-  async _probeAction(actionId, args, timeoutMs = 9000) {
-    try {
-      const r = await request('POST', `${APP_BASE}/swap`, this._opts({
-        timeoutMs,
-        headers: this._hdr({ 'Accept': 'text/x-component', 'Content-Type': 'text/plain;charset=UTF-8', 'Referer': APP_BASE + '/swap', 'next-action': actionId, 'next-router-state-tree': SWAP_STATE_TREE, ...this._bearerHdr }),
-        body: JSON.stringify(args || []),
-      }));
-      const text = r.text || '';
-      const line1 = text.split('\n').find(l => l.startsWith('1:'));
-      let val = null;
-      if (line1) { try { val = JSON.parse(line1.slice(2)); } catch (_) { } }
-      return { status: r.status, text, val };
-    } catch (_) { return { status: 0, text: '', val: null }; }
-  }
-
-  /**
-   * Cek cepat (1 request) apakah SWAP.actionIds masih valid. Anchor = estimateFee
-   * (BUKAN listProposals — itu bukan server action lagi di flow baru). estimateFee
-   * id valid → 200 (walau body "Market not found"); stale → 404 "Server action not
-   * found". Status-based = akurat, gak peduli auth/cookie.
-   */
-  async validateActionIds(partyId) {
-    if (!partyId) return false;
-    const r = await this._probeAction(SWAP.actionIds.estimateFee, [partyId]);
-    return r.status === 200;
-  }
-
-  /**
-   * Auto-discover next-action IDs dari bundle JS Silvana, FINGERPRINT-BASED.
+   * Discover party Silvana on-chain (recover dari userService DSO contract).
+   * Setara dengan klik halaman /connect di UI, dia balikin party termasuk
+   * `userServiceCid` yang dibutuhkan untuk swap finalize.
    *
-   * Silvana redeploy ~harian → hash next-action berubah + urutan bundle acak,
-   * JADI mapping by-order (fetch_id.js lama) tidak reliable. Tapi nama RPC di
-   * pesan error server STABIL antar-deploy. Strategi:
-   *   1. Scan semua chunk /_next → kumpulkan kandidat ID 0x40/0x60.
-   *   2. Probe tiap kandidat dgn [partyId], cocokkan signature (nama RPC/shape).
-   *   3. prepareDvpFee + getConsumedHoldings balik null ke probe [partyId] →
-   *      pass-2: probe pakai proposalId asli dari listProposals; prepareDvpFee
-   *      balik blob fee-context (CgMyL / baris "2:T"), getConsumedHoldings balik
-   *      {consumedAmuletCids}.
-   * Mutasi SWAP.actionIds in-place. Tidak butuh urutan bundle sama sekali.
-   *
-   * @param {string} partyId
-   * @returns {{ok:boolean, changed:string[], found:string[], missing:string[]}}
-   */
-  // Scan bundle JS /swap → daftar kandidat next-action ID (0x40/0x60). Fetch chunk
-  // PARALEL (8 sekaligus). Dipakai discoverActionIds + discoverActionByProbe.
-  async _scanSwapBundleIds() {
-    const page = await request('GET', `${APP_BASE}/swap`, this._opts({
-      headers: this._hdr({ 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8', 'Referer': APP_BASE + '/' }),
-    }));
-    const html = page.text || '';
-    const chunkUrls = new Set();
-    let m;
-    const reChunk = /\/_next\/static\/chunks\/[^"' \n\r]+\.js/g;
-    while ((m = reChunk.exec(html)) !== null) chunkUrls.add(m[0]);
-    const buildMatch = html.match(/"buildId"\s*:\s*"([^"]+)"/);
-    if (buildMatch) {
-      try {
-        const bm = await request('GET', `${APP_BASE}/_next/static/${buildMatch[1]}/_buildManifest.js`, this._opts({ timeoutMs: 8000 }));
-        for (const cc of ((bm.text || '').match(/static\/chunks\/[^"'\\]+\.js/g) || [])) chunkUrls.add('/_next/' + cc);
-      } catch (_) { }
-    }
-    const ids = [], seen = new Set();
-    const chunkTexts = await mapLimit([...chunkUrls], 8, url =>
-      request('GET', `${APP_BASE}${url}`, this._opts({ headers: this._hdr({ 'Referer': APP_BASE + '/swap' }), timeoutMs: 12000 }))
-        .then(r => r.status === 200 ? (r.text || '') : '').catch(() => ''));
-    for (const txt of chunkTexts) {
-      const re = /["']([46][0-9a-f]{41})["']/g;
-      while ((m = re.exec(txt)) !== null) { if (!seen.has(m[1])) { seen.add(m[1]); ids.push(m[1]); } }
-    }
-    return ids;
-  }
-
-  /**
-   * Cari 1 action yg balik BLOB factory ("CgMyL"/"2:T") buat body tertentu.
-   * Dipakai discover prepareDvpFee just-in-time (body butuh proposalId ASLI yg
-   * cuma ada saat swap) tanpa bergantung listProposals (yg udah mati). Skip id
-   * yg udah kepetakan biar gak salah ambil. Balikin id atau null.
-   * @param {Array} probeBody  body persis yg mau dikirim (mis. dvpFee args)
-   * @param {Set<string>} skipIds  id yg udah dipakai action lain
-   */
-  async discoverActionByProbe(probeBody, isMatch, skipIds = new Set()) {
-    const ids = await this._scanSwapBundleIds();
-    const cands = await mapLimit(ids.filter(id => !skipIds.has(id)), 6, id => this._probeAction(id, probeBody).then(r => ({ id, r })));
-    for (const c of cands) { if (c && c.r && isMatch(c.r)) return c.id; }
-    return null;
-  }
-  // prepareDvpFee/prepareTransfer balik BLOB factory ("CgMyL"/"2:T").
-  static _isBlob(r) { return /CgMyL/.test(r.text) || /^2:T/m.test(r.text); }
-  // getAllocFactory balik {success, factory:{factoryId, choiceContext}}.
-  static _isAllocFactory(r) { return !!(r.val && r.val.factory && r.val.factory.factoryId); }
-
-  async discoverActionIds(partyId) {
-    const ids = await this._scanSwapBundleIds();
-    const out = {};
-    if (!ids.length || !partyId) return { ok: false, changed: [], found: [], missing: Object.keys(SWAP.actionIds), missingCritical: ['estimateFee'] };
-
-    // 3. Pass-1: probe [partyId], fingerprint by nama RPC di error / shape sukses.
-    //    CATATAN: prepareDvpFee & prepareTransfer TIDAK di-fingerprint di sini —
-    //    keduanya balik blob factory ("2:T…CgMyL") yg butuh body khusus; di
-    //    pass-2. JANGAN pakai error "getDisclosedContracts" buat prepareTransfer:
-    //    itu helper standalone yg butuh Canton Bearer (BUKAN prepareTransfer).
-    //    Kandidat blob = yg balik null / E-digest / 500 ke probe [partyId].
-    const blobCands = [];
-    const probeLog = []; // dump ke swap-debug.log kalau discovery gak lengkap
-    // Probe semua id PARALEL (6 sekaligus), lalu assign berurutan (jaga first-match).
-    const probes = await mapLimit(ids, 6, id => this._probeAction(id, [partyId]).then(r => ({ id, ...r })));
-    for (const p of probes) {
-      if (!p) continue;
-      const { id, status, text, val } = p;
-      const _line1 = (val !== null ? JSON.stringify(val) : ((text || '').split('\n').find(l => l.startsWith('1:')) || (text || '').split('\n')[0] || ''));
-      probeLog.push(`${id} ${status} ${String(_line1).replace(/\s+/g, ' ').slice(0, 160)}`);
-      if (status === 0) continue;
-      const err = (val && (val.error || val.message)) || '';
-      // listProposals: array di key proposals/settlements/settlementProposals
-      // (Silvana kadang rename), ATAU error nyebut getSettlementProposals (nama
-      // RPC stabil — kematch walau cookie expired). Tahan rename antar-redeploy.
-      const propArr = val && (val.proposals || val.settlements || val.settlementProposals);
-      if (Array.isArray(propArr) || /getSettlementProposals/.test(err)) out.listProposals = out.listProposals || id;
-      else if (/estimateSettlementFees/.test(err)) out.estimateFee = id;
-      else if (/\bacceptQuote\b/.test(err)) out.acceptQuote = id;
-      else if (/Unknown event type/.test(err)) out.recordEvent = id;
-      else if (/getSettlementStatus/.test(err)) out.pollProposal = id;
-      else if (/choiceArguments/.test(err) || /DownField\(choiceArguments\)/.test(text)) out.getAllocFactory = id;
-      else if (val && typeof val.contractId === 'string' && val.success === undefined) out.getMultiCall = id;
-      else if (val && Array.isArray(val.consumedAmuletCids)) out.getConsumedHoldings = id;
-      else if (val === null || /^1:E\{/m.test(text) || status === 500) blobCands.push(id); // prepare*-family
-    }
-
-    // 4. Pass-2: prepareDvpFee & prepareTransfer dibedakan dari blobCands lewat
-    //    BENTUK BODY masing-masing — tiap action cuma balik blob ("CgMyL") buat
-    //    body yg sesuai (shape lain → null/error). Body transfer tak butuh
-    //    proposal; body dvpFee butuh proposalId asli dari listProposals.
-    const isBlob = (t) => /CgMyL/.test(t) || /^2:T/m.test(t);
-    if (blobCands.length) {
-      const _now = new Date();
-      const transferBody = [{ sender: partyId, receiver: partyId, amount: '1', instrumentId: { admin: SWAP.dsoPartyId, id: 'Amulet' }, inputHoldingCids: [], requestedAt: _now.toISOString(), executeBefore: new Date(_now.getTime() + 86400000).toISOString() }];
-      let dvpBody = null;
-      if (out.listProposals) {
-        const lp = await this._probeAction(out.listProposals, [partyId]);
-        const props = (lp.val && lp.val.proposals) || [];
-        const mine = props.find(p => p.seller === partyId) || props.find(p => p.buyer === partyId) || props[0];
-        if (mine && mine.proposalId) {
-          const role = mine.seller === partyId ? 'seller' : 'buyer';
-          dvpBody = [{ partyId, feeType: 'dvp_contract', role, proposalId: mine.proposalId, inputHoldingCids: [] }];
-        }
-      }
-      for (const id of blobCands) {
-        if (!out.prepareTransfer) {
-          const rt = await this._probeAction(id, transferBody);
-          if (isBlob(rt.text)) { out.prepareTransfer = id; continue; }
-        }
-        if (!out.prepareDvpFee && dvpBody) {
-          const rd = await this._probeAction(id, dvpBody);
-          if (isBlob(rd.text)) { out.prepareDvpFee = id; continue; }
-        }
-        if (out.prepareTransfer && out.prepareDvpFee) break;
-      }
-    }
-
-    // 5. Terapkan: mutasi SWAP.actionIds in-place, catat yg berubah.
-    const changed = [], found = [], missing = [];
-    for (const name of Object.keys(SWAP.actionIds)) {
-      if (out[name]) {
-        found.push(name);
-        if (SWAP.actionIds[name] !== out[name]) { SWAP.actionIds[name] = out[name]; changed.push(name); }
-      } else {
-        missing.push(name);
-      }
-    }
-    // Critical = action yg WAJIB ke-fingerprint di session-start.
-    //   - listProposals: BUKAN server action lagi (mati) → keluarin.
-    //   - prepareDvpFee: butuh proposalId asli → di-discover JUST-IN-TIME di
-    //     swapOnce (discoverActionByProbe pakai proposal dari acceptQuote) → keluarin.
-    //   - getConsumedHoldings: tak dipakai. getAllocFactory: cuma BUY.
-    const critical = ['estimateFee', 'acceptQuote', 'recordEvent', 'pollProposal', 'getMultiCall', 'prepareTransfer'];
-    const missingCritical = critical.filter(n => !out[n]);
-    const ok = missingCritical.length === 0;
-    if (!ok) logDebug(`discoverActionIds INCOMPLETE — missing: ${missingCritical.join(', ')} | found: ${found.join(', ')}`, probeLog.join('\n'));
-    return { ok, changed, found, missing, missingCritical };
-  }
-
-  /**
-   * Recover party + userServiceCid dari on-chain UserService.
-   * BUKAN server action /connect lagi (itu udah mati) — sekarang REST endpoint
-   * stabil: GET /api/parties/{partyId} → {success, party:{userServiceCid,...}}.
-   * Auth cookie (jar). Tahan redeploy (gak ada hash next-action).
+   * @param {string} partyId  e.g. 'supa1::1220abc...'
+   * @returns {object|null}   { partyId, partyName, userServiceCid, ... }
    */
   async recoverParty(partyId) {
     if (!partyId) throw new Error('partyId required');
-    const r = await request('GET', `${APP_BASE}/api/parties/${encodeURIComponent(partyId)}`, this._opts({
-      headers: this._hdr({ 'Accept': '*/*', 'Referer': APP_BASE + '/connect?returnTo=/swap', ...this._bearerHdr }),
+    const r = await request('POST', `${APP_BASE}/connect`, this._opts({
+      timeoutMs: this.timeoutMs,
+      headers: this._hdr({
+        'Accept': 'text/x-component',
+        'Content-Type': 'text/plain;charset=UTF-8',
+        'Referer': APP_BASE + '/connect',
+        'next-action': CONNECT_RECOVER_ACTION,
+        'next-router-state-tree': CONNECT_STATE_TREE,
+      }),
+      body: JSON.stringify([partyId]),
     }));
-    if (r.status === 401 || r.status === 403) { const e = new Error(`parties status=${r.status}`); e.unauthorized = true; throw e; }
-    if (r.status !== 200) throw new Error(`parties status=${r.status} body=${(r.text || '').slice(0, 160)}`);
-    let j = r.json; if (!j) { try { j = JSON.parse(r.text); } catch (_) { } }
-    if (j && j.success && j.party && j.party.userServiceCid) return j.party;
+    if (r.status === 401 || r.status === 403) { const e = new Error(`connect recover status=${r.status}`); e.unauthorized = true; throw e; }
+    if (r.status !== 200) throw new Error(`connect recover status=${r.status} body=${(r.text || '').slice(0, 160)}`);
+    const result = actionResult(r.text || '');
+    if (result && result.success && result.party) return result.party;
     return null;
   }
 
@@ -1079,6 +929,106 @@ class SilvanaClient {
       else if (ev === 'done') out.done = true;
     }
     return out;
+  }
+}
+
+/**
+ * Discover userServiceCid on-chain dari ACS (Active Contract Set) — pengganti
+ * SilvanaClient.recoverParty (server-action /connect) yang sudah mati setelah
+ * Silvana redeploy ("Server action not found"). Cara ini identik dengan yang
+ * dipakai frontend Silvana terbaru: ambil semua kontrak UserService, lalu pilih
+ * yang createArgument.user === partyId & operator === SILVANA_OPERATOR.
+ *
+ * @param {CantonClient} canton  client Supanova (token identity Privy).
+ * @param {string} partyId       party user, mis. 'supa1::1220...'
+ * @returns {Promise<string|null>} contractId userServiceCid, atau null kalau
+ *   UserService belum ada on-chain (akun belum selesai onboarding).
+ */
+async function discoverUserServiceCid(canton, partyId) {
+  if (!canton || !partyId) return null;
+  const list = await canton.activeContracts(USER_SERVICE_TEMPLATE, { filterModule: 'Service.User:UserService' });
+  let hit = null;
+  for (const c of (list || [])) {
+    const ca = (c && c.createArgument) || {};
+    if (ca.user !== partyId) continue;
+    if (ca.operator && ca.operator !== SILVANA_OPERATOR) continue;
+    hit = c.contractId; // praktiknya cuma 1 UserService per party
+  }
+  return hit || null;
+}
+
+// ============================================================================
+//  Auto-discovery server-action ID swap (anti "Server action not found" 404)
+// ============================================================================
+// Next.js server-action ID = hash build → ROTATE tiap Silvana redeploy frontend.
+// Bot lama hardcode ID dari HAR → tiap redeploy semua swap 404 sampai di-update
+// manual. Solusi tahan-redeploy: scrape bundle /swap. Tiap server-action publik
+// di JS chunk sebagai createServerReference("<id>",cb,void 0,smap,"<namaFungsi>").
+// Map nama fungsi Silvana → key SWAP.actionIds (nama Daml/fungsi stabil, cuma
+// hash ID yg rotate). Sama filosofinya dgn discoverUserServiceCid (on-chain ACS).
+const SWAP_ACTION_NAMES = {
+  estimateFee: 'estimateSettlementFees',
+  acceptQuote: 'acceptQuote',
+  recordEvent: 'recordSettlementEventAction',
+  pollProposal: 'getSettlementStatus',
+  getMultiCall: 'getMulticallConfigAction',
+  prepareDvpFee: 'buildFeeTransferDataAction',
+  prepareTransfer: 'getTransferFactoryContextAction',
+  getAllocFactory: 'getAllocationFactory',
+  submitPreconfirmation: 'submitPreconfirmation',
+  // listProposals & execSettle SENGAJA tidak dimap: tidak ada padanan di frontend
+  // Silvana terbaru → biarkan pakai fallback hardcoded (non-fatal kalau 404).
+};
+const ACTION_IDS_TTL_MS = 6 * 3600_000;  // re-discover tiap 6 jam (idempoten)
+let _actionIdsRefreshedAt = 0;
+
+// Fetch bundle /swap & override SWAP.actionIds dari nama fungsi. Idempoten:
+//  - normal: skip kalau < TTL sejak refresh terakhir.
+//  - force (mis. dipicu 404 mid-session): skip kalau < 60s (anti-hammer).
+// Non-fatal: gagal apa pun → biarkan ID lama (fallback hardcoded tetap jalan).
+async function refreshSwapActionIds({ proxy = null, force = false, log = () => { } } = {}) {
+  const gap = force ? 60_000 : ACTION_IDS_TTL_MS;
+  const now = Date.now();
+  if (_actionIdsRefreshedAt && (now - _actionIdsRefreshedAt) < gap) return null;
+  _actionIdsRefreshedAt = now;  // klaim slot dulu (anti-stampede multi-akun)
+  const backoff = () => { _actionIdsRefreshedAt = now - gap + Math.min(gap, 300_000); }; // retry <=5mnt saat gagal
+  try {
+    log('Auto-discover action-ID: ambil bundle /swap…', COLOR.gray);
+    const page = await request('GET', APP_BASE + '/swap', { proxy, timeoutMs: REQ.timeoutMs, headers: { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml' } });
+    if (!page || page.status !== 200 || !page.text) { logDebug('refreshSwapActionIds: /swap status', page && page.status); backoff(); return null; }
+    const chunks = [...new Set([...page.text.matchAll(/\/_next\/static\/[^"'\\)]+?\.js/g)].map(m => m[0]))];
+    const refRe = /createServerReference\)\("([0-9a-f]{40,42})",[^,]+,void 0,[^,]+,"([A-Za-z0-9_$]+)"\)/g;
+    const wanted = new Set(Object.values(SWAP_ACTION_NAMES));
+    const byName = {};
+    const CONC = 8;
+    log(`Scan ${chunks.length} chunk bundle (paralel ${CONC})…`, COLOR.gray);
+    // Fetch chunk PARALEL berbatch. Sekuensial via proxy bisa ~2 menit; batch
+    // konkuren menekan jadi beberapa detik. Early-stop per batch kalau semua ketemu.
+    for (let i = 0; i < chunks.length; i += CONC) {
+      const batch = await Promise.all(chunks.slice(i, i + CONC).map(c =>
+        request('GET', APP_BASE + c, { proxy, timeoutMs: REQ.timeoutMs, headers: { 'User-Agent': UA } }).catch(() => null)));
+      for (const r of batch) {
+        if (!r || r.status !== 200 || !r.text) continue;
+        for (const m of r.text.matchAll(refRe)) byName[m[2]] = m[1];
+      }
+      if ([...wanted].every(n => byName[n])) break;  // semua nama ketemu → stop early
+    }
+    if (!Object.keys(byName).length) { logDebug('refreshSwapActionIds: tidak ada server-action di bundle'); backoff(); return null; }
+    const updated = [], missing = [];
+    for (const [key, fnName] of Object.entries(SWAP_ACTION_NAMES)) {
+      const id = byName[fnName];
+      if (!id) { missing.push(`${key}(${fnName})`); continue; }
+      if (SWAP.actionIds[key] !== id) updated.push(key);
+      SWAP.actionIds[key] = id;
+    }
+    if (missing.length) logDebug('refreshSwapActionIds: nama tak ditemukan di bundle', missing);
+    if (updated.length) log(`Action-ID swap di-refresh dari frontend: ${updated.length} berubah (${updated.join(', ')})`, COLOR.green);
+    else log('Action-ID swap sudah terkini (cocok frontend)', COLOR.gray);
+    return { updated, missing, total: Object.keys(byName).length };
+  } catch (e) {
+    logDebug('refreshSwapActionIds: error', (e && e.message) || String(e));
+    backoff();
+    return null;
   }
 }
 
@@ -1394,22 +1344,8 @@ async function swapOnce(ctx, direction, quantityCC) {
   const ccNeed = weAreBuyer ? SWAP.feeBufferCC : addDp(amount, SWAP.feeBufferCC);
   const inputHoldingCids = selectCcHoldings(amulets, ccNeed);
 
-  const dvpFeeArgs = [{ partyId, feeType: 'dvp_contract', role, proposalId, inputHoldingCids }];
-  let feeCtx = await sv.swapAction(A.prepareDvpFee, dvpFeeArgs).catch(e => ({ _err: (e && e.message) || String(e) }));
-  // JUST-IN-TIME discover: kalau prepareDvpFee stale (404, redeploy) → scan bundle,
-  // cari action yg balik blob fee-context buat body INI (proposalId asli udah ada
-  // dari acceptQuote) → update SWAP.actionIds.prepareDvpFee → retry. Gak butuh
-  // listProposals (mati). Ini bikin auto-fetch prepareDvpFee jalan tiap redeploy.
-  if (!feeCtx || feeCtx._err || !feeCtx.choiceContextData) {
-    const skip = new Set(Object.values(A).filter(id => id !== A.prepareDvpFee));
-    const newId = await sv.discoverActionByProbe(dvpFeeArgs, SilvanaClient._isBlob, skip).catch(() => null);
-    if (newId && newId !== A.prepareDvpFee) {
-      log(`prepareDvpFee stale → ditemukan ID baru ${newId.slice(0, 10)}… (auto-fetch)`);
-      SWAP.actionIds.prepareDvpFee = newId;
-      feeCtx = await sv.swapAction(newId, dvpFeeArgs).catch(e => ({ _err: (e && e.message) || String(e) }));
-    }
-  }
-  if (!feeCtx || feeCtx._err || !feeCtx.choiceContextData) throw new Error(`prepareDvpFee gagal: ${(feeCtx && feeCtx._err) || 'no choiceContextData'}`);
+  const feeCtx = await sv.swapAction(A.prepareDvpFee, [{ partyId, feeType: 'dvp_contract', role, proposalId, inputHoldingCids }]);
+  if (!feeCtx || !feeCtx.choiceContextData) throw new Error('prepareDvpFee gagal');
 
   // FEE PROTECTION (authoritative): feeCtx punya angka fee CC sebenarnya.
   // Batalkan SEBELUM execSettle/prepare/submit → belum ada CC kebayar.
@@ -1434,10 +1370,15 @@ async function swapOnce(ctx, direction, quantityCC) {
     throw e;
   }
 
-  // execSettle DIHAPUS (4th redeploy / swap_sell/30.har): action ini sudah gone
-  // dari Silvana. Flow SELL skrg: prepareDvpFee → getConsumedHoldings →
-  // prepareTransfer → getAllocFactory → prepare_transaction → submit_prepared.
-  // Settlement di-trigger oleh submit_prepared (Canton RPC), bukan execSettle.
+  // execSettle HARUS dipanggil SEBELUM prepare_transaction (terbukti di 14/14
+  // HAR manual yg sukses: prepareDvpFee → execSettle → prepareTransfer → prepare).
+  // Ini yg menyiapkan/men-trigger eksekusi settlement di sisi Silvana. Tanpa ini
+  // tx Canton tetap ke-submit (valid) TAPI DvP gak pernah finalize → DAY_TRADER
+  // gak naik → bot keliatan "stuck submitted tapi gak settle".
+  const es = await sv.swapAction(A.execSettle, [{ proposalId, partyId }]).catch(e => ({ _err: (e && e.message) || String(e) }));
+  logDebug('execSettle (pre-prepare) response', es);
+  if (es && es._err) log(`⚠ execSettle gagal: ${es._err}`);
+  else if (es && es.success === false) log('⚠ execSettle success=false');
 
   const _now = new Date();
   const _totalFee = addDp(feeCtx.feeAmountCC || '0', feeCtx.counterpartFeeAmountCC || '0');
@@ -1473,7 +1414,7 @@ async function swapOnce(ctx, direction, quantityCC) {
     // BUY allocationFactory = USDCx factory (bukan CC/Amulet ExternalPartyAmuletRules).
     // prepareTransfer.factoryId = "004b73bef9..." (CC factory) → salah untuk BUY.
     // getAllocFactory action 60c923ff... return "006289e882..." (USDCx factory) → benar.
-    const allocFactArgs = [
+    const allocFact = await sv.swapAction(A.getAllocFactory, [
       SWAP.usdcxAdmin,
       {
         allocation: {
@@ -1499,22 +1440,9 @@ async function swapOnce(ctx, direction, quantityCC) {
         extraArgs: { context: { values: {} }, meta: { values: {} } },
         requestedAt: dvp.terms.createdAt,
       },
-    ];
-    let allocFact = await sv.swapAction(A.getAllocFactory, allocFactArgs).catch(e => ({ _err: (e && e.message) || String(e) }));
-    // JUST-IN-TIME discover getAllocFactory (BUY) kalau stale (404, redeploy) →
-    // scan bundle, cari action yg balik {factory:{factoryId}} buat body INI →
-    // update + retry. Auto-fetch tiap redeploy tanpa update manual.
-    if (!allocFact || allocFact._err || !allocFact.factory || !allocFact.factory.factoryId) {
-      const skip = new Set(Object.values(A).filter(id => id !== A.getAllocFactory));
-      const newId = await sv.discoverActionByProbe(allocFactArgs, SilvanaClient._isAllocFactory, skip).catch(() => null);
-      if (newId && newId !== A.getAllocFactory) {
-        log(`getAllocFactory stale → ditemukan ID baru ${newId.slice(0, 10)}… (auto-fetch)`);
-        SWAP.actionIds.getAllocFactory = newId;
-        allocFact = await sv.swapAction(newId, allocFactArgs).catch(e => ({ _err: (e && e.message) || String(e) }));
-      }
-    }
+    ]);
     logDebug('getAllocFactory (buy) response', allocFact);
-    if (!allocFact || allocFact._err || !allocFact.factory || !allocFact.factory.factoryId) throw new Error(`getAllocFactory (buy) gagal: ${(allocFact && allocFact._err) || 'no factory'}`);
+    if (!allocFact || !allocFact.factory || !allocFact.factory.factoryId) throw new Error('getAllocFactory (buy) gagal');
     const _allocCtx = allocFact.factory.choiceContext || {};
     allocate = { instrument: ourLeg.instrument, amount: ourLeg.amount, legId: ourLeg.legId, factoryCid: allocFact.factory.factoryId, contextValues: (_allocCtx.choiceContextData && _allocCtx.choiceContextData.values) || {}, disclosed: _allocCtx.disclosedContracts || [] };
   } else {
@@ -1560,8 +1488,8 @@ async function swapOnce(ctx, direction, quantityCC) {
     if (q && (q.status === 'failed' || q.status === 'rejected')) throw new Error(`transaksi ${q.status}: ${q.message || ''}`);
     await sleep(SWAP.completionPollMs);
   }
-  // Settlement di-finalize oleh submit_prepared (Canton RPC) di atas — tidak ada
-  // execSettle lagi (gone sejak 4th redeploy).
+  // (execSettle sudah dipanggil SEBELUM prepare_transaction — lihat di atas.
+  //  Tidak dipanggil lagi di sini; di flow manual web hanya 1x, pre-prepare.)
   return { ok: true, direction, proposalId, submissionId: sub.submissionId, completed: !!completion, feeCC: Number.isFinite(realFeeCC) ? realFeeCC : null };
 }
 
@@ -1573,19 +1501,13 @@ const c = (code) => useColor ? `\x1b[${code}m` : '';
 const COLOR = { reset: c(0), dim: c(2), bold: c(1), red: c(31), green: c(32), yellow: c(33), blue: c(34), mag: c(35), cyan: c(36), white: c(37), gray: c(90) };
 const paint = (txt, ...codes) => codes.join('') + txt + COLOR.reset;
 function visLen(s) { return s.replace(/\x1b\[[0-9;]*m/g, '').length; }
-function pad(s, w, side = 'right') {
-  const len = visLen(s); if (len >= w) return s;
-  const total = w - len;
-  if (side === 'center') { const l = Math.floor(total / 2); return ' '.repeat(l) + s + ' '.repeat(total - l); }
-  const sp = ' '.repeat(total);
-  return side === 'right' ? s + sp : sp + s;
-}
+function pad(s, w, side = 'right') { const len = visLen(s); if (len >= w) return s; const sp = ' '.repeat(w - len); return side === 'right' ? s + sp : sp + s; }
 
 let W = 44, ROWS = 24;
 function computeLayout() {
   const cols = process.stdout.columns || 0, rows = process.stdout.rows || 0;
   ROWS = rows > 0 ? rows : 24;
-  W = cols > 0 ? Math.max(30, Math.min(cols, 160)) : 44;
+  W = cols > 0 ? Math.max(30, Math.min(cols, 100)) : 44;
 }
 const BOX = { tl: '╭', tr: '╮', bl: '╰', br: '╯', h: '─', v: '│', tee: '├', tee2: '┤' };
 const line = () => paint(BOX.tl + BOX.h.repeat(W - 2) + BOX.tr, COLOR.cyan);
@@ -1605,93 +1527,89 @@ function row(content) {
 }
 function clearScreen() { if (useColor) process.stdout.write('\x1b[2J\x1b[H'); }
 function fmtNum(s, maxDp = 4) { if (s == null) return '-'; const n = Number(s); if (!isFinite(n)) return String(s); if (n === 0) return '0'; const t = (Math.abs(n) >= 1 ? n.toFixed(maxDp) : n.toFixed(6)); return t.includes('.') ? t.replace(/0+$/, '').replace(/\.$/, '') : t; }
-// Sisa umur sesi → [teks, warna] (buat sel table; warna diterapkan saat render).
-function expParts(expMs) {
-  if (!expMs) return ['-', COLOR.gray];
+function progressBar(cur, max, width = 12) { const filled = max > 0 ? Math.max(0, Math.min(width, Math.round((cur / max) * width))) : 0; return paint('▓'.repeat(filled), COLOR.green) + paint('░'.repeat(width - filled), COLOR.gray); }
+/** Format sisa waktu sampai expMs jadi "47m" / "2h" / "expired" */
+function expIn(expMs) {
+  if (!expMs) return paint('-', COLOR.gray);
   const ms = Number(expMs) - Date.now();
-  if (ms <= 0) return ['expired', COLOR.red];
+  if (ms <= 0) return paint('expired', COLOR.red);
   const m = Math.round(ms / 60000);
-  if (m < 60) return [m + 'm', m < 5 ? COLOR.yellow : COLOR.cyan];
+  if (m < 60) return paint(m + 'm', m < 5 ? COLOR.yellow : COLOR.cyan);
   const h = Math.round(m / 60);
-  if (h < 48) return [h + 'h', COLOR.cyan];
-  return [Math.round(h / 24) + 'd', COLOR.cyan];
+  if (h < 48) return paint(h + 'h', COLOR.cyan);
+  return paint(Math.round(h / 24) + 'd', COLOR.cyan);
 }
+/** Render dua field, KEDUANYA rata kiri dengan gap tetap. Kalau gak muat,
+ *  tumpuk jadi dua baris (tetap rata kiri). */
+function row2(left, right) {
+  const inner = W - 4; // total inner width tanpa border
+  const GAP = 3;
+  if (visLen(left) + GAP + visLen(right) <= inner) {
+    return row(left + ' '.repeat(GAP) + right);
+  }
+  return row(left) + '\n' + row(right); // gak muat → tumpuk, dua-duanya rata kiri
+}
+
 function renderHeader() {
-  return [line(), row(paint(' SilvanaBot V1.6 Auto Swap ', COLOR.bold + COLOR.cyan)), row(paint(new Date().toLocaleString('id-ID'), COLOR.gray))].join('\n');
+  return [line(), row(paint(' SilvanaBot V1.5 Auto Swap ', COLOR.bold + COLOR.cyan)), row(paint(new Date().toLocaleString('id-ID'), COLOR.gray))].join('\n');
 }
-// Status akun → [teks, warna]. Dipakai sel STATUS di table.
-function statusInfo(state) {
+function statusBadge(state) {
   const d = state.dayTrader;
-  if (state.status === 'error') return ['● Error', COLOR.red];
-  if (d && d.count >= d.target) return ['● Selesai', COLOR.green];
-  if (dtSessionRunning) return ['● Swap', COLOR.yellow];
-  if (state.status === 'login') return ['● Login', COLOR.yellow];
-  if (state.status === 'ok') return ['● Aktif', COLOR.green];
-  return ['● Siap', COLOR.gray];
+  if (state.status === 'error') return paint('● Error', COLOR.red);
+  if (state.status === 'skip') return paint('● Skip', COLOR.yellow);
+  if (d && d.count >= d.target) return paint('● Selesai ✓', COLOR.green);
+  if (dtSessionRunning) return paint('● Swap…', COLOR.yellow);
+  if (state.status === 'login') return paint('● Login…', COLOR.yellow);
+  if (state.status === 'ok') return paint('● Aktif', COLOR.green);
+  return paint('● Siap', COLOR.gray);
 }
-// ── Helper kolom table (compact 2-baris/akun) ────────────────────────────────
-function truncVis(s, w) { s = String(s); return s.length > w ? s.slice(0, Math.max(0, w - 1)) + '…' : s; }
-function fmtThousand(n) { const x = Math.round(Number(n)); return Number.isFinite(x) ? x.toLocaleString('en-US') : '-'; }
-function balOf(state, idUpper) {
-  const t = (Array.isArray(state.balances) ? state.balances : []).find(b => String((b.instrumentId && b.instrumentId.id) || '').toUpperCase() === idUpper);
-  if (!t) return null;
-  const u = Number(t.totalUnlockedBalance ?? t.totalBalance ?? 0);
-  const tot = Number(t.totalBalance ?? 0);
-  return { unlocked: u, locked: Math.max(0, tot - u) };
-}
-// Grid akun: 1 baris/akun, kolom dipisah border │, ada header kolom. Lebar &
-// set kolom dihitung SEKALI dari semua akun → align rapi. Kolom prioritas-rendah
-// (prio besar) didrop SERAGAM kalau terminal sempit; AKUN nyerap sisa lebar.
-function renderAccountsTable(states) {
-  // TANPA pembatas kolom (no │/┬/┼/┴). Semua sel CENTER, compact (lebar natural),
-  // blok di-center dalam frame. cell(s) → [teks polos, warna]. prio 0 = wajib.
-  const COLS = [
-    { title: 'AKUN', prio: 0, cap: 16, align: 'l', cell: s => [truncVis(s.label || '-', 16), COLOR.bold] },
-    { title: 'STATUS', prio: 1, cap: 10, cell: s => statusInfo(s) },
-    { title: 'SWAP', prio: 0, cap: 7, cell: s => [s.dayTrader ? `${s.dayTrader.count}/${s.dayTrader.target}` : '-', s.dayTrader && s.dayTrader.count >= s.dayTrader.target ? COLOR.green : COLOR.white] },
-    { title: 'CC', prio: 1, cap: 12, cell: s => { const b = balOf(s, 'AMULET'); return [b ? fmtCC(b.unlocked) + (b.locked > 1e-8 ? '+' + fmtCC(b.locked) : '') : '-', COLOR.green]; } },
-    { title: 'USDCx', prio: 1, cap: 12, cell: s => { const b = balOf(s, 'USDCX'); return [b ? fmtUSDC(b.unlocked) + (b.locked > 1e-8 ? '+' + fmtUSDC(b.locked) : '') : '-', COLOR.green]; } },
-    { title: 'POIN', prio: 3, cap: 9, cell: s => [s.points != null ? fmtThousand(s.points) : '-', COLOR.mag] },
-    { title: 'STREAK', prio: 4, cap: 6, cell: s => [s.streak != null ? String(s.streak) : '-', COLOR.yellow] },
-    { title: 'SILV', prio: 2, cap: 8, cell: s => expParts(s.silvanaExpMs) },
-    { title: 'SUPA', prio: 2, cap: 8, cell: s => expParts(s.tokenExpMs) },
-  ];
-  // Natural width = max(title, isi sel) di-cap per kolom.
-  for (const c of COLS) {
-    let w = c.title.length;
-    for (const s of states) { const t = String(c.cell(s)[0]); if (t.length > w) w = t.length; }
-    c.w = Math.min(c.cap, w);
+function renderAccount(state) {
+  const lines = [sep()];
+  // baris 1: label kiri, status kanan
+  lines.push(row2(paint(state.label || '-', COLOR.bold), statusBadge(state)));
+
+  // baris 2: progress kiri, count kanan
+  const d = state.dayTrader;
+  if (d) {
+    const left = progressBar(d.count, d.target);
+    const right = paint(`${d.count}/${d.target}`, d.count >= d.target ? COLOR.green : COLOR.bold) + paint(' swap', COLOR.gray);
+    lines.push(row2(left, right));
+  } else {
+    lines.push(row(paint('DAY_TRADER  —  (memuat…)', COLOR.gray)));
   }
-  // Fit compact: gap 2 spasi antar kolom, JANGAN distribusi slack (biar compact).
-  // Drop prioritas-rendah kalau total > inner. inner = lebar konten (W-4).
-  const inner = W - 4, GAP = 2;
-  const total = arr => arr.reduce((a, c, i) => a + c.w + (i ? GAP : 0), 0);
-  let kept = COLS.slice();
-  while (kept.length > 2 && total(kept) > inner) {
-    let di = -1;
-    for (let i = 0; i < kept.length; i++) if (kept[i].prio > 0 && (di < 0 || kept[i].prio >= kept[di].prio)) di = i;
-    if (di < 0) break;
-    kept.splice(di, 1);
+
+  // baris balance: CC | USDCx (2 kolom)
+  const bals = (Array.isArray(state.balances) ? state.balances : []).filter(b => {
+    const id = String((b.instrumentId && b.instrumentId.id) || '').toLowerCase();
+    if (HIDE_TOKENS.includes(id)) return false;
+    return SHOW_TOKENS.length ? SHOW_TOKENS.includes(id) : true;
+  });
+  const balCells = bals.map(b => {
+    const rawId = (b.instrumentId && b.instrumentId.id) || '?';
+    const label = TOKEN_LABEL[String(rawId).toLowerCase()] || rawId;
+    const unlocked = Number(b.totalUnlockedBalance ?? b.totalBalance ?? 0);
+    const total = Number(b.totalBalance ?? 0);
+    const locked = total - unlocked;
+    let s = paint(label, COLOR.bold) + paint(' ', COLOR.gray) + paint(fmtNum(unlocked), COLOR.green);
+    if (locked > 1e-8) s += paint(' (+' + fmtNum(locked) + ')', COLOR.gray);
+    return s;
+  });
+  if (balCells.length === 2) {
+    lines.push(row2(balCells[0], balCells[1]));
+  } else {
+    balCells.forEach(c => lines.push(row(c)));
   }
-  // Render: tiap sel di-center ke lebar kolom, gabung pakai GAP spasi, blok
-  // di-center dalam inner. Header titles gray bold, baris data warna per sel.
-  const gapStr = ' '.repeat(GAP);
-  const blockW = total(kept);
-  const leftPad = ' '.repeat(Math.max(0, Math.floor((inner - blockW) / 2)));
-  const sideOf = a => a === 'l' ? 'right' : a === 'r' ? 'left' : 'center'; // l=rata kiri, r=rata kanan, default center
-  const buildRow = (cellsTC, header) => {
-    const cells = kept.map((c, i) => {
-      let [t, col] = cellsTC[i];
-      t = String(t); if (visLen(t) > c.w) t = truncVis(t, c.w);
-      return paint(pad(t, c.w, sideOf(c.align)), header ? COLOR.bold + COLOR.gray : col);
-    });
-    return row(leftPad + cells.join(gapStr));
-  };
-  const out = [sep()];
-  out.push(buildRow(kept.map(c => [c.title, null]), true)); // header kolom (center)
-  out.push(sep());
-  for (const s of states) out.push(buildRow(kept.map(c => c.cell(s)))); // 1 baris/akun
-  return out.join('\n');
+
+  // baris session info: silv expiry kiri, supa expiry kanan
+  const silv = expIn(state.silvanaExpMs);
+  const supa = expIn(state.tokenExpMs);
+  lines.push(row2(
+    paint('silv ', COLOR.gray) + silv,
+    paint('supa ', COLOR.gray) + supa
+  ));
+
+  if (state.status === 'error' && state.message) lines.push(row(paint('⚠ ' + state.message, COLOR.red)));
+  return lines.join('\n');
 }
 function renderFooter() {
   const jam = String(SCHED.hour).padStart(2, '0') + ':' + String(SCHED.minute).padStart(2, '0');
@@ -1745,7 +1663,7 @@ function render(states) {
   if (!Array.isArray(states)) return; // dipanggil dari path non-dashboard (wallets/register) sebelum __states init
   computeLayout(); clearScreen();
   const out = [renderHeader()];
-  out.push(renderAccountsTable(states));
+  states.forEach(s => out.push(renderAccount(s)));
   out.push(renderFooter());
   const used = out.join('\n').split('\n').length;
   const avail = Math.max(MIN_ACTIVITY_LINES, ROWS - used - 3);
@@ -1765,23 +1683,6 @@ function parseDayTrader(tasksArr) {
   const target = m ? Number(m[2]) : 10;
   return { current, target, completed: !!it.completed || current >= target };
 }
-// Streak dari task MONTHLY_TRADER earn-hub. Robust ke nama field (streak/
-// currentStreak/progress "X/Y"). Balikin angka streak atau null.
-function parseMonthlyStreak(tasksArr) {
-  const arr = Array.isArray(tasksArr) ? tasksArr : (tasksArr && tasksArr.items) || [];
-  const it = arr.find(t => /MONTHLY/i.test(String((t && t.code) || '')));
-  if (!it) return null;
-  const num = v => { if (v == null) return null; const n = Number(String(v).replace(/,/g, '').trim()); return Number.isFinite(n) ? n : null; };
-  for (const k of ['streak', 'currentStreak', 'dayStreak', 'consecutiveDays', 'streakDays', 'value', 'count']) {
-    if (k in it) { const n = num(it[k]); if (n != null) return n; }
-  }
-  const m = String(it.progress || '').match(/(\d+)/); // "5/30" → 5
-  if (m) return Number(m[1]);
-  return it.completed ? 1 : 0;
-}
-// Format balance: CC = 1 desimal, USDCx = 3 desimal (tetap, gak strip nol).
-function fmtCC(n) { const x = Number(n); return Number.isFinite(x) ? x.toFixed(1) : '-'; }
-function fmtUSDC(n) { const x = Number(n); return Number.isFinite(x) ? x.toFixed(3) : '-'; }
 // Unclaimed Points dari earn-hub (mis. 1,780.00). Cari di root + nested, robust ke nama field.
 function extractUnclaimedPoints(tasks) {
   if (!tasks || typeof tasks !== 'object') return null;
@@ -1830,26 +1731,17 @@ async function tickAccount(state) {
       const tasks = await sv.earnTasks(partyId).catch(() => null);
       const dt = parseDayTrader(tasks && tasks.items);
       if (dt) state.dayTrader = { count: dt.current, target: dt.target };
-      const stk = parseMonthlyStreak(tasks && tasks.items);
-      if (stk != null) state.streak = stk;
       const stats = await sv.earnStats().catch(() => null);
       const pts = (stats && stats.totalPoints != null && Number.isFinite(Number(stats.totalPoints)))
         ? Number(stats.totalPoints) : extractUnclaimedPoints(tasks);
       if (pts != null) state.points = pts;
-      // Earn-hub lengkap buat kolom dashboard table.
-      if (stats && stats.totalVolume != null && Number.isFinite(Number(stats.totalVolume))) state.volume = Number(stats.totalVolume);
-      if (stats && stats.activityCount != null && Number.isFinite(Number(stats.activityCount))) state.activity = Number(stats.activityCount);
-      if (stats && stats.displayName) state.displayName = stats.displayName;
       await fetchCcPrice(sv);
     }
     state.status = 'ok'; state.message = '';
   } catch (e) { state.status = 'error'; state.message = (e && e.message) || String(e); }
   render(global.__states);
 }
-// Konkurensi login/keep-alive antar-akun. Tiap akun independen (proxy/cookie/
-// privy sendiri) → aman paralel. Batasi biar gak overload proxy/rate-limit.
-const ACCT_CONCURRENCY = Math.max(1, Number((CONFIG.swap || {}).loginConcurrency) || 5);
-async function tickAll(states) { await mapLimit(states, ACCT_CONCURRENCY, s => tickAccount(s)); }
+async function tickAll(states) { for (const s of states) await tickAccount(s); }
 
 // ============================================================================
 //  Keep-alive token (Privy/Supa + Silvana) — jalan TERUS walau quest selesai.
@@ -1867,8 +1759,7 @@ async function keepAliveTokens(state) {
   }
 }
 async function keepAliveAll(states) {
-  if (dtSessionRunning) return;
-  await mapLimit(states, ACCT_CONCURRENCY, s => dtSessionRunning ? null : keepAliveTokens(s));
+  for (const s of states) { if (dtSessionRunning) return; await keepAliveTokens(s); }
   render(states);
 }
 
@@ -1876,41 +1767,8 @@ async function keepAliveAll(states) {
 //  DAY_TRADER engine — API-driven, anti-overcap (no local count file)
 // ============================================================================
 let dtSessionRunning = false;
-// Sekali per-proses: true setelah action IDs diverifikasi/di-discover valid.
-// Reset jadi false otomatis saat swapAction kena 404 (redeploy mid-run) →
-// ensureActionIds di loop swap re-discover otomatis (self-heal mid-run).
-let actionIdsVerified = false;
-let lastDiscoverMs = 0; // throttle scan bundle (anti-hammer kalau discover gagal)
-
-// Pastikan SWAP.actionIds current: validate murah (1 req) → kalau stale (404,
-// Silvana redeploy) scan bundle & remap fingerprint. Dipanggil di session-start
-// DAN tiap iterasi loop swap (murah kalau sudah verified). Aman dipanggil
-// berulang. Throttle scan 30s biar gak hammer pas discover gagal (cookie dead).
-async function ensureActionIds(sv, partyId, tag) {
-  if (actionIdsVerified) return;
-  try {
-    if (await sv.validateActionIds(partyId)) {
-      actionIdsVerified = true;
-      logActivity(`[${tag}] action IDs valid ✓`, COLOR.gray);
-      return;
-    }
-    if (Date.now() - lastDiscoverMs < 30000) return; // baru scan <30s lalu, tunggu
-    lastDiscoverMs = Date.now();
-    logActivity(`[${tag}] action ID stale (Silvana redeploy) → scan bundle…`, COLOR.yellow);
-    const r = await sv.discoverActionIds(partyId);
-    if (r.changed.length) logActivity(`[${tag}] action IDs di-refresh (${r.changed.length}): ${r.changed.join(', ')}`, COLOR.green);
-    // verified = SEMUA action kritis ketemu. prepareDvpFee butuh proposal aktif
-    // buat di-fingerprint → kalau akun belum punya proposal, baru ke-heal setelah
-    // swap pertama bikin proposal (loop berikut re-discover). getConsumedHoldings
-    // opsional (tak dipakai) → gak masuk hitungan.
-    actionIdsVerified = r.ok;
-    if (!r.ok) logActivity(`[${tag}] discovery belum lengkap: ${r.missingCritical.join(', ')} — auto-retry tiap loop (prepareDvpFee perlu proposal aktif)`, COLOR.yellow);
-  } catch (e) {
-    logActivity(`[${tag}] discovery action IDs gagal: ${(e && e.message) || e}`, COLOR.yellow);
-  }
-}
 function makeStates() {
-  return ACCOUNTS.map((a, i) => ({ label: a.label || `akun-${i + 1}`, email: a.email, privyEmail: a.privyEmail || null, status: 'idle', message: '', balances: null, dayTrader: null, points: null, volume: null, activity: null, streak: null }));
+  return ACCOUNTS.map((a, i) => ({ label: a.label || `akun-${i + 1}`, email: a.email, privyEmail: a.privyEmail || null, status: 'idle', message: '', balances: null, dayTrader: null }));
 }
 
 /**
@@ -1943,9 +1801,6 @@ async function buildSwapClients(state) {
   if (!pat) throw new Error('privy_access_token tidak ada di session');
   const sv = await ensureSilvanaSession(state);
   if (!sv) throw new Error('passkey belum di-set (paste dulu)');
-  // Server action /swap & /connect skrg butuh Canton Bearer (supa identity token).
-  // Pakai fungsi biar selalu baca token terbaru dari session (auto-refresh).
-  sv.bearer = () => { try { return acctSession(email).privy.token || identityToken; } catch (_) { return identityToken; } };
   const me = await supaMe(identityToken, proxy);
   const partyId = me.data && me.data.partyId;
   if (!partyId) throw new Error('partyId tidak ditemukan');
@@ -2096,6 +1951,10 @@ async function runDayTraderSession(reason) {
   dtSessionRunning = true;
   logActivity(`Mulai cek & auto-swap (${reason || 'manual'})`, COLOR.cyan);
   try {
+    // Auto-discover server-action ID terkini dari frontend Silvana SEBELUM swap
+    // (anti "Server action not found" 404 setelah redeploy). Non-fatal: gagal →
+    // fallback ke ID hardcoded. Idempoten (TTL 6 jam) — cuma fetch sekali/sesi.
+    await refreshSwapActionIds({ proxy: getProxy((ACCOUNTS[0] || {}).email), log: (m, c) => logActivity(m, c) });
     for (let i = 0; i < ACCOUNTS.length; i++) {
       const a = ACCOUNTS[i], tag = a.label || a.email;
       const state = (global.__states && global.__states[i]) || makeStates()[i];
@@ -2115,26 +1974,26 @@ async function runDayTraderSession(reason) {
         state.status = 'ok';
         let userServiceCid = getUserServiceCid(a.email);
         if (!userServiceCid) {
-          logActivity(`[${tag}] discovery party (one-time)…`, COLOR.cyan);
+          logActivity(`[${tag}] discovery userServiceCid (on-chain)…`, COLOR.cyan);
           try {
-            const party = await sv.recoverParty(partyId);
-            if (party && party.userServiceCid) {
-              userServiceCid = party.userServiceCid;
+            userServiceCid = await discoverUserServiceCid(clients.canton, partyId);
+            if (userServiceCid) {
               patchAcctSession(a.email, { userServiceCid });
               logActivity(`[${tag}] userServiceCid tersimpan ✓`, COLOR.green);
             } else {
-              logActivity(`[${tag}] recoverParty: party tidak ditemukan on-chain`, COLOR.red);
+              logActivity(`[${tag}] UserService belum ada on-chain (akun belum onboarding?)`, COLOR.red);
             }
           } catch (e) {
-            logActivity(`[${tag}] recoverParty gagal: ${(e && e.message) || e}`, COLOR.red);
+            logActivity(`[${tag}] discovery userServiceCid gagal: ${(e && e.message) || e}`, COLOR.red);
           }
         }
-        // AUTO-DISCOVER next-action IDs (Silvana redeploy ~harian re-hash semua ID).
-        // Self-heal: validate murah → scan+remap fingerprint kalau stale. Juga
-        // dipanggil ulang tiap iterasi loop swap (lihat di bawah) buat tangkap
-        // redeploy MID-RUN (404 reset actionIdsVerified → re-discover otomatis).
-        await ensureActionIds(sv, partyId, tag);
-
+        if (!userServiceCid) {
+          state.status = 'skip';
+          state.message = 'UserService belum ada; selesaikan onboarding';
+          logActivity(`[${tag}] skip: userServiceCid belum ada; selesaikan onboarding di browser`, COLOR.yellow);
+          render(global.__states);
+          continue;
+        }
         await refreshBalances(state, identityToken, proxy); render(global.__states);
 
         // Auto-cleanup sampah proposal nyangkut (0 dana kelock) dari sesi/feecheck
@@ -2170,7 +2029,7 @@ async function runDayTraderSession(reason) {
         let stuck = 0;
         let lowFeeStreak = 0;
         let done = 0;
-        while (done < need) {
+        swapLoop: while (done < need) {
           // Refresh token Privy/Silvana kalau mendekati expired (session bisa berjam-jam)
           try {
             const fresh = await ensureFreshClients(state, clients);
@@ -2184,12 +2043,18 @@ async function runDayTraderSession(reason) {
             logActivity(`[${tag}] refresh token gagal: ${(e && e.message) || e}`, COLOR.yellow);
           }
 
-          // Self-heal MID-RUN: kalau redeploy bikin ID 404 di tengah loop,
-          // swapAction set actionIdsVerified=false → re-discover SEBELUM swap
-          // berikut (token udah di-refresh di atas → cookie fresh buat discovery).
-          await ensureActionIds(sv, partyId, tag);
-
-          const chk = await fetchDayTrader(sv, partyId).catch(() => null);
+          let chk = await fetchDayTrader(sv, partyId).catch(async (e) => {
+            // 401: token mati → re-login (force) lalu coba lagi (jangan ditelan diam)
+            if (e && e.unauthorized) {
+              try {
+                clients = await ensureFreshClients(state, clients, { force: true });
+                ({ sv, partyId, identityToken, proxy } = clients);
+                logActivity(`[${tag}] token mati saat cek DAY_TRADER → re-login`, COLOR.yellow);
+                return await fetchDayTrader(sv, partyId).catch(() => null);
+              } catch (_) { return null; }
+            }
+            return null;
+          });
           if (chk) {
             state.dayTrader = { count: chk.current, target: chk.target }; render(global.__states);
             const chkApiHit = chk.completed || chk.current >= chk.target;
@@ -2200,7 +2065,7 @@ async function runDayTraderSession(reason) {
           // Pre-check: kalau ada settlement yang lagi in-progress (counterparty
           // belum allocate), tunggu dulu sebelum buka posisi baru. Hindari
           // lock balance ganda + race condition di ledger.
-          const activeWaitMaxSec = Math.max(60, Number(SWAP.activeSettlementWaitSec) || 240);
+          const activeWaitMaxSec = Math.max(30, Number(SWAP.activeSettlementWaitSec) || 45);
           const activeStartMs = Date.now();
           while (Date.now() - activeStartMs < activeWaitMaxSec * 1000) {
             const active = await fetchActiveSettlements(sv, partyId).catch(() => []);
@@ -2313,6 +2178,8 @@ async function runDayTraderSession(reason) {
           // Caller (di bawah) yg increment berdasar delta API count beneran.
           // Return realDt biar caller bisa cek apakah swap settle on-chain.
           const handleSuccess = async (label) => {
+            // Refresh token sebelum tunggu sync panjang biar tak mati di tengah.
+            try { const fr = await ensureFreshClients(state, clients); if (fr !== clients) { clients = fr; ({ sv, partyId, identityToken, proxy } = clients); } } catch (_) { }
             const baseCount = (state.dayTrader && Number(state.dayTrader.count)) || 0;
             if (state.dayTrader) {
               state.dayTrader = {
@@ -2325,7 +2192,7 @@ async function runDayTraderSession(reason) {
 
             // Poll DAY_TRADER bertahap: 15s, 20s, lalu 30s (3x). Berhenti begitu
             // count naik on-chain (settle bisa telat). Total tunggu max 125s.
-            const SYNC_WAITS = [15000, 20000, 30000, 30000, 30000];
+            const SYNC_WAITS = [10000, 15000, 25000, 30000];
             let realDt = null;
             for (let r = 0; r < SYNC_WAITS.length; r++) {
               const w = SYNC_WAITS[r];
@@ -2385,6 +2252,20 @@ async function runDayTraderSession(reason) {
                   await sleep(TRANSIENT_RETRY_DELAY_MS);
                   continue;
                 }
+                // IP proxy kena geoblock (negara non-Indonesia dari pool ProxyScrape
+                // yg best-effort). Rotate ke session proxy lain (kemungkinan ID) & retry.
+                if (e && e.geoblocked && PROXIES.length > 1 && attempt < TRANSIENT_MAX_RETRY) {
+                  const np = rotateProxy(a.email);
+                  logActivity(`[${tag}] IP kena geoblock → rotate proxy ke ${np ? np.host + ':' + np.port : '-'} (coba ${attempt}/${TRANSIENT_MAX_RETRY - 1})`, COLOR.yellow);
+                  try {
+                    clients = await buildSwapClients(state);
+                    ({ sv, partyId, identityToken, proxy } = clients);
+                  } catch (re) {
+                    logActivity(`[${tag}] rebuild clients gagal: ${(re && re.message) || re}`, COLOR.red);
+                  }
+                  await sleep(1500);
+                  continue;
+                }
                 if (isProxyErr(e) && PROXIES.length > 1 && attempt < TRANSIENT_MAX_RETRY) {
                   const np = rotateProxy(a.email);
                   logActivity(`[${tag}] proxy error → rotate ke ${np ? np.host + ':' + np.port : '-'} (retry ${attempt}/${TRANSIENT_MAX_RETRY - 1})`, COLOR.yellow);
@@ -2433,8 +2314,10 @@ async function runDayTraderSession(reason) {
                   // & unlock balance), baru lanjut swap.
                   const baseline = startApi + done;
                   const pollS = Math.max(60, Number(SWAP.stuckPollSec) || 300);
-                  logActivity(`[${tag}] ${MAX_STUCK} swap nyangkut. STOP swap, tunggu settle. Poll DAY_TRADER tiap ${Math.round(pollS / 60)} mnt sampai naik (balance gak ke-lock semua)`, COLOR.yellow);
-                  for (; ;) {
+                  const maxRounds = Math.max(1, Number(SWAP.maxStuckPollRounds) || 3);
+                  logActivity(`[${tag}] ${MAX_STUCK} swap nyangkut. STOP swap, tunggu settle. Poll tiap ${Math.round(pollS / 60)} mnt (maks ${maxRounds}x)`, COLOR.yellow);
+                  let settled = false;
+                  for (let round = 1; round <= maxRounds; round++) {
                     await sleep(pollS * 1000);
                     try {
                       const fr = await ensureFreshClients(state, clients);
@@ -2446,15 +2329,21 @@ async function runDayTraderSession(reason) {
                     render(global.__states);
                     if (wdt && (wdt.completed || wdt.current >= wdt.target) && !SWAP.allowOvercap) {
                       logActivity(`[${tag}] DAY_TRADER ${wdt.current}/${wdt.target} kebaca pas nunggu settle`, COLOR.green);
-                      done = need; break;
+                      done = need; settled = true; break;
                     }
                     if (wdt && wdt.current > baseline) {
                       done = Math.max(done, wdt.current - startApi);
-                      stuck = 0;
+                      stuck = 0; settled = true;
                       logActivity(`[${tag}] settle kebaca (DAY_TRADER ${wdt.current}/${wdt.target}) — lanjut swap`, COLOR.green);
                       break;
                     }
-                    logActivity(`[${tag}] belum settle (DAY_TRADER ${(wdt && wdt.current) ?? '?'}/${(wdt && wdt.target) ?? '?'}) — tunggu ${Math.round(pollS / 60)} mnt lagi…`, COLOR.gray);
+                    logActivity(`[${tag}] belum settle (DAY_TRADER ${(wdt && wdt.current) ?? '?'}/${(wdt && wdt.target) ?? '?'}) — tunggu ${Math.round(pollS / 60)} mnt lagi (${round}/${maxRounds})…`, COLOR.gray);
+                  }
+                  // Tidak naik setelah maxRounds → JANGAN nunggu selamanya. Lewati akun
+                  // ini (tetap tak submit swap baru = balance aman), lanjut akun berikut.
+                  if (!settled) {
+                    logActivity(`[${tag}] settle tak naik setelah ${maxRounds}x poll — lewati akun ini, lanjut berikutnya`, COLOR.red);
+                    break swapLoop;
                   }
                 }
               }
@@ -2850,6 +2739,7 @@ Usage:
   node index.js swap      jalankan SATU sesi DAY_TRADER lalu exit
   node index.js feecheck [sell|buy] [amt]  cek fee live tanpa swap (dry-run, 0 CC, auto-cleanup)
   node index.js proposals  list settlement aktif (read-only) — cek proposal nyangkut
+  node index.js discover   refresh & cetak server-action ID dari frontend (fix "Server action not found")
   node index.js cleanup    reject semua proposal nyangkut yg 0 dana kelock (sampah)
   node index.js register  cetak script utk daftarkan passkey baru via Console, lalu paste hasil
   node index.js paste     tempel JSON passkey hasil register → simpan ke session.json
@@ -2910,6 +2800,24 @@ Usage:
     // `node index.js swap [sell|buy]` — arg kedua paksa arah (test SELL).
     if (argv[1] === 'sell' || argv[1] === 'buy') global.__forceDir = argv[1];
     (async () => { global.__states = makeStates(); render(global.__states); await runDayTraderSession('manual'); process.exit(0); })().catch(e => { console.error(paint('FATAL: ' + e.message, COLOR.red)); process.exit(1); });
+  } else if (argv[0] === 'discover') {
+    // `node index.js discover` — paksa auto-discovery server-action ID dari bundle
+    // frontend Silvana & cetak mapping live. Berguna cek manual setelah redeploy
+    // ("Server action not found"). Read-only, tidak menyentuh dana.
+    (async () => {
+      const a = ACCOUNTS[0] || {};
+      const before = { ...SWAP.actionIds };
+      const res = await refreshSwapActionIds({ proxy: getProxy(a.email), force: true, log: (m, c) => process.stdout.write(paint(m, c || COLOR.gray) + '\n') });
+      process.stdout.write(paint('\n=== SWAP.actionIds (live) ===\n', COLOR.bold + COLOR.cyan));
+      for (const [k, v] of Object.entries(SWAP.actionIds)) {
+        const changed = before[k] !== v;
+        const fn = SWAP_ACTION_NAMES[k] ? ` (${SWAP_ACTION_NAMES[k]})` : ' (tanpa mapping live — fallback)';
+        process.stdout.write(`  ${k}${fn}: ${v}${changed ? paint('  <- updated', COLOR.green) : ''}\n`);
+      }
+      if (res) process.stdout.write(paint(`\nbundle server-actions: ${res.total}, key berubah: ${res.updated.length}${res.missing.length ? ', tak ditemukan: ' + res.missing.join(', ') : ''}\n`, COLOR.gray));
+      else process.stdout.write(paint('\ndiscovery gagal/diskip — pakai fallback hardcoded\n', COLOR.yellow));
+      process.exit(0);
+    })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
   } else if (argv[0] === 'proposals') {
     // `node index.js proposals` — list settlement/DvpProposal aktif (read-only).
     // Buat ngecek apakah feecheck/skip-spike ninggalin proposal nyangkut.
@@ -2956,11 +2864,12 @@ Usage:
       if (!a) { console.error(paint('accounts.json kosong', COLOR.red)); process.exit(1); }
       const state = makeStates()[0];
       process.stdout.write(paint(`feecheck (dry-run): ${dir} ${amt} CC — ${a.label || a.email}\n`, COLOR.cyan));
+      await refreshSwapActionIds({ proxy: getProxy(a.email), log: (m) => process.stdout.write('  ' + m + '\n') });
       const clients = await buildSwapClients(state);
       let userServiceCid = getUserServiceCid(a.email);
       if (!userServiceCid) {
-        const party = await clients.sv.recoverParty(clients.partyId).catch(() => null);
-        if (party && party.userServiceCid) { userServiceCid = party.userServiceCid; patchAcctSession(a.email, { userServiceCid }); }
+        userServiceCid = await discoverUserServiceCid(clients.canton, clients.partyId).catch(() => null);
+        if (userServiceCid) patchAcctSession(a.email, { userServiceCid });
       }
       try {
         await swapOnce({ ...clients, userServiceCid, dryRun: true, log: (m) => process.stdout.write('  ' + m + '\n') }, dir, amt);
@@ -2982,6 +2891,9 @@ Usage:
       if (n) process.stdout.write(paint(`  ${n} proposal nyangkut dibersihin\n`, COLOR.green));
       process.exit(0);
     })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
+  } else if (argv[0] === 'run') {
+    if (!ACCOUNTS.length) { console.error(paint('accounts.json kosong. Jalankan: node index.js register', COLOR.red)); process.exit(1); }
+    runMain().catch(e => { console.error(paint('FATAL: ' + (e && e.stack || e), COLOR.red)); process.exit(1); });
   } else if (argv.length === 0) {
     if (!ACCOUNTS.length) { console.error(paint('accounts.json kosong. Jalankan: node index.js register', COLOR.red)); process.exit(1); }
     (async () => {
