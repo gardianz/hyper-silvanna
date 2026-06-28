@@ -52,7 +52,11 @@ function saveJSON(p, obj) { fs.writeFileSync(p, JSON.stringify(obj, null, 2)); }
 const ACTIONIDS_PATH = path.join(__dirname, 'action_ids.json');
 function loadActionIds() {
   const d = loadJSON(ACTIONIDS_PATH, null);
-  if (d && d.ids && typeof d.ids === 'object') { Object.assign(SWAP.actionIds, d.ids); return d; }
+  if (d && d.ids && typeof d.ids === 'object') {
+    // cuma load key yg dikenal (cegah dead key garbage dari file lama nempel)
+    for (const k of Object.keys(SWAP.actionIds)) if (d.ids[k]) SWAP.actionIds[k] = d.ids[k];
+    return d;
+  }
   return null;
 }
 function saveActionIds() {
@@ -99,7 +103,21 @@ const RP_ID = 'silvana.one';
 // Parameter swap (next-action & template ID = publik, dari frontend Silvana.
 // Kalau swap mendadak gagal setelah Silvana redeploy frontend, update di sini).
 const SWAP = {
+  // === PAIR (di-set runtime via setActivePair; default usdcx) ===
+  // market         : symbol RFQ/quote (CC-USDCx | cETH-CC).
+  // tokenId        : id instrument token non-CC (match balance, uppercase).
+  // tokenAdmin     : party admin registry token (fallback; admin asli diambil dari dvp terms).
+  // baseIsCC       : true kalau base market = CC (RFQ quantity = CC). cETH base=cETH → false.
+  // dirOpen/dirClose: arah market utk CC→token (open) & token→CC (close). Beda orientasi:
+  //   CC-USDCx (base CC): open=sell, close=buy.  cETH-CC (base cETH): open=buy, close=sell.
   market: 'CC-USDCx',
+  tokenId: 'USDCX',
+  tokenLabel: 'USDCx',
+  tokenAdmin: 'decentralized-usdc-interchain-rep::12208115f1e168dd7e792320be9c4ca720c751a02a3053c7606e1c1cd3dad9bf60ef',
+  baseIsCC: true,
+  dirOpen: 'sell',
+  dirClose: 'buy',
+  pairKey: 'usdcx',
   dsoPartyId: 'DSO::1220b1431ef217342db44d516bb9befde802be7d8899637d290895fa58880f19accc',
   usdcxAdmin: 'decentralized-usdc-interchain-rep::12208115f1e168dd7e792320be9c4ca720c751a02a3053c7606e1c1cd3dad9bf60ef',
   synchronizerId: 'global-domain::1220b1431ef217342db44d516bb9befde802be7d8899637d290895fa58880f19accc',
@@ -145,31 +163,27 @@ const SWAP = {
   dailySwapCount: Math.max(1, Number((CONFIG.swap || {}).dailySwapCount) || 10),
   privyAppId: PRIVY_APP_ID, privyClientId: PRIVY_CLIENT_ID,
   actionIds: {
-    // Updated 2026-06-26 — dari jual_cc/9.har (deploy terbaru, flow SELL lengkap).
-    // FALLBACK: di-refresh otomatis tiap sesi via discoverActionIds() (fingerprint
-    // by nama RPC). execSettle gone (settlement via Canton prepare→submit_prepared).
-    // listProposals BUKAN server action lagi di flow baru (frontend pakai
-    //   pollProposal by settlementId + REST /api/parties) → id di bawah stale,
-    //   cuma dipakai validate/cleanup; swap core gak butuh.
+    // FALLBACK saja — di-refresh tiap sesi via discoverActionIds() (parse bundle
+    // by NAMA FUNGSI, lihat ACTION_NAME). execSettle gone (Canton prepare→submit).
+    // listProposals + getConsumedHoldings DIHAPUS: gak dipakai swap core
+    //   (listProposals → REST /api/settlement-proposals; getConsumedHoldings unused).
     estimateFee: '4074ab0f8f8520c7db51cdc9553113534d890eb95e',
     acceptQuote: '40a1adcd089f85984250205b5ea4e17f06a40dbeba',
     recordEvent: '40e87910772c03d8a7421cfb88978ac8f2cd4c456b',
-    listProposals: '40fee850f4e3e17be2ff8dfb9b01f0639837563cc4', // stale (REST /api/settlement-proposals)
     pollProposal: '40394b3565003b5772b75a4d82bdd88f26fe3af6a0',
     getMultiCall: '402effcb926d81e596e8d19b4f5a645a5b604a03ed',
     prepareDvpFee: '406963e108efd714c3b12143bae33345c88035c129',
-    getConsumedHoldings: '40653a042ecc26c605198e6a00ca92456ce71ae6f6',
     prepareTransfer: '40163cbb1aa5dc6248b427f0f118e2d90fea196a3d',
-    // getAllocFactory = action AllocationFactory_Allocate (0x60, "choiceArguments"),
-    // dipakai BUY buat factory USDCx. BUKAN 402e8596 (itu alloc SELL ["supa"]).
-    getAllocFactory: '603aef8e2cc8143c6fee9ae86138625a65ec2acecf',
-    // cancelSettlement: action di page /terminal (BUKAN /swap). Dari settlement/*.har.
-    // Auto-fetch via ensureCancelId (scan bundle /terminal, fingerprint nama RPC).
-    cancelSettlement: '40dbccf8bf64af39e38601b55e89f775629e1bbd4d',
+    // FALLBACK saja — semua di-refresh via discoverActionIds (parse bundle by
+    // NAMA FUNGSI). getAllocFactory=getAllocationFactory, cancelSettlement=
+    // cancelSettlementAction (lewat /swap, bukan /terminal).
+    getAllocFactory: '603f6b19e6cca00e786c9be09a1042e21308027cd1',
+    cancelSettlement: '403c0a394eb2f07997e27fc2d2b981533c564272e8',
   },
   // Package ID untuk Splice.Api.Token.AllocationInstructionV1 — dipakai
   // saat membangun ExerciseCommand AllocationFactory_Allocate.
   allocationInstructionPackageId: '275064aacfe99cea72ee0c80563936129563776f67415ef9f13e4297eecbc520',
+  // catatan: actionIds (di bawah) + templateIds SHARED antar pair (sama persis).
   templateIds: {
     dvpProposal: '#utility-settlement-app-v1:Utility.Settlement.App.V1.Model.Dvp:DvpProposal',
     amulet: '#splice-amulet:Splice.Amulet:Amulet',
@@ -177,6 +191,33 @@ const SWAP = {
     instrumentConfiguration: '#utility-registry-v0:Utility.Registry.V0.Configuration.Instrument:InstrumentConfiguration',
   },
 };
+
+// Definisi pair yg didukung. Nilai token-specific dari HAR (folder jual_cc =
+// USDCx, cc-eth = cETH). Logic swap SAMA; cuma orientasi base/quote beda:
+//   CC-USDCx : base=CC  → CC→USDCx = 'sell', USDCx→CC = 'buy'  (RFQ qty = CC).
+//   cETH-CC  : base=cETH → CC→cETH = 'buy',  cETH→CC = 'sell'  (RFQ qty = cETH).
+// price (bid/ask) di KEDUA market = "jumlah token per 1 CC" (invariant) → buyCap
+// & konversi qty seragam. admin token asli tetap diambil dari dvp terms saat swap.
+const PAIRS = {
+  usdcx: {
+    pairKey: 'usdcx', market: 'CC-USDCx', tokenId: 'USDCX', tokenLabel: 'USDCx',
+    tokenAdmin: 'decentralized-usdc-interchain-rep::12208115f1e168dd7e792320be9c4ca720c751a02a3053c7606e1c1cd3dad9bf60ef',
+    baseIsCC: true, dirOpen: 'sell', dirClose: 'buy',
+  },
+  ceth: {
+    pairKey: 'ceth', market: 'cETH-CC', tokenId: 'CETH', tokenLabel: 'cETH',
+    tokenAdmin: 'cethMain-1::12200350ba6e96e3b701c3048b5aa013a8c1c08833e8ebf54339cff581055c29003a',
+    baseIsCC: false, dirOpen: 'buy', dirClose: 'sell',
+  },
+};
+// Set pair aktif (mutate SWAP). Dipanggil dari menu / CLI sebelum sesi swap.
+function setActivePair(key) {
+  const p = PAIRS[key] || PAIRS.usdcx;
+  SWAP.pairKey = p.pairKey; SWAP.market = p.market; SWAP.tokenId = p.tokenId;
+  SWAP.tokenLabel = p.tokenLabel; SWAP.tokenAdmin = p.tokenAdmin;
+  SWAP.baseIsCC = p.baseIsCC; SWAP.dirOpen = p.dirOpen; SWAP.dirClose = p.dirClose;
+  return p;
+}
 
 // ---- UI constants ----
 const MIN_ACTIVITY_LINES = 4;
@@ -803,9 +844,22 @@ function buildMultiCallAccept(p) {
 //  Silvana app client (passkey login, earn-hub, server actions, RFQ)
 // ============================================================================
 const SWAP_STATE_TREE = encodeURIComponent(JSON.stringify(['', { children: ['(app)', { children: ['swap', { children: ['__PAGE__', {}, null, null] }, null, null] }, null, null] }, null, null, true]));
-// /terminal page state tree (buat cancelSettlement — action-nya ada di /terminal,
-// BUKAN /swap). Persis dari settlement/*.har.
-const TERMINAL_STATE_TREE = encodeURIComponent(JSON.stringify(['', { children: ['terminal', { children: ['__PAGE__', {}, null, null, false] }, null, null, false] }, null, null, true]));
+// Map: bot key → NAMA FUNGSI server-action di bundle Silvana. Nama STABIL antar-
+// redeploy (cuma hash id-nya ganti). discoverActionIds parse bundle
+// createServerReference("<id>",…,"<nama>") → resolve id by nama ini. Definitif,
+// gak perlu probe. listProposals = getSettlementProposals (udah hilang dari /swap
+// bundle → pakai REST). getConsumedHoldings tak dipakai swapOnce.
+const ACTION_NAME = {
+  estimateFee: 'estimateSettlementFees',
+  acceptQuote: 'acceptQuote',
+  recordEvent: 'recordSettlementEventAction',
+  pollProposal: 'getSettlementStatus',
+  getMultiCall: 'getMulticallConfigAction',
+  prepareDvpFee: 'buildFeeTransferDataAction',
+  prepareTransfer: 'getTransferFactoryContextAction',
+  getAllocFactory: 'getAllocationFactory',
+  cancelSettlement: 'cancelSettlementAction',
+};
 // recoverParty (party + userServiceCid) skrg lewat REST GET /api/parties/{id},
 // bukan server action /connect lagi (lihat SilvanaClient.recoverParty).
 
@@ -876,7 +930,7 @@ class SilvanaClient {
       actionIdsVerified = false;
       const name = Object.keys(SWAP.actionIds).find(n => SWAP.actionIds[n] === actionId);
       logDebug(`swapAction 404 → self-heal discover (action=${name || '?'} id=${actionId.slice(0, 10)})`, '');
-      const healed = await this._selfHeal(name, actionId, args).catch(() => null);
+      const healed = await this._selfHeal(name).catch(() => null);
       if (healed && healed !== actionId) {
         return this.swapAction(healed, args, { timeoutMs, _healed: true });
       }
@@ -889,45 +943,16 @@ class SilvanaClient {
     }
     return actionResult(r.text || '');
   }
-  // Cari id BARU utk action yg 404. 2 jalur:
-  //  1) discoverActionIds (named actions by RPC error) — throttled 15s.
-  //  2) kalau masih belum ketemu (blob action: prepareDvpFee/prepareTransfer/
-  //     getAllocFactory), PROBE pakai `args` ASLI yg barusan gagal (proposalId
-  //     real ada di situ) → cari yg balik blob/factory. Ini reliable buat blob
-  //     action yg gak bisa di-fingerprint cuma dari [partyId].
-  async _selfHeal(name, oldId, args) {
+  // Cari id BARU utk action yg 404: re-discover dari bundle (by nama fungsi —
+  // reliable, nemu SEMUA termasuk prepareDvpFee). Throttle 15s. Balikin id baru
+  // utk `name`.
+  async _selfHeal(name) {
     if (Date.now() - lastDiscoverMs >= 15000) {
       lastDiscoverMs = Date.now();
-      const res = await this.discoverActionIds(this.partyId).catch(() => null);
-      if (res && res.changed && res.changed.length) saveActionIds();
+      const res = await this.discoverActionIds().catch(() => null);
+      if (res && res.changed && res.changed.length) { saveActionIds(); logActivity(`auto-fetch: ${res.changed.length} ID di-refresh (self-heal)`, COLOR.green); }
     }
-    let nid = name ? SWAP.actionIds[name] : null;
-    if (nid && nid !== oldId) return nid;                        // jalur-1 ketemu
-    // jalur-2: probe pakai args asli + DUMP semua respons ke swap-debug.log
-    if (Array.isArray(args) && args.length) {
-      const ids = await this._scanSwapBundleIds().catch(() => []);
-      const skip = new Set(Object.values(SWAP.actionIds).filter(x => x !== oldId));
-      const cand = ids.filter(id => !skip.has(id));
-      const probes = await mapLimit(cand, 6, id => this._probeAction(id, args).then(r => ({ id, r })));
-      const dump = [];
-      let found = null;
-      for (const p of probes) {
-        if (!p || !p.r) continue;
-        const r = p.r;
-        const isM = SilvanaClient._isBlob(r) || SilvanaClient._isAllocFactory(r);
-        const line1 = (r.val != null ? JSON.stringify(r.val) : ((r.text || '').split('\n').find(l => l.startsWith('1:')) || (r.text || '').slice(0, 60)));
-        dump.push(`${p.id} st=${r.status} blob=${SilvanaClient._isBlob(r)} ${String(line1).replace(/\s+/g, ' ').slice(0, 120)}`);
-        if (isM && !found) found = p.id;
-      }
-      logDebug(`self-heal by-args ${name || '?'} (scanned ${ids.length}, cand ${cand.length}, found ${found || 'NONE'})`, dump.join('\n'));
-      if (found && found !== oldId) {
-        if (name) SWAP.actionIds[name] = found;
-        saveActionIds();
-        logActivity(`auto-fetch: ${name || 'action'} ID baru ${found.slice(0, 10)}… (self-heal)`, COLOR.green);
-        return found;
-      }
-    }
-    return nid;
+    return name ? SWAP.actionIds[name] : null;
   }
 
   /**
@@ -948,34 +973,6 @@ class SilvanaClient {
       if (line1) { try { val = JSON.parse(line1.slice(2)); } catch (_) { } }
       return { status: r.status, text, val };
     } catch (_) { return { status: 0, text: '', val: null }; }
-  }
-
-  // Server action di page /terminal (mis. cancelSettlement) — beda dari /swap.
-  // Cookie-only (HAR gak kirim Authorization). Return {status, val}.
-  async terminalAction(actionId, args, timeoutMs = 12000) {
-    const r = await request('POST', `${APP_BASE}/terminal`, this._opts({
-      timeoutMs,
-      headers: this._hdr({ 'Accept': 'text/x-component', 'Content-Type': 'text/plain;charset=UTF-8', 'Referer': APP_BASE + '/terminal', 'next-action': actionId, 'next-router-state-tree': TERMINAL_STATE_TREE }),
-      body: JSON.stringify(args || []),
-    }));
-    const text = r.text || '';
-    const line1 = text.split('\n').find(l => l.startsWith('1:'));
-    let val = null; if (line1) { try { val = JSON.parse(line1.slice(2)); } catch (_) { } }
-    return { status: r.status, text, val };
-  }
-  // Scan bundle JS /terminal → kandidat next-action ID (buat discover cancelSettlement).
-  async _scanTerminalBundleIds() {
-    const page = await request('GET', `${APP_BASE}/terminal`, this._opts({ headers: this._hdr({ 'Accept': 'text/html,*/*;q=0.8', 'Referer': APP_BASE + '/' }) }));
-    const html = page.text || '';
-    const chunkUrls = new Set(); let m;
-    const reChunk = /\/_next\/static\/chunks\/[^"' \n\r]+\.js/g;
-    while ((m = reChunk.exec(html)) !== null) chunkUrls.add(m[0]);
-    const bm = html.match(/"buildId"\s*:\s*"([^"]+)"/);
-    if (bm) { try { const b = await request('GET', `${APP_BASE}/_next/static/${bm[1]}/_buildManifest.js`, this._opts({ timeoutMs: 8000 })); for (const cc of ((b.text || '').match(/static\/chunks\/[^"'\\]+\.js/g) || [])) chunkUrls.add('/_next/' + cc); } catch (_) { } }
-    const ids = [], seen = new Set();
-    const texts = await mapLimit([...chunkUrls], 8, url => request('GET', `${APP_BASE}${url}`, this._opts({ headers: this._hdr({ 'Referer': APP_BASE + '/terminal' }), timeoutMs: 12000 })).then(r => r.status === 200 ? (r.text || '') : '').catch(() => ''));
-    for (const t of texts) { const re = /["']([46][0-9a-f]{41})["']/g; while ((m = re.exec(t)) !== null) { if (!seen.has(m[1])) { seen.add(m[1]); ids.push(m[1]); } } }
-    return ids;
   }
 
   /**
@@ -1058,96 +1055,35 @@ class SilvanaClient {
   // getAllocFactory balik {success, factory:{factoryId, choiceContext}}.
   static _isAllocFactory(r) { return !!(r.val && r.val.factory && r.val.factory.factoryId); }
 
-  async discoverActionIds(partyId, dvpProbeBody) {
-    const ids = await this._scanSwapBundleIds();
-    const out = {};
-    if (!ids.length || !partyId) return { ok: false, changed: [], found: [], missing: Object.keys(SWAP.actionIds), missingCritical: ['estimateFee'] };
+  async discoverActionIds() {
+    // Parse bundle JS: createServerReference)("<id>", x.callServer, void 0,
+    // x.findSourceMapURL, "<functionName>") → map NAMA FUNGSI (stabil antar-
+    // redeploy) ke action id. Cara yg BENAR — bundle expose id↔nama langsung.
+    // GAK perlu probe / proposal / blob / auth. Tiap redeploy nama tetap, hash
+    // ganti → regex nemu hash baru. (Metode dari bot temen, terbukti 20 SA.)
+    const page = await request('GET', `${APP_BASE}/swap`, this._opts({ headers: this._hdr({ 'Accept': 'text/html,*/*;q=0.8', 'Referer': APP_BASE + '/' }) }));
+    const html = page.text || '';
+    const chunkUrls = new Set();
+    let m;
+    const reChunk = /\/_next\/static\/chunks\/[a-f0-9]+\.js/g;
+    while ((m = reChunk.exec(html)) !== null) chunkUrls.add(m[0]);
+    const bm = html.match(/"buildId"\s*:\s*"([^"]+)"/);
+    if (bm) { try { const b = await request('GET', `${APP_BASE}/_next/static/${bm[1]}/_buildManifest.js`, this._opts({ timeoutMs: 8000 })); for (const cc of ((b.text || '').match(/static\/chunks\/[a-f0-9]+\.js/g) || [])) chunkUrls.add('/_next/' + cc); } catch (_) { } }
+    const texts = await mapLimit([...chunkUrls], 8, url => request('GET', `${APP_BASE}${url}`, this._opts({ headers: this._hdr({ 'Referer': APP_BASE + '/swap' }), timeoutMs: 12000 })).then(r => r.status === 200 ? (r.text || '') : '').catch(() => ''));
+    const name2id = {};
+    const reSA = /createServerReference\)\("([0-9a-f]{42})",\s*\w+\.callServer,\s*void\s*0,\s*\w+\.findSourceMapURL,\s*"([a-zA-Z]+)"/g;
+    for (const t of texts) { let mm; while ((mm = reSA.exec(t)) !== null) name2id[mm[2]] = mm[1]; }
 
-    // 3. Pass-1: probe [partyId], fingerprint by nama RPC di error / shape sukses.
-    //    CATATAN: prepareDvpFee & prepareTransfer TIDAK di-fingerprint di sini —
-    //    keduanya balik blob factory ("2:T…CgMyL") yg butuh body khusus; di
-    //    pass-2. JANGAN pakai error "getDisclosedContracts" buat prepareTransfer:
-    //    itu helper standalone yg butuh Canton Bearer (BUKAN prepareTransfer).
-    //    Kandidat blob = yg balik null / E-digest / 500 ke probe [partyId].
-    const blobCands = [];
-    const probeLog = []; // dump ke swap-debug.log kalau discovery gak lengkap
-    // Probe semua id PARALEL (6 sekaligus), lalu assign berurutan (jaga first-match).
-    const probes = await mapLimit(ids, 6, id => this._probeAction(id, [partyId]).then(r => ({ id, ...r })));
-    for (const p of probes) {
-      if (!p) continue;
-      const { id, status, text, val } = p;
-      const _line1 = (val !== null ? JSON.stringify(val) : ((text || '').split('\n').find(l => l.startsWith('1:')) || (text || '').split('\n')[0] || ''));
-      probeLog.push(`${id} ${status} ${String(_line1).replace(/\s+/g, ' ').slice(0, 160)}`);
-      if (status === 0) continue;
-      const err = (val && (val.error || val.message)) || '';
-      // listProposals: array di key proposals/settlements/settlementProposals
-      // (Silvana kadang rename), ATAU error nyebut getSettlementProposals (nama
-      // RPC stabil — kematch walau cookie expired). Tahan rename antar-redeploy.
-      const propArr = val && (val.proposals || val.settlements || val.settlementProposals);
-      if (Array.isArray(propArr) || /getSettlementProposals/.test(err)) out.listProposals = out.listProposals || id;
-      else if (/estimateSettlementFees/.test(err)) out.estimateFee = id;
-      else if (/\bacceptQuote\b/.test(err)) out.acceptQuote = id;
-      else if (/Unknown event type/.test(err)) out.recordEvent = id;
-      else if (/getSettlementStatus/.test(err)) out.pollProposal = id;
-      else if (/cancelSettlement/.test(err)) out.cancelSettlement = id;
-      else if (/choiceArguments/.test(err) || /DownField\(choiceArguments\)/.test(text)) out.getAllocFactory = id;
-      else if (val && typeof val.contractId === 'string' && val.success === undefined) out.getMultiCall = id;
-      else if (val && Array.isArray(val.consumedAmuletCids)) out.getConsumedHoldings = id;
-      else if (val === null || /^1:E\{/m.test(text) || status === 500) blobCands.push(id); // prepare*-family
-    }
-
-    // 4. Pass-2: prepareDvpFee & prepareTransfer dibedakan dari blobCands lewat
-    //    BENTUK BODY masing-masing — tiap action cuma balik blob ("CgMyL") buat
-    //    body yg sesuai. Body transfer tak butuh proposal; body dvpFee butuh
-    //    proposalId asli → ambil dari REST /api/settlement-proposals (listProposals
-    //    server action udah mati). Pakai proposal apa aja (stuck/lama OK).
-    const isBlob = (t) => /CgMyL/.test(t) || /^2:T/m.test(t);
-    if (blobCands.length) {
-      const _now = new Date();
-      const transferBody = [{ sender: partyId, receiver: partyId, amount: '1', instrumentId: { admin: SWAP.dsoPartyId, id: 'Amulet' }, inputHoldingCids: [], requestedAt: _now.toISOString(), executeBefore: new Date(_now.getTime() + 86400000).toISOString() }];
-      // dvpBody: prioritas dari caller (dibangun dari Canton: proposal+amulet ASLI
-      // → prepareDvpFee pasti balik blob). Fallback REST settlement-proposals.
-      let dvpBody = (Array.isArray(dvpProbeBody) && dvpProbeBody.length) ? dvpProbeBody : null;
-      if (!dvpBody) {
-        const props = await this.listSettlementProposals().catch(() => []);
-        const mine = props.find(p => p.seller === partyId) || props.find(p => p.buyer === partyId) || props[0];
-        if (mine && mine.proposalId) {
-          const role = mine.seller === partyId ? 'seller' : 'buyer';
-          dvpBody = [{ partyId, feeType: 'dvp_contract', role, proposalId: mine.proposalId, inputHoldingCids: [] }];
-        }
-      }
-      for (const id of blobCands) {
-        if (!out.prepareTransfer) {
-          const rt = await this._probeAction(id, transferBody);
-          if (isBlob(rt.text)) { out.prepareTransfer = id; continue; }
-        }
-        if (!out.prepareDvpFee && dvpBody) {
-          const rd = await this._probeAction(id, dvpBody);
-          if (isBlob(rd.text)) { out.prepareDvpFee = id; continue; }
-        }
-        if (out.prepareTransfer && out.prepareDvpFee) break;
-      }
-    }
-
-    // 5. Terapkan: mutasi SWAP.actionIds in-place, catat yg berubah.
     const changed = [], found = [], missing = [];
-    for (const name of Object.keys(SWAP.actionIds)) {
-      if (out[name]) {
-        found.push(name);
-        if (SWAP.actionIds[name] !== out[name]) { SWAP.actionIds[name] = out[name]; changed.push(name); }
-      } else {
-        missing.push(name);
-      }
+    for (const [key, fn] of Object.entries(ACTION_NAME)) {
+      const id = name2id[fn];
+      if (id) { found.push(key); if (SWAP.actionIds[key] !== id) { SWAP.actionIds[key] = id; changed.push(key); } }
+      else missing.push(key);
     }
-    // Critical = action yg WAJIB ke-fingerprint di session-start.
-    //   - listProposals: BUKAN server action lagi (mati) → keluarin.
-    //   - prepareDvpFee: butuh proposalId asli → di-discover JUST-IN-TIME di
-    //     swapOnce (discoverActionByProbe pakai proposal dari acceptQuote) → keluarin.
-    //   - getConsumedHoldings: tak dipakai. getAllocFactory: cuma BUY.
-    const critical = ['estimateFee', 'acceptQuote', 'recordEvent', 'pollProposal', 'getMultiCall', 'prepareTransfer'];
-    const missingCritical = critical.filter(n => !out[n]);
+    const critical = ['estimateFee', 'acceptQuote', 'recordEvent', 'pollProposal', 'getMultiCall', 'prepareDvpFee', 'prepareTransfer'];
+    const missingCritical = critical.filter(k => !name2id[ACTION_NAME[k]]);
     const ok = missingCritical.length === 0;
-    if (!ok) logDebug(`discoverActionIds INCOMPLETE — missing: ${missingCritical.join(', ')} | found: ${found.join(', ')}`, probeLog.join('\n'));
+    if (!ok) logDebug(`discoverActionIds INCOMPLETE — missing ${missingCritical.join(',')} | bundle SA: ${Object.keys(name2id).join(',')}`, '');
     return { ok, changed, found, missing, missingCritical };
   }
 
@@ -1185,28 +1121,12 @@ class SilvanaClient {
   }
 
   /**
-   * Batalin settlement nyangkut (V2). PENTING: action ini di page /terminal
-   * (cookie-only), BUKAN /swap — itu sebabnya cancel lewat swapAction gagal.
-   * Body persis HAR: {proposalId, partyId, reason} -> {success:true}.
+   * Batalin settlement nyangkut (V2). cancelSettlementAction id dari bundle
+   * (discoverActionIds). Lewat /swap (swapAction, ada self-heal 404). Body:
+   * {proposalId, partyId, reason} -> {success:true}.
    */
   async cancelSettlement(proposalId, partyId, reason = 'Cancelled by user') {
-    const r = await this.terminalAction(SWAP.actionIds.cancelSettlement, [{ proposalId, partyId, reason }]).catch(e => ({ _err: (e && e.message) || String(e) }));
-    return (r && (r.val !== undefined ? r.val : r)) || r;
-  }
-  // Pastikan SWAP.actionIds.cancelSettlement = id /terminal yg current. Probe
-  // [partyId] AMAN (error "cancelSettlement failed", gak beneran cancel). Kalau
-  // stale → scan bundle /terminal, fingerprint by nama RPC. Return true kalau OK.
-  async ensureCancelId(partyId) {
-    const chk = await this.terminalAction(SWAP.actionIds.cancelSettlement, [partyId]).catch(() => ({ status: 0 }));
-    if (chk.status === 200 && /cancelSettlement/.test((chk.val && (chk.val.error || chk.val.message)) || '')) return true;
-    const ids = await this._scanTerminalBundleIds().catch(() => []);
-    for (const id of ids) {
-      const r = await this.terminalAction(id, [partyId]).catch(() => ({ status: 0 }));
-      if (r.status === 200 && /cancelSettlement/.test((r.val && (r.val.error || r.val.message)) || '')) {
-        SWAP.actionIds.cancelSettlement = id; saveActionIds(); return true;
-      }
-    }
-    return false;
+    return this.swapAction(SWAP.actionIds.cancelSettlement, [{ proposalId, partyId, reason }]).catch(e => ({ _err: (e && e.message) || String(e) }));
   }
 
   async rfqStream({ partyId, marketId, direction, quantity }, { timeoutMs } = {}) {
@@ -1313,14 +1233,36 @@ async function privyRefreshSession(refreshToken, accessToken, proxy) {
   return r.json;
 }
 
-// terminal prompt (OTP manual)
+// Serialize OTP prompt secara GLOBAL. Banyak akun bisa butuh OTP barengan
+// (tickAll/keepAlive paralel), tapi stdin cuma satu → readline tabrakan & prompt
+// numpuk. Lock bikin init+prompt OTP antri 1-per-1 di manapun dipanggil.
+let _otpChain = Promise.resolve();
+function withOtpLock(fn) {
+  const result = _otpChain.then(fn, fn);
+  _otpChain = result.then(() => { }, () => { });
+  return result;
+}
+
+// terminal prompt (OTP manual). SATU readline singleton dipakai ulang via
+// rl.question — JANGAN create/close interface tiap prompt. Create/close berulang
+// di process.stdin ninggalin buffer → interface berikut emit 'line' kosong instan
+// → prompt cascade (keliatan parallel). Singleton + mutex = 1 prompt sungguhan.
+let _rl = null;
+function getRL() {
+  if (!_rl) {
+    _rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    _rl.on('close', () => { _rl = null; });
+  }
+  return _rl;
+}
 function prompt(question) {
   return new Promise((resolve) => {
     global.__paused = true;
     if (useColor) process.stdout.write('\x1b[?25h');
-    process.stdout.write('\n\n' + question);
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    rl.on('line', (ans) => { rl.close(); global.__paused = false; resolve((ans || '').trim()); });
+    getRL().question('\n\n' + question, (ans) => {
+      global.__paused = false;
+      resolve((ans || '').trim());
+    });
   });
 }
 
@@ -1338,31 +1280,83 @@ async function ensurePrivyToken(state) {
   const old = acctSession(email).privy;
   if (old && old.refresh_token) {
     const maxRetry = 20, baseDelay = 2000; let lastErr = null;
+    // 401/400 (unauthorized) bisa transient (proxy/Privy hiccup) — retry beberapa
+    // kali sebelum nyerah ke OTP. Cuma 'notRefreshable' (sesi di-clear) yg final.
+    const MAX_UNAUTH = 4; let unauthCount = 0;
+    let curProxy = proxy;
     for (let attempt = 1; attempt <= maxRetry; attempt++) {
       state.status = 'login'; state.message = `refresh privy (${attempt}/${maxRetry})`; render(global.__states);
       try {
-        const fresh = await privyRefreshSession(old.refresh_token, old.privy_access_token, proxy);
+        const fresh = await privyRefreshSession(old.refresh_token, old.privy_access_token, curProxy);
         const sess = putPrivySession(email, { ...fresh, token: fresh.token || old.token, refresh_token: fresh.refresh_token || old.refresh_token });
         state.tokenExpMs = sess.expMs; state.identityExpMs = sess.identityExpMs; state.message = '';
         return sess.token;
       } catch (e) {
         lastErr = e;
-        if (e && (e.unauthorized || e.notRefreshable)) break; // refresh tak guna → OTP
+        if (e && e.notRefreshable) break; // sesi di-clear server → OTP wajib
+        if (e && e.unauthorized) {
+          if (++unauthCount >= MAX_UNAUTH) break; // 401 persisten → refresh mati → OTP
+          curProxy = rotateProxy(email); // IP baru, mungkin 401 gara2 IP
+          state.proxyHost = curProxy ? `${curProxy.host}:${curProxy.port}` : null;
+          state.message = `refresh 401 → retry (${unauthCount}/${MAX_UNAUTH})`; render(global.__states);
+        } else if (isProxyErr(e)) {
+          curProxy = rotateProxy(email); // exit node mati (502/timeout) → ganti IP
+          state.proxyHost = curProxy ? `${curProxy.host}:${curProxy.port}` : null;
+          state.message = `proxy mati → ganti IP`; render(global.__states);
+        }
         if (attempt < maxRetry) { await sleep(Math.min(30_000, baseDelay * Math.min(8, attempt))); }
       }
     }
     if (lastErr) { state.message = `refresh gagal: ${(lastErr.message || '').slice(0, 40)}`; render(global.__states); }
   }
 
-  // OTP manual (IMAP dihapus)
-  state.status = 'login'; state.message = 'kirim OTP'; render(global.__states);
-  await withRetry(() => privyInit(privyEmail, proxy), 'init OTP', { retry: REQ.retry, delayMs: REQ.retryDelayMs });
-  const code = await prompt(`OTP Privy untuk ${privyEmail}: `);
-  if (!/^\d{4,8}$/.test(code)) throw new Error('format OTP tidak valid');
-  const auth = await withRetry(() => privyAuthenticate(privyEmail, code, proxy), 'authenticate', { retry: REQ.retry, delayMs: REQ.retryDelayMs });
-  const sess = putPrivySession(email, auth);
-  state.tokenExpMs = sess.expMs; state.identityExpMs = sess.identityExpMs; state.message = '';
-  return sess.token;
+  // OTP manual (IMAP dihapus) — serialize global biar prompt gak tabrakan paralel.
+  return await withOtpLock(async () => {
+    // Re-cek cache: bisa jadi sesi keisi sementara nunggu giliran lock.
+    const cachedNow = getValidPrivySession(email);
+    if (cachedNow) { state.tokenExpMs = cachedNow.expMs; state.identityExpMs = cachedNow.identityExpMs; return cachedNow.token; }
+    state.status = 'login'; state.message = 'kirim OTP'; render(global.__states);
+    // init OTP: 429 = rate-limit per IP. Rotate proxy (IP baru) & coba lagi.
+    // PENTING: panggil privyInit LANGSUNG (jangan withRetry) — withRetry bungkus
+    // error jadi Error baru & buang flag .rateLimit, bikin rotate gak pernah jalan.
+    let initProxy = proxy;
+    const MAX_ROT = Math.min(PROXIES.length || 1, 8);
+    let transientLeft = REQ.retry || 2;
+    for (let rot = 0; ; rot++) {
+      try {
+        await privyInit(privyEmail, initProxy);
+        break;
+      } catch (e) {
+        if (e && e.rateLimit) {
+          if (rot >= MAX_ROT - 1) throw e; // semua proxy kena limit → nyerah
+          initProxy = rotateProxy(email);
+          state.proxyHost = initProxy ? `${initProxy.host}:${initProxy.port}` : null;
+          state.message = `429 → ganti proxy #${rot + 1}`; render(global.__states);
+          continue;
+        }
+        if (isProxyErr(e)) { // exit node mati → ganti IP (jangan retry proxy sama)
+          if (rot >= MAX_ROT - 1) throw e;
+          initProxy = rotateProxy(email);
+          state.proxyHost = initProxy ? `${initProxy.host}:${initProxy.port}` : null;
+          state.message = `proxy mati → ganti IP #${rot + 1}`; render(global.__states);
+          continue;
+        }
+        // error transient (network non-proxy) → retry proxy sama beberapa kali
+        if (transientLeft-- > 0) { await sleep(REQ.retryDelayMs || 2000); rot--; continue; }
+        throw e;
+      }
+    }
+    let code;
+    for (; ;) {
+      code = await prompt(`OTP Privy untuk ${privyEmail} (4-8 digit): `);
+      if (/^\d{4,8}$/.test(code)) break;
+      process.stdout.write(paint('  format OTP salah, ulangi\n', COLOR.yellow));
+    }
+    const auth = await withRetry(() => privyAuthenticate(privyEmail, code, initProxy), 'authenticate', { retry: REQ.retry, delayMs: REQ.retryDelayMs });
+    const sess = putPrivySession(email, auth);
+    state.tokenExpMs = sess.expMs; state.identityExpMs = sess.identityExpMs; state.message = '';
+    return sess.token;
+  });
 }
 
 // Pastikan sesi Silvana (cookie) hidup; re-login passkey (dari session.json) bila perlu.
@@ -1374,7 +1368,8 @@ async function ensureSilvanaSession(state) {
   const _rawCookies = loadCookies(email);
   delete _rawCookies.geo_status; // never send geo_status=blocked — let server re-eval based on current IP
   const jar = new CookieJar(_rawCookies);
-  const client = new SilvanaClient({ jar, timeoutMs: REQ.timeoutMs, proxy });
+  let curProxy = proxy;
+  let client = new SilvanaClient({ jar, timeoutMs: REQ.timeoutMs, proxy: curProxy });
   // Re-login silvana proaktif kalau sisa < 15 menit (margin lebar biar gak pernah
   // expired antar-sesi). authMe TIDAK nge-extend token; cuma re-login yg nge-renew,
   // jadi margin harus > interval keep-alive.
@@ -1382,19 +1377,44 @@ async function ensureSilvanaSession(state) {
   const exp = silvanaAccessExpMs(email);
   const stillFresh = exp && (exp - Date.now() > SAFETY_MS);
   if (stillFresh) {
-    try {
-      const me = await client.authMe();
-      if (me.authenticated && me.user) { state.silvanaUser = me.user.email || me.user.firstName || 'ok'; saveCookies(email, jar.toObject()); state.silvanaExpMs = silvanaAccessExpMs(email); return client; }
-    } catch (_) { }
+    // authMe bisa flake (network/proxy) — retry transient dikit sebelum re-login.
+    for (let i = 0; i < 3; i++) {
+      try {
+        const me = await client.authMe();
+        if (me.authenticated && me.user) { state.silvanaUser = me.user.email || me.user.firstName || 'ok'; saveCookies(email, jar.toObject()); state.silvanaExpMs = silvanaAccessExpMs(email); return client; }
+        break; // ke-auth tapi gak authenticated → token mati, lanjut re-login
+      } catch (e) {
+        if (i < 2) {
+          if (isProxyErr(e)) { curProxy = rotateProxy(email); state.proxyHost = curProxy ? `${curProxy.host}:${curProxy.port}` : null; client = new SilvanaClient({ jar, timeoutMs: REQ.timeoutMs, proxy: curProxy }); }
+          await sleep(REQ.retryDelayMs || 2000);
+        }
+      }
+    }
   }
-  state.status = 'login'; state.message = 'silvana re-login passkey'; render(global.__states);
-  jar.clear();
+  // Re-login passkey: retry banyak + rotate proxy tiap gagal (transient/IP block).
   const privateJwk = (typeof pk.privateJwk === 'string') ? JSON.parse(pk.privateJwk) : pk.privateJwk;
-  const result = await withRetry(() => client.loginWithPasskey({ email, credentialId: pk.credentialId, userHandle: pk.userHandle, privateJwk }), 'silvana login', { retry: REQ.retry, delayMs: REQ.retryDelayMs });
-  state.silvanaUser = (result.user && (result.user.email || result.user.firstName)) || 'ok';
-  saveCookies(email, jar.toObject());
-  state.silvanaExpMs = silvanaAccessExpMs(email);
-  return client;
+  const MAX_LOGIN = 6; let lastErr = null;
+  for (let attempt = 1; attempt <= MAX_LOGIN; attempt++) {
+    state.status = 'login'; state.message = `silvana re-login passkey (${attempt}/${MAX_LOGIN})`; render(global.__states);
+    jar.clear();
+    try {
+      const result = await client.loginWithPasskey({ email, credentialId: pk.credentialId, userHandle: pk.userHandle, privateJwk });
+      state.silvanaUser = (result.user && (result.user.email || result.user.firstName)) || 'ok';
+      saveCookies(email, jar.toObject());
+      state.silvanaExpMs = silvanaAccessExpMs(email);
+      state.message = '';
+      return client;
+    } catch (e) {
+      lastErr = e;
+      if (attempt < MAX_LOGIN) {
+        curProxy = rotateProxy(email);
+        state.proxyHost = curProxy ? `${curProxy.host}:${curProxy.port}` : null;
+        client = new SilvanaClient({ jar, timeoutMs: REQ.timeoutMs, proxy: curProxy });
+        await sleep(REQ.retryDelayMs || 2000);
+      }
+    }
+  }
+  throw new Error(`silvana login gagal: ${(lastErr && lastErr.message) || lastErr}`);
 }
 
 // ============================================================================
@@ -1423,7 +1443,14 @@ async function swapOnce(ctx, direction, quantityCC) {
   const dirID = direction === 'sell' ? 'jual CC' : 'beli CC';
 
   const price = await sv.getPrice(market).catch(() => null);
-  const px = price ? String(direction === 'sell' ? price.bid : price.ask) : '0';
+  // getPrice = quote-per-base. USDCx (base CC): USDCx/CC. cETH (base cETH): CC/cETH.
+  // estimateFee `price` butuh "token per CC" → USDCx pakai apa adanya; cETH INVERT
+  // (1/getPrice) krn base/quote kebalik. (HAR cc-eth: getPrice ask≈10332, est price≈0.0000967.)
+  let px = '0';
+  if (price) {
+    const raw = Number(direction === 'sell' ? price.bid : price.ask);
+    px = String(SWAP.baseIsCC ? raw : (raw > 0 ? 1 / raw : 0));
+  }
   // FEE PROTECTION (early gate): cek estimasi fee SEBELUM bikin proposal on-chain.
   // Kalau fee > maxFeeCC, batal di sini — gak ada DvpProposal nyangkut.
   const feeEst = await sv.swapAction(A.estimateFee, [{ partyId, marketId: market, baseQuantity: amount, price: px }]).catch(() => null);
@@ -1544,9 +1571,15 @@ async function swapOnce(ctx, direction, quantityCC) {
   const deliv = dvp.terms.deliveries[0], pay = dvp.terms.payments[0], weAreBuyer = (direction === 'buy');
   const ourLeg = weAreBuyer ? { instrument: pay.instrument, amount: pay.amount, legId: '2' } : { instrument: deliv.instrument, amount: deliv.amount, legId: '1' };
   const receiver = dvp.proposer;
+  // PATH ditentukan token YANG KITA SERAHKAN (bukan direction). weProvideCC = leg
+  // kita = Amulet (CC) → bayar CC (cETH-buy / USDCx-sell). else → serahkan token
+  // (USDCx-buy / cETH-sell). Bikin satu logic jalan utk kedua pair walau orientasi
+  // base/quote kebalik. admin/id token diambil dari ourLeg.instrument (dvp terms).
+  const weProvideCC = String((ourLeg.instrument && ourLeg.instrument.id) || '') === 'Amulet';
 
   const amulets = await canton.activeContracts(SWAP.templateIds.amulet);
-  const ccNeed = weAreBuyer ? SWAP.feeBufferCC : addDp(amount, SWAP.feeBufferCC);
+  // Kalau kita bayar CC: butuh CC sebesar leg + fee. Kalau bayar token: CC cuma utk fee.
+  const ccNeed = weProvideCC ? addDp(ourLeg.amount, SWAP.feeBufferCC) : SWAP.feeBufferCC;
   const inputHoldingCids = selectCcHoldings(amulets, ccNeed);
 
   const dvpFeeArgs = [{ partyId, feeType: 'dvp_contract', role, proposalId, inputHoldingCids }];
@@ -1606,30 +1639,31 @@ async function swapOnce(ctx, direction, quantityCC) {
     executeBefore: new Date(_now.getTime() + 24 * 3600_000 + 10_000).toISOString(),
   }];
   let allocate;
-  if (weAreBuyer) {
-    // BUY: kita bayar USDCx — fetch holdings buat inputHoldingCids + balance check
+  if (!weProvideCC) {
+    // Kita SERAHKAN token (USDCx-buy / cETH-sell) — fetch holdings token + cek saldo.
+    // admin token diambil dari ourLeg.instrument (dvp terms) → benar utk pair manapun.
+    const tokenLabel = SWAP.tokenLabel, tokenId = SWAP.tokenId, tokenAdmin = (ourLeg.instrument && ourLeg.instrument.admin) || SWAP.tokenAdmin;
     const bal = await supaBalances(ctx.identityToken || canton.token, ctx.proxy || null);
-    const usdcxToken = ((bal && bal.tokens) || []).find(t => String((t.instrumentId && t.instrumentId.id) || '').toUpperCase() === 'USDCX');
-    const usdcxHoldings = (usdcxToken && usdcxToken.unlockedUtxos || []).map(u => u.contractId).filter(Boolean);
-    if (!usdcxHoldings.length) throw new Error('tidak ada USDCx holding untuk swap buy');
-    const totalUsdcx = (usdcxToken.unlockedUtxos || []).reduce((s, u) => s + Number(u.amount || 0), 0);
-    const needUsdcx = Number(ourLeg.amount);
-    if (totalUsdcx < needUsdcx) {
-      const e = new Error(`USDCx kurang: butuh ${needUsdcx.toFixed(4)} hanya punya ${totalUsdcx.toFixed(4)}`);
+    const tokenTok = ((bal && bal.tokens) || []).find(t => String((t.instrumentId && t.instrumentId.id) || '').toUpperCase() === tokenId);
+    const tokenHoldings = (tokenTok && tokenTok.unlockedUtxos || []).map(u => u.contractId).filter(Boolean);
+    if (!tokenHoldings.length) throw new Error(`tidak ada ${tokenLabel} holding untuk swap`);
+    const totalToken = (tokenTok.unlockedUtxos || []).reduce((s, u) => s + Number(u.amount || 0), 0);
+    const needToken = Number(ourLeg.amount);
+    if (totalToken < needToken) {
+      const e = new Error(`${tokenLabel} kurang: butuh ${needToken.toFixed(6)} hanya punya ${totalToken.toFixed(6)}`);
       e.insufficientBalance = true;
-      e.usdcxNeeded = needUsdcx;
-      e.usdcxHave = totalUsdcx;
+      e.tokenNeeded = needToken;
+      e.tokenHave = totalToken;
       throw e;
     }
-    for (const h of usdcxHoldings) { if (!inputHoldingCids.includes(h)) inputHoldingCids.push(h); }
+    for (const h of tokenHoldings) { if (!inputHoldingCids.includes(h)) inputHoldingCids.push(h); }
     const t = await sv.swapAction(A.prepareTransfer, _prepTransferArgs);
-    logDebug('prepareTransfer (buy) response', t);
-    if (!t || !t.factoryId) throw new Error('prepareTransfer (buy) gagal');
-    // BUY allocationFactory = USDCx factory (bukan CC/Amulet ExternalPartyAmuletRules).
-    // prepareTransfer.factoryId = "004b73bef9..." (CC factory) → salah untuk BUY.
-    // getAllocFactory action 60c923ff... return "006289e882..." (USDCx factory) → benar.
+    logDebug('prepareTransfer (token) response', t);
+    if (!t || !t.factoryId) throw new Error('prepareTransfer (token) gagal');
+    // allocationFactory = factory TOKEN (bukan CC/Amulet ExternalPartyAmuletRules).
+    // expectedAdmin = admin token dari dvp terms. getAllocFactory balik factory token.
     const allocFactArgs = [
-      SWAP.usdcxAdmin,
+      tokenAdmin,
       {
         allocation: {
           settlement: {
@@ -1649,8 +1683,8 @@ async function swapOnce(ctx, direction, quantityCC) {
             meta: { values: {} },
           },
         },
-        inputHoldingCids: usdcxHoldings,
-        expectedAdmin: SWAP.usdcxAdmin,
+        inputHoldingCids: tokenHoldings,
+        expectedAdmin: tokenAdmin,
         extraArgs: { context: { values: {} }, meta: { values: {} } },
         requestedAt: dvp.terms.createdAt,
       },
@@ -1772,7 +1806,7 @@ function expParts(expMs) {
   return [Math.round(h / 24) + 'd', COLOR.cyan];
 }
 function renderHeader() {
-  return [line(), row(paint(' SilvanaBot V1.6 Auto Swap ', COLOR.bold + COLOR.cyan)), row(paint(new Date().toLocaleString('id-ID'), COLOR.gray))].join('\n');
+  return [line(), row(paint(' SilvanaBot V1.7 Auto Swap ', COLOR.bold + COLOR.cyan)), row(paint(new Date().toLocaleString('id-ID'), COLOR.gray))].join('\n');
 }
 // Status akun → [teks, warna]. Dipakai sel STATUS di table.
 function statusInfo(state) {
@@ -1805,7 +1839,7 @@ function renderAccountsTable(states) {
     { title: 'STATUS', prio: 1, cap: 10, cell: s => statusInfo(s) },
     { title: 'SWAP', prio: 0, cap: 7, cell: s => [s.dayTrader ? `${s.dayTrader.count}/${s.dayTrader.target}` : '-', s.dayTrader && s.dayTrader.count >= s.dayTrader.target ? COLOR.green : COLOR.white] },
     { title: 'CC', prio: 1, cap: 12, cell: s => { const b = balOf(s, 'AMULET'); return [b ? fmtCC(b.unlocked) + (b.locked > 1e-8 ? '+' + fmtCC(b.locked) : '') : '-', COLOR.green]; } },
-    { title: 'USDCx', prio: 1, cap: 12, cell: s => { const b = balOf(s, 'USDCX'); return [b ? fmtUSDC(b.unlocked) + (b.locked > 1e-8 ? '+' + fmtUSDC(b.locked) : '') : '-', COLOR.green]; } },
+    { title: SWAP.tokenLabel, prio: 1, cap: 12, cell: s => { const b = balOf(s, SWAP.tokenId); const ft = SWAP.baseIsCC ? fmtUSDC : fmtTok6; return [b ? ft(b.unlocked) + (b.locked > 1e-8 ? '+' + ft(b.locked) : '') : '-', COLOR.green]; } },
     { title: 'POIN', prio: 3, cap: 9, cell: s => [s.points != null ? fmtThousand(s.points) : '-', COLOR.mag] },
     { title: 'STREAK', prio: 4, cap: 6, cell: s => [s.streak != null ? String(s.streak) : '-', COLOR.yellow] },
     { title: 'SILV', prio: 2, cap: 8, cell: s => expParts(s.silvanaExpMs) },
@@ -1937,6 +1971,7 @@ function parseMonthlyStreak(tasksArr) {
 // Format balance: CC = 1 desimal, USDCx = 3 desimal (tetap, gak strip nol).
 function fmtCC(n) { const x = Number(n); return Number.isFinite(x) ? x.toFixed(1) : '-'; }
 function fmtUSDC(n) { const x = Number(n); return Number.isFinite(x) ? x.toFixed(3) : '-'; }
+function fmtTok6(n) { const x = Number(n); return Number.isFinite(x) ? x.toFixed(6) : '-'; }
 // Unclaimed Points dari earn-hub (mis. 1,780.00). Cari di root + nested, robust ke nama field.
 function extractUnclaimedPoints(tasks) {
   if (!tasks || typeof tasks !== 'object') return null;
@@ -2041,24 +2076,7 @@ let lastDiscoverMs = 0; // throttle scan bundle (anti-hammer kalau discover gaga
 // Silvana redeploy) scan bundle & remap fingerprint. Dipanggil di session-start
 // DAN tiap iterasi loop swap (murah kalau sudah verified). Aman dipanggil
 // berulang. Throttle scan 30s biar gak hammer pas discover gagal (cookie dead).
-// Bangun dvpBody VALID dari Canton (DvpProposal proposalId + amulet cid asli) →
-// prepareDvpFee dijamin balik blob → discovery prepareDvpFee reliable di session
-// start (gak nunggu mid-swap yg lambat). Balikin null kalau gak ada DvP/amulet.
-async function buildDvpProbeBody(canton, partyId) {
-  if (!canton) return null;
-  try {
-    const dvps = await canton.activeContracts(SWAP.templateIds.dvpProposal).catch(() => []);
-    const mine = (dvps || []).find(c => { const a = c.createArgument; return a && a.terms && a.terms.id && (a.proposer === partyId || a.counterparty === partyId); });
-    if (!mine) return null;
-    const ca = mine.createArgument;
-    const weAreBuyer = ca.proposer === partyId ? !!ca.proposerIsBuyer : !ca.proposerIsBuyer;
-    const amulets = await canton.activeContracts(SWAP.templateIds.amulet).catch(() => []);
-    const amCid = (amulets || []).map(c => c.contractId).filter(Boolean)[0];
-    if (!amCid) return null;
-    return [{ partyId, feeType: 'dvp_contract', role: weAreBuyer ? 'buyer' : 'seller', proposalId: ca.terms.id, inputHoldingCids: [amCid] }];
-  } catch (_) { return null; }
-}
-async function ensureActionIds(sv, partyId, tag, canton) {
+async function ensureActionIds(sv, partyId, tag) {
   if (actionIdsVerified) return;
   try {
     if (await sv.validateActionIds(partyId)) {
@@ -2069,15 +2087,10 @@ async function ensureActionIds(sv, partyId, tag, canton) {
     if (Date.now() - lastDiscoverMs < 30000) return; // baru scan <30s lalu, tunggu
     lastDiscoverMs = Date.now();
     logActivity(`[${tag}] action ID stale (Silvana redeploy) → scan bundle…`, COLOR.yellow);
-    const dvpProbe = await buildDvpProbeBody(canton, partyId);
-    const r = await sv.discoverActionIds(partyId, dvpProbe);
+    const r = await sv.discoverActionIds();   // parse bundle by nama fungsi (no probe)
     if (r.changed.length) { logActivity(`[${tag}] action IDs di-refresh (${r.changed.length}): ${r.changed.join(', ')}`, COLOR.green); saveActionIds(); }
-    // verified = SEMUA action kritis ketemu. prepareDvpFee butuh proposal aktif
-    // buat di-fingerprint → kalau akun belum punya proposal, baru ke-heal setelah
-    // swap pertama bikin proposal (loop berikut re-discover). getConsumedHoldings
-    // opsional (tak dipakai) → gak masuk hitungan.
     actionIdsVerified = r.ok;
-    if (!r.ok) logActivity(`[${tag}] discovery belum lengkap: ${r.missingCritical.join(', ')} — auto-retry tiap loop (prepareDvpFee perlu proposal aktif)`, COLOR.yellow);
+    if (!r.ok) logActivity(`[${tag}] discovery belum lengkap: ${r.missingCritical.join(', ')} (bundle berubah?) — auto-retry`, COLOR.yellow);
   } catch (e) {
     logActivity(`[${tag}] discovery action IDs gagal: ${(e && e.message) || e}`, COLOR.yellow);
   }
@@ -2257,9 +2270,8 @@ async function cleanupStaleProposals(sv, canton, partyId, log = () => { }) {
   cands.sort((a, b) => b.ageSec - a.ageSec);                      // tertua dulu (clear clog lama)
   log(`cleanup: ${totalDvp} DvpProposal aktif, ${cands.length} kandidat, ${pastExpiry} udah lewat settleBefore (harusnya auto-archive)`, COLOR.gray);
   if (!cands.length) return 0;
-  // Pastikan cancelSettlement id (di page /terminal) current — auto-fetch kalau stale.
-  const okId = await sv.ensureCancelId(partyId).catch(() => false);
-  if (!okId) { log(`  cancelSettlement id tak ketemu di /terminal bundle — skip cancel`, COLOR.red); return 0; }
+  // cancelSettlement id dari bundle (discoverActionIds). Pastikan ke-discover dulu.
+  if (!actionIdsVerified) await ensureActionIds(sv, partyId, '(cleanup)').catch(() => { });
   let cancelled = 0;
   const t0 = Date.now(), BUDGET_MS = 120000, MAX = 120, ANCIENT = 3600;
   for (const p of cands) {
@@ -2287,12 +2299,13 @@ async function cleanupStaleProposals(sv, canton, partyId, log = () => { }) {
   }
   return cancelled;
 }
-// fetch saldo → update state.balances (utk dashboard) + return saldo USDCx unlocked
+// fetch saldo → update state.balances (utk dashboard) + return saldo TOKEN aktif
+// (USDCx / cETH) unlocked. tokenId dari SWAP.tokenId (di-set per pair aktif).
 async function refreshBalances(state, token, proxy) {
   try {
     const b = await supaBalances(token, proxy);
     if (b && b.tokens) state.balances = b.tokens;
-    const t = (b && b.tokens || []).find(x => String((x.instrumentId && x.instrumentId.id) || '').toUpperCase() === 'USDCX');
+    const t = (b && b.tokens || []).find(x => String((x.instrumentId && x.instrumentId.id) || '').toUpperCase() === SWAP.tokenId);
     return t ? Number(t.totalUnlockedBalance || t.totalBalance || 0) : 0;
   } catch (_) { return 0; }
 }
@@ -2343,7 +2356,7 @@ async function runDayTraderSession(reason) {
         // Self-heal: validate murah → scan+remap fingerprint kalau stale. Juga
         // dipanggil ulang tiap iterasi loop swap (lihat di bawah) buat tangkap
         // redeploy MID-RUN (404 reset actionIdsVerified → re-discover otomatis).
-        await ensureActionIds(sv, partyId, tag, clients.canton);
+        await ensureActionIds(sv, partyId, tag);
 
         await refreshBalances(state, identityToken, proxy); render(global.__states);
 
@@ -2400,7 +2413,7 @@ async function runDayTraderSession(reason) {
           // Self-heal MID-RUN: kalau redeploy bikin ID 404 di tengah loop,
           // swapAction set actionIdsVerified=false → re-discover SEBELUM swap
           // berikut (token udah di-refresh di atas → cookie fresh buat discovery).
-          await ensureActionIds(sv, partyId, tag, clients.canton);
+          await ensureActionIds(sv, partyId, tag);
 
           const chk = await fetchDayTrader(sv, partyId).catch(() => null);
           if (chk) {
@@ -2450,8 +2463,10 @@ async function runDayTraderSession(reason) {
             ask = (priceRes && Number(priceRes.ask)) || 0;
           } catch (_) { ask = 0; }
 
-          const usdcxBudget = usdc * 0.95;                            // buffer slippage/fee; kalau actual LP rate lebih mahal, auto-adjust di catch handler
-          const buyCapCC = ask > 0 ? floor4(usdcxBudget / ask) : 0;    // kapasitas CC dari USDCx
+          const tokenBudget = usdc * 0.95;                            // buffer slippage/fee; kalau actual LP rate lebih mahal, auto-adjust di catch handler
+          // ask = quote-per-base. USDCx (base CC): USDCx/CC → CC = budget/ask.
+          // cETH (base cETH): CC/cETH → CC = budget*ask. Kapasitas CC dari saldo token.
+          const buyCapCC = ask > 0 ? floor4(SWAP.baseIsCC ? tokenBudget / ask : tokenBudget * ask) : 0;
           const feeBuf = Math.max(0, Number(SWAP.feeBufferCC) || 0);   // CC disisain buat fee (smart)
           const maxAmt = SWAP_MAX_AMOUNT > 0 ? SWAP_MAX_AMOUNT : Infinity;
 
@@ -2494,16 +2509,16 @@ async function runDayTraderSession(reason) {
           // Floor tetap minAmount (config). buyCapCC = kapasitas CC dari seluruh USDCx.
           const closeBuyCC = floor4(buyCapCC);
           const closeFloor = Math.max(minSwap, SWAP_MODE === 'minmax' ? Number(SWAP_MIN_AMOUNT) : minSwap);
-          if (forcedDir === 'sell') { direction = 'sell'; amountCC = String(maxSellCC); logActivity(`[${tag}] arah dipaksa: sell (restock USDCx, sisa ${remaining})`, COLOR.gray); }
+          if (forcedDir === 'sell') { direction = 'sell'; amountCC = String(maxSellCC); logActivity(`[${tag}] arah dipaksa: open (restock ${SWAP.tokenLabel}, sisa ${remaining})`, COLOR.gray); }
           else if (forcedDir === 'buy') {
             direction = 'buy';
             if (closeBuyAll && closeBuyCC >= closeFloor) {
-              amountCC = String(closeBuyCC); // habisin USDCx, max bebas
-              logActivity(`[${tag}] swap penutup: BUY semua USDCx (${closeBuyCC} CC, floor ${closeFloor}) → tutup pegang CC`, COLOR.cyan);
+              amountCC = String(closeBuyCC); // habisin token, max bebas
+              logActivity(`[${tag}] swap penutup: CLOSE semua ${SWAP.tokenLabel} (~${closeBuyCC} CC, floor ${closeFloor}) → tutup pegang CC`, COLOR.cyan);
             } else if (closeBuyAll) {
-              // USDCx < minAmount → gak bisa buy valid. Fallback sell biar gak stuck.
-              if (canSell) { direction = 'sell'; amountCC = String(maxSellCC); logActivity(`[${tag}] swap penutup: USDCx ${closeBuyCC} CC < min ${closeFloor} → fallback sell`, COLOR.yellow); }
-              else { direction = 'buy'; amountCC = String(maxBuyCC); logActivity(`[${tag}] swap penutup: USDCx kurang & sell gak bisa, coba buy seadanya`, COLOR.yellow); }
+              // token < minAmount → gak bisa close valid. Fallback open biar gak stuck.
+              if (canSell) { direction = 'sell'; amountCC = String(maxSellCC); logActivity(`[${tag}] swap penutup: ${SWAP.tokenLabel} ~${closeBuyCC} CC < min ${closeFloor} → fallback open`, COLOR.yellow); }
+              else { direction = 'buy'; amountCC = String(maxBuyCC); logActivity(`[${tag}] swap penutup: ${SWAP.tokenLabel} kurang & open gak bisa, coba close seadanya`, COLOR.yellow); }
             } else {
               amountCC = String(maxBuyCC); logActivity(`[${tag}] arah dipaksa: buy (override)`, COLOR.gray);
             }
@@ -2513,13 +2528,31 @@ async function runDayTraderSession(reason) {
           else {
             // Dua-duanya gak cukup. Banyak CC mungkin masih kelock di settlement →
             // tunggu sebentar lalu cek ulang; kalau tetap, stop sesi (server unlock sendiri).
-            logActivity(`[${tag}] saldo gak cukup utk swap (CC unlocked ${floor4(ccUnlocked)}, USDCx ${floor4(usdc)}, mode ${modeLabel}). Tunggu unlock…`, COLOR.yellow);
+            logActivity(`[${tag}] saldo gak cukup utk swap (CC unlocked ${floor4(ccUnlocked)}, ${SWAP.tokenLabel} ${SWAP.baseIsCC ? floor4(usdc) : usdc}, mode ${modeLabel}). Tunggu unlock…`, COLOR.yellow);
             lowFeeStreak++;
             if (lowFeeStreak >= MAX_LOW_FEE) { logActivity(`[${tag}] Stop sesi: saldo kurang setelah ${MAX_LOW_FEE}x. Tunggu settlement unlock / top-up.`, COLOR.red); break; }
             await sleep(Math.min(90, 30 * lowFeeStreak) * 1000);
             continue;
           }
-          logActivity(`[${tag}] ${direction} ${amountCC} CC (${modeLabel})`, COLOR.gray);
+          // === ADAPTER PAIR ===
+          // `direction` di atas = INTENT (sell=open CC→token, buy=close token→CC) &
+          // `amountCC` = CC. Konversi ke arah market + quantity RFQ sesuai pair aktif:
+          //   USDCx (base CC): identity (arah sama, qty = CC).
+          //   cETH  (base token): arah flip (open=buy/close=sell) & qty = CC*ask (token).
+          // ask = quote-per-base (USDCx: USDCx/CC; cETH: CC/cETH). qty RFQ = jumlah BASE:
+          //   USDCx base=CC → qty = CC (ccAmt). cETH base=cETH → qty = ccAmt / ask (CC÷(CC/cETH)).
+          const toRfq = (intent, ccAmt) => {
+            const md = (intent === 'sell') ? SWAP.dirOpen : SWAP.dirClose;
+            const q = SWAP.baseIsCC ? String(ccAmt) : fmt10(String(ask > 0 ? Number(ccAmt) / ask : 0));
+            return { md, q };
+          };
+          const { md: marketDir, q: rfqQty } = toRfq(direction, amountCC);
+          if (!(Number(rfqQty) > 0)) {
+            logActivity(`[${tag}] qty RFQ 0 (harga ${SWAP.tokenLabel} belum ada / saldo kurang) — tunggu…`, COLOR.yellow);
+            await sleep(SWAP.delayBetweenSwapsSec * 1000);
+            continue;
+          }
+          logActivity(`[${tag}] ${marketDir} ${rfqQty} ${SWAP.baseIsCC ? 'CC' : SWAP.tokenLabel} [${direction === 'sell' ? 'CC→' + SWAP.tokenLabel : SWAP.tokenLabel + '→CC'}] (${modeLabel})`, COLOR.gray);
 
           // Eksekusi swap + optimistic update progress + cooldown + refresh
           // handleSuccess: optimistic visual + cooldown + sync. TIDAK increment done.
@@ -2618,8 +2651,8 @@ async function runDayTraderSession(reason) {
 
           try {
             const beforeApi = (state.dayTrader && Number(state.dayTrader.count)) || 0;
-            const label = direction === 'sell' ? 'jual CC→USDCx' : 'beli USDCx→CC';
-            const res = await swapWithRetry(direction, amountCC, label);
+            const label = direction === 'sell' ? `CC→${SWAP.tokenLabel}` : `${SWAP.tokenLabel}→CC`;
+            const res = await swapWithRetry(marketDir, rfqQty, label);
             if (res && res.ok) {
               if (res.feeCC) recordBurn(res.feeCC, tag);
               const realDt = await handleSuccess(label);
@@ -2715,40 +2748,45 @@ async function runDayTraderSession(reason) {
               await sleep(waitS * 1000);
               continue;
             }
-            // Kalau buy gagal karena USDCx kurang, auto-adjust amount berdasarkan
-            // actual LP rate, lalu retry buy. Fallback sell hanya kalau adjusted < min.
+            // Close (intent 'buy' = token→CC) gagal karena token kurang → auto-adjust
+            // amount pakai actual LP rate, retry close. Fallback open kalau adjusted < min.
+            // (intent 'buy' = kita serahkan token di KEDUA pair → gating bener.)
             if (e && e.insufficientBalance && direction === 'buy') {
               let retried = false;
-              if (e.usdcxNeeded && e.usdcxHave && Number(amountCC) > 0) {
-                const lpRatio = e.usdcxNeeded / Number(amountCC); // USDCx per CC (actual LP rate)
-                const adjCC = floor4(e.usdcxHave * 0.94 / lpRatio); // 6% safety margin
+              const closeLabel = `${SWAP.tokenLabel}→CC (adj)`;
+              if (e.tokenNeeded && e.tokenHave && Number(amountCC) > 0) {
+                const lpRatio = e.tokenNeeded / Number(amountCC); // token per CC (actual LP rate)
+                const adjCC = floor4(e.tokenHave * 0.94 / lpRatio); // 6% safety margin
                 if (adjCC >= minSwap) {
-                  logActivity(`[${tag}] USDCx kurang (LP rate ${lpRatio.toFixed(6)}/CC) → retry buy ${adjCC} CC (auto-adjusted)`, COLOR.yellow);
+                  const r = toRfq('buy', adjCC);
+                  logActivity(`[${tag}] ${SWAP.tokenLabel} kurang (LP rate ${lpRatio.toFixed(8)}/CC) → retry close ${adjCC} CC (auto-adjusted)`, COLOR.yellow);
                   try {
-                    const res2 = await swapWithRetry('buy', String(adjCC), 'beli CC (adj)');
+                    const res2 = await swapWithRetry(r.md, r.q, closeLabel);
                     if (res2 && res2.ok) {
                       if (res2.feeCC) recordBurn(res2.feeCC, tag);
-                      await handleSuccess('beli CC (adj)');
+                      await handleSuccess(closeLabel);
                       done++; stuck = 0; lowFeeStreak = 0;
                       retried = true;
                     }
                   } catch (e2) {
-                    logActivity(`[${tag}] buy adj gagal: ${shortSwapReason(e2)}`, COLOR.yellow);
+                    logActivity(`[${tag}] close adj gagal: ${shortSwapReason(e2)}`, COLOR.yellow);
                   }
                 }
               }
               if (!retried) {
-                logActivity(`[${tag}] ${e.message} → coba sell sebagai gantinya`, COLOR.yellow);
+                const openLabel = `CC→${SWAP.tokenLabel}`;
+                logActivity(`[${tag}] ${e.message} → coba open (${openLabel}) sebagai gantinya`, COLOR.yellow);
                 try {
-                  const res2 = await swapWithRetry('sell', amountCC, 'jual CC→USDCx');
-                  if (res2 && res2.ok) { await handleSuccess('jual CC→USDCx'); continue; }
+                  const r = toRfq('sell', amountCC);
+                  const res2 = await swapWithRetry(r.md, r.q, openLabel);
+                  if (res2 && res2.ok) { await handleSuccess(openLabel); continue; }
                 } catch (e2) {
-                  if (e2 && e2.noLiquidity) { logActivity(`[${tag}] likuiditas sell belum ada, retry…`, COLOR.gray); await sleep(SWAP.delayBetweenSwapsSec * 1000); continue; }
-                  logActivity(`[${tag}] swap sell juga gagal: ${shortSwapReason(e2)}`, COLOR.red);
+                  if (e2 && e2.noLiquidity) { logActivity(`[${tag}] likuiditas open belum ada, retry…`, COLOR.gray); await sleep(SWAP.delayBetweenSwapsSec * 1000); continue; }
+                  logActivity(`[${tag}] swap open juga gagal: ${shortSwapReason(e2)}`, COLOR.red);
                 }
               }
             } else {
-              logActivity(`[${tag}] swap ${direction} gagal: ${shortSwapReason(e)}`, COLOR.red);
+              logActivity(`[${tag}] swap ${marketDir} gagal: ${shortSwapReason(e)}`, COLOR.red);
             }
             if (process.env.SWAP_DEBUG && e && e.stack) console.error('[swap-error-stack]', e.stack);
             await sleep(SWAP.delayBetweenSwapsSec * 1000);
@@ -3127,8 +3165,12 @@ Usage:
   } else if (argv[0] === 'paste') {
     runPaste().catch(e => { console.error(paint('FATAL: ' + e.message, COLOR.red)); process.exit(1); });
   } else if (argv[0] === 'swap') {
-    // `node index.js swap [sell|buy]` — arg kedua paksa arah (test SELL).
-    if (argv[1] === 'sell' || argv[1] === 'buy') global.__forceDir = argv[1];
+    // `node index.js swap [ceth|usdcx] [sell|buy]` — pilih pair (default usdcx) +
+    // paksa arah INTENT (sell=open CC→token, buy=close token→CC).
+    let ai = 1;
+    if (PAIRS[argv[ai]]) { setActivePair(argv[ai]); ai++; }
+    if (argv[ai] === 'sell' || argv[ai] === 'buy') global.__forceDir = argv[ai];
+    process.stdout.write(paint(`pair: ${SWAP.market} (CC↔${SWAP.tokenLabel})\n`, COLOR.cyan));
     (async () => { global.__states = makeStates(); render(global.__states); await runDayTraderSession('manual'); process.exit(0); })().catch(e => { console.error(paint('FATAL: ' + e.message, COLOR.red)); process.exit(1); });
   } else if (argv[0] === 'proposals') {
     // `node index.js proposals` — list settlement/DvpProposal aktif (read-only).
@@ -3167,15 +3209,20 @@ Usage:
       process.exit(0);
     })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
   } else if (argv[0] === 'feecheck') {
-    // `node index.js feecheck [sell|buy] [amount]` — dry-run: flow swap ASLI sampai
-    // feeCtx lalu STOP sebelum submit. Log 3 angka fee. 0 CC kebayar.
-    const dir = (argv[1] === 'buy') ? 'buy' : 'sell';
-    const amt = String(argv[2] || SWAP_MIN_AMOUNT || '11');
+    // `node index.js feecheck [ceth|usdcx] [sell|buy] [amount]` — dry-run: flow swap
+    // ASLI sampai feeCtx lalu STOP sebelum submit. Log 3 angka fee. 0 CC kebayar.
+    // dir = arah MARKET-NATIVE (langsung ke swapOnce); amt = base quantity (CC utk
+    // usdcx, cETH utk ceth). Pakai ini buat validasi cETH sebelum live!
+    let ai = 1;
+    if (PAIRS[argv[ai]]) { setActivePair(argv[ai]); ai++; }
+    const dir = (argv[ai] === 'buy') ? 'buy' : 'sell';
+    const amt = String(argv[ai + 1] || SWAP_MIN_AMOUNT || '11');
+    const unit = SWAP.baseIsCC ? 'CC' : SWAP.tokenLabel;
     (async () => {
       const a = ACCOUNTS[0];
       if (!a) { console.error(paint('accounts.json kosong', COLOR.red)); process.exit(1); }
       const state = makeStates()[0];
-      process.stdout.write(paint(`feecheck (dry-run): ${dir} ${amt} CC — ${a.label || a.email}\n`, COLOR.cyan));
+      process.stdout.write(paint(`feecheck (dry-run): ${SWAP.market} ${dir} ${amt} ${unit} — ${a.label || a.email}\n`, COLOR.cyan));
       const clients = await buildSwapClients(state);
       let userServiceCid = getUserServiceCid(a.email);
       if (!userServiceCid) {
@@ -3206,9 +3253,11 @@ Usage:
     if (!ACCOUNTS.length) { console.error(paint('accounts.json kosong. Jalankan: node index.js register', COLOR.red)); process.exit(1); }
     (async () => {
       process.stdout.write('\n' + paint('SilvanaBot-Sipal', COLOR.bold + COLOR.cyan) + '\n');
-      process.stdout.write(paint('  1) run            — dashboard + auto DAY_TRADER', COLOR.gray) + '\n');
-      process.stdout.write(paint('  2) check balance  — cek CC & USDCx semua akun', COLOR.gray) + '\n');
-      const ans = (await prompt(paint('pilih [1/2]: ', COLOR.bold))).trim();
+      process.stdout.write(paint('  0) swap CC→cETH   — dashboard + auto DAY_TRADER (pair cETH)', COLOR.gray) + '\n');
+      process.stdout.write(paint('  1) swap CC→USDCx  — dashboard + auto DAY_TRADER (pair USDCx)', COLOR.gray) + '\n');
+      process.stdout.write(paint('  2) check balance  — cek CC, USDCx & cETH semua akun', COLOR.gray) + '\n');
+      process.stdout.write(paint('  3) run (OTP urut) — login akun 1-per-1 (OTP gak tabrakan) lalu run USDCx', COLOR.gray) + '\n');
+      const ans = (await prompt(paint('pilih [0/1/2/3]: ', COLOR.bold))).trim();
       if (ans === '2') {
         const states = makeStates();
         for (const s of states) {
@@ -3220,9 +3269,11 @@ Usage:
             s.balances = (bal && bal.tokens) || [];
             const cc = balanceOf(s, 'amulet');
             const usdcx = balanceOf(s, 'usdcx');
+            const ceth = balanceOf(s, 'ceth');
             const fmt = (b) => paint(fmtNum(b.unlocked), COLOR.green) + (b.locked > 1e-8 ? paint(' (+' + fmtNum(b.locked) + ' locked)', COLOR.gray) : '');
             process.stdout.write('  CC    : ' + fmt(cc) + '\n');
             process.stdout.write('  USDCx : ' + fmt(usdcx) + '\n');
+            process.stdout.write('  cETH  : ' + fmt(ceth) + '\n');
           } catch (e) {
             process.stdout.write(paint('  ERROR: ' + ((e && e.message) || e) + '\n', COLOR.red));
           }
@@ -3230,6 +3281,31 @@ Usage:
         process.stdout.write('\n');
         process.exit(0);
       }
+      if (ans === '3') {
+        // OTP sequential: login tiap akun SATU PER SATU (concurrency 1) biar prompt
+        // OTP gak tabrakan di stdin. Token nyimpan ke session.json → tickAll paralel
+        // sesudahnya pakai cache, gak prompt lagi.
+        const states = makeStates();
+        global.__states = states;
+        process.stdout.write('\n' + paint('Login berurutan (OTP satu per satu)…', COLOR.cyan) + '\n');
+        let ok = 0, fail = 0;
+        for (let i = 0; i < states.length; i++) {
+          const s = states[i];
+          process.stdout.write('\n' + paint(`[${i + 1}/${states.length}] ${s.label || s.email}`, COLOR.bold) + '\n');
+          try {
+            await ensurePrivyToken(s);
+            await ensureSilvanaSession(s).catch(() => null);
+            process.stdout.write(paint('  ✓ login OK', COLOR.green) + '\n');
+            ok++;
+          } catch (e) {
+            process.stdout.write(paint('  ✗ ' + ((e && e.message) || e), COLOR.red) + '\n');
+            fail++;
+          }
+        }
+        process.stdout.write('\n' + paint(`Login selesai: ${ok} OK, ${fail} gagal. Lanjut run…`, fail ? COLOR.yellow : COLOR.green) + '\n');
+      }
+      const pair = setActivePair(ans === '0' ? 'ceth' : 'usdcx');
+      process.stdout.write('\n' + paint(`Pair aktif: ${pair.market} (CC↔${pair.tokenLabel})`, COLOR.bold + COLOR.cyan) + '\n');
       runMain().catch(e => { console.error(paint('FATAL: ' + (e && e.stack || e), COLOR.red)); process.exit(1); });
     })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
   } else {
