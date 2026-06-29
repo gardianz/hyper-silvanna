@@ -179,6 +179,9 @@ const SWAP = {
     // cancelSettlementAction (lewat /swap, bukan /terminal).
     getAllocFactory: '603f6b19e6cca00e786c9be09a1042e21308027cd1',
     cancelSettlement: '403c0a394eb2f07997e27fc2d2b981533c564272e8',
+    // FALLBACK — di-refresh via discoverActionIds (by nama). Buat withdraw alloc.
+    getDsoInfo: '00dd839eb2f450e60e92b6e868e52f2ecf9999af98',
+    getOpenRound: '00719f372227f711c798857cecf801de3b40bbe809',
   },
   // Package ID untuk Splice.Api.Token.AllocationInstructionV1 — dipakai
   // saat membangun ExerciseCommand AllocationFactory_Allocate.
@@ -697,6 +700,15 @@ class CantonClient {
   get token() { return typeof this._token === 'function' ? this._token() : this._token; }
   set token(v) { this._token = v; }
   _opts(extra) { return { headers: supaHeaders(this.token), timeoutMs: this.timeoutMs, proxy: this.proxy, ...extra }; }
+  // Query active contracts by INTERFACE id (mis. Allocation, Holding) — WAJIB pakai
+  // param `interfaceIds=` (templateIds= balik 400 buat interface). Verified: diag
+  // interfaceIds=Allocation → 200 rows. Dipakai withdraw allocation nyangkut.
+  async activeContractsByInterface(interfaceId) {
+    const r = await request('GET', `${SUPA}/active_contracts?interfaceIds=${encodeURIComponent(interfaceId)}`, this._opts());
+    if (r.status === 401) { const e = new Error('active_contracts(iface) 401'); e.unauthorized = true; throw e; }
+    if (r.status >= 400) throw new Error(`active_contracts(iface) status=${r.status}`);
+    return Array.isArray(r.json) ? r.json : [];
+  }
   async activeContracts(templateId, opts = {}) {
     // CATATAN: supanova TOLAK param limit/pageSize (bikin respons KOSONG) — jangan
     // tambah. Default cap 200; reduksi via cleanup (cancel) kalau DvpProposal numpuk.
@@ -859,6 +871,10 @@ const ACTION_NAME = {
   prepareTransfer: 'getTransferFactoryContextAction',
   getAllocFactory: 'getAllocationFactory',
   cancelSettlement: 'cancelSettlementAction',
+  // Buat withdraw allocation nyangkut (unlock + archive proposal LOCKED yg cancel
+  // gagal). getDsoInfo→amulet_rules, getOpenRound→open mining round (context withdraw).
+  getDsoInfo: 'getDsoInfoAction',
+  getOpenRound: 'getOpenMiningRoundAction',
 };
 // recoverParty (party + userServiceCid) skrg lewat REST GET /api/parties/{id},
 // bukan server action /connect lagi (lihat SilvanaClient.recoverParty).
@@ -1513,7 +1529,24 @@ async function swapOnce(ctx, direction, quantityCC) {
   if (!acc || !acc.proposalId) throw new Error(`acceptQuote gagal: ${JSON.stringify(acc).slice(0, 120)}`);
   const proposalId = acc.proposalId;
 
-  await sv.swapAction(A.recordEvent, [{ partyId, recordedByRole: role, eventType: `preconfirmation_${role}`, result: 'success', proposalId, metadata: { accept: true, source: 'rfq_accept' } }]).catch(() => { });
+  // recordEvent preconfirmation. PENTING: website SELALU sertakan metadata.holdingsByToken
+  // = UTXO token yg kita commit (HAR cc-eth buyer & jual_cc seller: KEDUANYA {CC:[...]}).
+  // Tanpa ini LP cETH gak majuin proposal stage 3→5 → poll dvpProposalCid timeout
+  // (state stage 3 IDENTIK manual-success, beda cuma holdingsByToken). Open commit CC
+  // (terbukti utk USDCx-sell & cETH-buy). Close (commit token) gak ada data HAR → biarin
+  // spt semula (USDCx close jalan tanpa holdingsByToken) biar gak regresi.
+  const meta = { accept: true, source: 'rfq_accept' };
+  if (direction === SWAP.dirOpen) {
+    try {
+      const bal = await supaBalances(ctx.identityToken || canton.token, ctx.proxy || null);
+      const ccTok = ((bal && bal.tokens) || []).find(t => String((t.instrumentId && t.instrumentId.id) || '').toUpperCase() === 'AMULET');
+      const ccUtxos = (ccTok && ccTok.unlockedUtxos || [])
+        .map(u => ({ cid: u.contractId, amount: fmt10(String(u.amount)) }))
+        .filter(x => x.cid);
+      if (ccUtxos.length) meta.holdingsByToken = { CC: ccUtxos };
+    } catch (_) { }
+  }
+  await sv.swapAction(A.recordEvent, [{ partyId, recordedByRole: role, eventType: `preconfirmation_${role}`, result: 'success', proposalId, metadata: meta }]).catch(() => { });
 
   let dvpCid = null;
   let lastPoll = null;
@@ -1539,6 +1572,7 @@ async function swapOnce(ctx, direction, quantityCC) {
   let dvp = null;
   let lastCount = 0;
   let lastAcErr = null;
+  let unburied = false;
   for (let i = 0; i < SWAP.pollMaxTries; i++) {
     const list = await canton.activeContracts(SWAP.templateIds.dvpProposal).catch(e => { lastAcErr = (e && e.message) || String(e); return []; });
     lastCount = (list || []).length;
@@ -1554,6 +1588,18 @@ async function swapOnce(ctx, direction, quantityCC) {
         proposerIsBuyer: ca.proposerIsBuyer,
       };
       break;
+    }
+    // active_contracts CAP 200 (no pagination). Kalau proposal stale numpuk sampai
+    // 200, cid FRESH kita ke-bury di balik yg lama → lookup gagal. DULU solusinya
+    // ganti wallet (party baru = 0 proposal). GANTIIN: cleanup SEKALI (archive yg
+    // 0-dana/tua >120s → count turun <200 → cid fresh kelihatan). Proposal fresh
+    // kita age<120s → DI-SKIP cleanup (aman, gak ke-cancel sendiri).
+    if (!unburied && lastCount >= 200) {
+      unburied = true;
+      log(`${lastCount} DvpProposal (cap supanova) — cid fresh ke-bury, bersihin proposal stale…`);
+      const n = await cleanupStaleProposals(sv, canton, partyId, (m) => log(m), privy).catch(() => 0);
+      log(`cleanup: ${n} proposal di-archive → cek ledger lagi`);
+      continue; // re-fetch langsung tanpa delay
     }
     if (i === 0) log('Menunggu DvpProposal muncul di ledger…');
     await sleep(SWAP.pollIntervalMs);
@@ -1606,6 +1652,10 @@ async function swapOnce(ctx, direction, quantityCC) {
     log(`Fee ${dirID}: ${realFeeCC} CC (batas ${SWAP.maxFeeCC})`);
     if (realFeeCC > Number(SWAP.maxFeeCC) && !ctx.dryRun) {
       logDebug('fee spike (feeCtx) — abort sebelum submit', { realFeeCC, max: SWAP.maxFeeCC });
+      // PROPOSAL udah dibuat (acceptQuote) tapi BELUM allocate (0 dana ke-lock) →
+      // cancel SEKARANG biar gak nyangkut numpuk di ledger (cegah cap-200 → "Menunggu
+      // DvpProposal" → ganti wallet). Best-effort, gak gagalin alur abort.
+      await sv.cancelSettlement(proposalId, partyId).catch(() => { });
       const e = new Error(`fee ${realFeeCC} CC > batas ${SWAP.maxFeeCC} CC`);
       e.feeSpike = true; e.feeCC = realFeeCC;
       throw e;
@@ -1806,7 +1856,7 @@ function expParts(expMs) {
   return [Math.round(h / 24) + 'd', COLOR.cyan];
 }
 function renderHeader() {
-  return [line(), row(paint(' SilvanaBot V1.7 Auto Swap ', COLOR.bold + COLOR.cyan)), row(paint(new Date().toLocaleString('id-ID'), COLOR.gray))].join('\n');
+  return [line(), row(paint(' SilvanaBot V1.8 Auto Swap ', COLOR.bold + COLOR.cyan)), row(paint(new Date().toLocaleString('id-ID'), COLOR.gray))].join('\n');
 }
 // Status akun → [teks, warna]. Dipakai sel STATUS di table.
 function statusInfo(state) {
@@ -2234,15 +2284,110 @@ async function fetchActiveSettlements(sv, partyId, { staleMaxSec = 300, statusBu
   }
   return out;
 }
+// Interface templateId Allocation (Splice token standard).
+const ALLOCATION_IFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
+// contractId dari row active_contracts (flat {contractId} / wrapped contractEntry).
+function _acContractId(c) {
+  if (!c) return null;
+  if (c.contractId) return c.contractId;
+  const ce = c.contractEntry && c.contractEntry.JsActiveContract && c.contractEntry.JsActiveContract.createdEvent;
+  return (ce && ce.contractId) || null;
+}
+// Normalisasi contract ref supanova → {templateId, contractId, createdEventBlob}
+// (server balik snake_case template_id/contract_id/created_event_blob).
+function _normContract(x) {
+  if (!x) return null;
+  return {
+    templateId: x.template_id || x.templateId,
+    contractId: x.contract_id || x.contractId,
+    createdEventBlob: x.created_event_blob || x.createdEventBlob,
+  };
+}
+/**
+ * Withdraw SEMUA Allocation aktif milik party → UNLOCK dana + bikin DvpProposal
+ * LOCKED bisa di-archive/cancel (yg cancelSettlement-nya FAILED gara2 dana ke-lock).
+ * Pakai Canton choice `Allocation_Withdraw` + extraArgs {expire-lock:true, amulet-rules,
+ * open-round}. Sumber: bot temen silvanjut (withdraw_allocation) — ini yg dia lakuin
+ * buat atasi proposal nyangkut yg gak bisa di-cancel. Butuh privy (sign). Return jumlah.
+ */
+async function withdrawStuckAllocations(sv, canton, privy, partyId, log = () => { }) {
+  if (!canton || !privy) return 0;
+  // 1) Allocation nyangkut = dana kita ke-lock di proposal stuck. WAJIB query pakai
+  //    interfaceIds= (templateIds= → 400). Verified diag: 200 alloc di akun stuck.
+  const allocs = await canton.activeContractsByInterface(ALLOCATION_IFACE).catch((e) => { log(`  query alloc gagal: ${(e && e.message) || e}`, COLOR.red); return []; });
+  const cids = [...new Set((allocs || []).map(_acContractId).filter(Boolean))];
+  if (!cids.length) { log('  0 allocation aktif → gak ada dana ke-lock', COLOR.gray); return 0; }
+  // 2) Context withdraw dari getDsoInfo (1 call): amulet_rules + latest_mining_round
+  //    (getOpenRound action MATI 404 → pakai latest_mining_round dari getDsoInfo).
+  try { const d = await sv.discoverActionIds(); if (d && d.changed && d.changed.length) saveActionIds(); } catch (_) { }
+  const dso = await sv.swapAction(SWAP.actionIds.getDsoInfo, []).catch((e) => ({ _err: (e && e.message) || String(e) }));
+  const ar = _normContract(dso && dso.amulet_rules && dso.amulet_rules.contract);
+  const omr = _normContract(dso && dso.latest_mining_round && dso.latest_mining_round.contract);
+  if (!ar || !ar.contractId || !omr || !omr.contractId) {
+    log(`  withdraw GAGAL baca getDsoInfo (${cids.length} alloc nyangkut) — kirim swap-debug.log`, COLOR.red);
+    logDebug('withdraw shape FAIL', { getDsoInfo: JSON.stringify(dso).slice(0, 1000), idDso: SWAP.actionIds.getDsoInfo });
+    return 0;
+  }
+  log(`  ${cids.length} allocation nyangkut → withdraw (unlock dana)…`, COLOR.gray);
+  let done = 0, fail = 0;
+  const t0 = Date.now(), BUDGET_MS = 240000, MAX = 250;
+  for (const cid of cids) {
+    if (done + fail >= MAX || Date.now() - t0 > BUDGET_MS) { log(`  budget habis (${done} done) — run cleanup lagi buat sisanya`, COLOR.yellow); break; }
+    const body = {
+      commands: [{
+        ExerciseCommand: {
+          templateId: ALLOCATION_IFACE,
+          contractId: cid,
+          choice: 'Allocation_Withdraw',
+          choiceArgument: {
+            extraArgs: {
+              context: {
+                values: {
+                  'expire-lock': { tag: 'AV_Bool', value: true },
+                  'amulet-rules': { tag: 'AV_ContractId', value: ar.contractId },
+                  'open-round': { tag: 'AV_ContractId', value: omr.contractId },
+                },
+              },
+              meta: { values: {} },
+            },
+          },
+        },
+      }],
+      disclosedContracts: [
+        { templateId: omr.templateId, contractId: omr.contractId, createdEventBlob: omr.createdEventBlob, synchronizerId: SWAP.synchronizerId },
+        { templateId: ar.templateId, contractId: ar.contractId, createdEventBlob: ar.createdEventBlob, synchronizerId: SWAP.synchronizerId },
+      ],
+    };
+    try {
+      const prep = await canton.prepareTransaction(body);
+      if (!prep || !prep.hash) throw new Error('no hash');
+      const hashHex = b64HashToHex(prep.hash);
+      let sub = null;
+      const tries = Math.max(1, (privy.walletCandidates && privy.walletCandidates.length) || 1) + 1;
+      for (let st = 1; st <= tries; st++) {
+        const sigRaw = await privy.rawSign(hashHex);
+        try { sub = await canton.submitPrepared({ hash: prep.hash, signature: sigToB64(sigRaw) }); break; }
+        catch (e) { if (/bad signature/i.test((e && e.message) || '')) { const nxt = privy.nextWallet(); if (nxt) continue; } throw e; }
+      }
+      if (sub && sub.submissionId) { done++; if (done % 10 === 0 || done === 1) log(`  withdraw ${done}/${cids.length}…`, COLOR.green); }
+      else fail++;
+    } catch (e) {
+      fail++;
+      if (fail <= 3) log(`  withdraw ${cid.slice(0, 14)}… gagal: ${((e && e.message) || e).toString().slice(0, 100)}`, COLOR.red);
+    }
+  }
+  log(`  withdraw selesai: ${done} unlock, ${fail} gagal`, done ? COLOR.green : COLOR.yellow);
+  return done;
+}
 /**
  * Cancel proposal nyangkut yg AMAN dibuang (V2): stage<9 (belum settle), alloc
  * sisi kita kosong (0 dana ke-lock), umur >90s (bukan in-flight). Sampah dari
  * abort fee-spike / settlement gak kelar / proposal LP yg gak kita ambil.
  * Cancel via cancelSettlement → DvpProposal di-archive → active_contracts gak
- * kena cap 200. NEVER sentuh yg dana kita kekunci (LOCKED) atau udah SETTLED.
- * Return jumlah yg berhasil di-cancel.
+ * kena cap 200. Yg dana kita ke-LOCK gak bisa di-cancel → di-WITHDRAW (kalau privy
+ * dikasih) biar dana unlock + proposal bisa archive. Return total (cancel+withdraw).
  */
-async function cleanupStaleProposals(sv, canton, partyId, log = () => { }) {
+async function cleanupStaleProposals(sv, canton, partyId, log = () => { }, privy = null) {
   // Clog = DvpProposal CONTRACTS di Canton (active_contracts cap 200), BUKAN REST
   // settlement-proposals (sering kosong) — itu kenapa cleanup lama 0 terus.
   // Ambil dari ledger, cancel yg AMAN → DvpProposal di-archive → count turun <200
@@ -2269,10 +2414,15 @@ async function cleanupStaleProposals(sv, canton, partyId, log = () => { }) {
   }
   cands.sort((a, b) => b.ageSec - a.ageSec);                      // tertua dulu (clear clog lama)
   log(`cleanup: ${totalDvp} DvpProposal aktif, ${cands.length} kandidat, ${pastExpiry} udah lewat settleBefore (harusnya auto-archive)`, COLOR.gray);
-  if (!cands.length) return 0;
-  // cancelSettlement id dari bundle (discoverActionIds). Pastikan ke-discover dulu.
+  // discover action ids (buat cancel + withdraw getDsoInfo/getOpenRound). Selalu,
+  // walau cands kosong (mungkin masih ada allocation nyangkut buat di-withdraw).
   if (!actionIdsVerified) await ensureActionIds(sv, partyId, '(cleanup)').catch(() => { });
-  let cancelled = 0;
+  // WITHDRAW DULU: unlock allocation nyangkut → dana balik + proposal LOCKED jadi
+  // bisa di-cancel di loop bawah (dana kita ke-lock = penyebab cancel FAILED).
+  let withdrawn = 0;
+  if (privy) { withdrawn = await withdrawStuckAllocations(sv, canton, privy, partyId, log).catch(() => 0); }
+  if (!cands.length) return withdrawn;
+  let cancelled = 0, alreadyDone = 0, failed = 0;
   const t0 = Date.now(), BUDGET_MS = 120000, MAX = 120, ANCIENT = 3600;
   for (const p of cands) {
     if (cancelled >= MAX || Date.now() - t0 > BUDGET_MS) break;
@@ -2288,16 +2438,117 @@ async function cleanupStaleProposals(sv, canton, partyId, log = () => { }) {
       }
     }
     const r = await sv.cancelSettlement(p.proposalId, partyId);
+    const emsg = ((r && (r._err || r.error || r.message)) || '').toString();
     if (r && !r._err && r.success !== false) {
       cancelled++;
       await sv.swapAction(SWAP.actionIds.recordEvent, [{ partyId, recordedByRole: 'buyer', eventType: 'cancel_buyer', result: 'cancelled', proposalId: p.proposalId, metadata: { source: 'cleanup' } }]).catch(() => { });
       log(`  cancelled ${p.proposalId.slice(0, 16)}… (${Math.round(p.ageSec)}s)`, COLOR.yellow);
+    } else if (/only pending|already|status (Cancelled|Settled|Rejected|Completed)/i.test(emsg)) {
+      // Udah Cancelled/Settled — cancel BUKAN alatnya. Yg cancelled-tapi-masih-aktif =
+      // alloc kita masih ke-lock → di-clear lewat withdraw (di atas), bukan cancel.
+      alreadyDone++;
     } else {
-      if (cancelled === 0) logDebug('cancelSettlement gagal (full)', { proposalId: p.proposalId, resp: r });
-      log(`  gagal cancel ${p.proposalId.slice(0, 16)}…: ${((r && (r._err || r.error || r.message)) || 'unknown').toString().slice(0, 200)}`, COLOR.red);
+      if (failed === 0) logDebug('cancelSettlement gagal (full)', { proposalId: p.proposalId, resp: r });
+      failed++;
+      log(`  gagal cancel ${p.proposalId.slice(0, 16)}…: ${emsg.slice(0, 160) || 'unknown'}`, COLOR.red);
     }
   }
-  return cancelled;
+  if (alreadyDone) log(`  ${alreadyDone} proposal udah Cancelled/Settled (skip — clear lewat withdraw/expire)`, COLOR.gray);
+  return cancelled + withdrawn;
+}
+// ── accessor row active_contracts (flat snake/camel ATAU wrapped contractEntry) ──
+function _acTemplateId(c) {
+  if (!c) return null;
+  if (c.templateId || c.template_id) return c.templateId || c.template_id;
+  const ce = c.contractEntry && c.contractEntry.JsActiveContract && c.contractEntry.JsActiveContract.createdEvent;
+  return (ce && ce.templateId) || null;
+}
+function _acBlob(c) {
+  if (!c) return null;
+  if (c.createdEventBlob || c.created_event_blob) return c.createdEventBlob || c.created_event_blob;
+  const ce = c.contractEntry && c.contractEntry.JsActiveContract && c.contractEntry.JsActiveContract.createdEvent;
+  return (ce && (ce.createdEventBlob || ce.created_event_blob)) || null;
+}
+function _acArg(c) {
+  if (!c) return {};
+  if (c.createArgument || c.create_argument) return c.createArgument || c.create_argument;
+  const ce = c.contractEntry && c.contractEntry.JsActiveContract && c.contractEntry.JsActiveContract.createdEvent;
+  return (ce && (ce.createArgument || ce.create_argument)) || {};
+}
+/**
+ * ROBUST drain DvpProposal stale (penyebab cap-200 → "Menunggu DvpProposal").
+ *
+ * Beda dari cleanupStaleProposals (pakai cancelSettlement server-action yg sering
+ * gagal & capped 120/2mnt 1-pass): ini ARCHIVE LANGSUNG di Canton via choice
+ * `DvpProposal_Reject {reason}` pada contract-nya sendiri, lalu RE-FETCH berulang
+ * sampai count<200 & gak ada expired lagi. active_contracts cap 200 → tiap putaran
+ * yg di-archive ke-replace yg ke-201, jadi loop ngabisin backlog berapa pun banyaknya.
+ *
+ * AMAN: cuma yg PUNYA KITA (proposer/counterparty == party) & udah lewat settleBefore
+ * (mati — gak akan settle). Withdraw allocation nyangkut DULU (unlock dana) biar
+ * reject gak ketahan lock + dana balik. Butuh privy (buat raw_sign). Return jumlah
+ * DvpProposal yg ke-reject + alloc yg ke-withdraw.
+ *
+ * templateId PER-CONTRACT (full package-id dari row), BUKAN '#name' (flaky) — Canton
+ * reject '#'-form di prepare ("Invalid Daml-LF Package ID 0x23") & wajib match blob.
+ */
+async function drainStaleDvpProposals(sv, canton, privy, partyId, log = () => { }) {
+  if (!canton) return 0;
+  if (!privy) { log('drain: butuh privy (raw_sign) — skip', COLOR.yellow); return 0; }
+  const TPL = SWAP.templateIds.dvpProposal;
+  const REASON = 'expired cleanup';
+  // unlock dana ke-lock dulu (allocation nyangkut) → dana balik + reject gak ketahan lock
+  let withdrawn = 0;
+  withdrawn = await withdrawStuckAllocations(sv, canton, privy, partyId, log).catch(() => 0);
+  let rejected = 0, failed = 0, round = 0;
+  const t0 = Date.now(), BUDGET_MS = 600000, MAX_ROUNDS = 60;
+  while (round < MAX_ROUNDS && Date.now() - t0 < BUDGET_MS) {
+    const list = await canton.activeContracts(TPL).catch(() => []);
+    const n = (list || []).length;
+    const cands = [];
+    for (const c of (list || [])) {
+      const ca = _acArg(c), terms = ca && ca.terms;
+      if (!terms) continue;
+      if (ca.proposer !== partyId && ca.counterparty !== partyId) continue; // bukan punya kita
+      const settleBeforeMs = Date.parse(terms.settleBefore) || 0;
+      if (!settleBeforeMs || settleBeforeMs >= Date.now()) continue;        // belum lewat settleBefore → SKIP (mungkin in-flight)
+      const cid = _acContractId(c), tpl = _acTemplateId(c), blob = _acBlob(c);
+      if (cid && tpl && blob) cands.push({ cid, tpl, blob });
+    }
+    log(`drain round ${round}: ${n} DvpProposal aktif, ${cands.length} expired (mati)`, COLOR.gray);
+    if (n < 200 && !cands.length) { log('  ✓ cap-200 kebuka — gak ada stale lagi', COLOR.green); break; }
+    if (!cands.length) { log('  gak ada kandidat expired lagi (sisanya mungkin in-flight) — stop', COLOR.yellow); break; }
+    const rejectedAtRoundStart = rejected;
+    for (const k of cands) {
+      if (Date.now() - t0 > BUDGET_MS) { log('  budget habis — jalanin cleanup lagi buat sisanya', COLOR.yellow); break; }
+      const body = {
+        commands: [{ ExerciseCommand: { templateId: k.tpl, contractId: k.cid, choice: 'DvpProposal_Reject', choiceArgument: { reason: REASON } } }],
+        disclosedContracts: [{ templateId: k.tpl, contractId: k.cid, createdEventBlob: k.blob, synchronizerId: SWAP.synchronizerId }],
+      };
+      try {
+        const prep = await canton.prepareTransaction(body);
+        if (!prep || !prep.hash) throw new Error('no hash');
+        const hashHex = b64HashToHex(prep.hash);
+        let sub = null;
+        const tries = Math.max(1, (privy.walletCandidates && privy.walletCandidates.length) || 1) + 1;
+        for (let st = 1; st <= tries; st++) {
+          const sigRaw = await privy.rawSign(hashHex);
+          try { sub = await canton.submitPrepared({ hash: prep.hash, signature: sigToB64(sigRaw) }); break; }
+          catch (e) { if (/bad signature/i.test((e && e.message) || '') && privy.nextWallet && privy.nextWallet()) continue; throw e; }
+        }
+        if (sub && sub.submissionId) { rejected++; if (rejected % 25 === 0 || rejected === 1) log(`  reject ${rejected}…`, COLOR.green); }
+        else failed++;
+      } catch (e) {
+        const msg = ((e && e.message) || e).toString();
+        // CONTRACT_NOT_FOUND = ke-archive duluan (race) → harmless, lanjut
+        if (!/CONTRACT_NOT_FOUND|could not be found/i.test(msg)) { failed++; if (failed <= 3) log(`  reject ${k.cid.slice(0, 14)}… gagal: ${msg.slice(0, 120)}`, COLOR.red); }
+      }
+    }
+    if (rejected === rejectedAtRoundStart) { log('  ronde ini 0 progress (kandidat nolak terus) — stop biar gak spin', COLOR.yellow); break; }
+    round++;
+  }
+  log(`drain selesai: ${rejected} DvpProposal di-reject, ${failed} gagal, ${withdrawn} alloc di-withdraw`, rejected ? COLOR.green : COLOR.yellow);
+  return rejected + withdrawn;
 }
 // fetch saldo → update state.balances (utk dashboard) + return saldo TOKEN aktif
 // (USDCx / cETH) unlocked. tokenId dari SWAP.tokenId (di-set per pair aktif).
@@ -2364,7 +2615,7 @@ async function runDayTraderSession(reason) {
         // Aktifin lagi via config.swap.autoCancelStale=true kalau udah fix. User
         // bersihin manual (browser) dulu, bot tinggal swap.
         if (SWAP.autoCancelStale) {
-          const cleaned = await cleanupStaleProposals(sv, clients.canton, partyId, (m, c) => logActivity(`[${tag}] ${m}`, c)).catch(e => { logActivity(`[${tag}] cleanup error: ${(e && e.message) || e}`, COLOR.yellow); return 0; });
+          const cleaned = await cleanupStaleProposals(sv, clients.canton, partyId, (m, c) => logActivity(`[${tag}] ${m}`, c), clients.privy).catch(e => { logActivity(`[${tag}] cleanup error: ${(e && e.message) || e}`, COLOR.yellow); return 0; });
           if (cleaned) logActivity(`[${tag}] cleanup ${cleaned} proposal nyangkut di-cancel`, COLOR.green);
         }
 
@@ -2569,19 +2820,38 @@ async function runDayTraderSession(reason) {
             logActivity(`[${tag}] Swap ${label} submitted ✓ menunggu settle…`, COLOR.green);
             render(global.__states);
 
-            // Poll DAY_TRADER bertahap: 15s, 20s, lalu 30s (3x). Berhenti begitu
-            // count naik on-chain (settle bisa telat). Total tunggu max 125s.
-            const SYNC_WAITS = [15000, 20000, 30000, 30000, 30000];
+            // Poll DAY_TRADER sampai CONFIRMED on-chain — INFINITE (user request).
+            // res.ok = settlement tx udah submit+complete on-chain; ini cuma nunggu
+            // counter earn-hub catch-up (bisa telat menit-an). Jangan nyerah di 5 cek.
+            // Cek cepat awal [15s,20s,30s], lalu steady (default 30s) selamanya sampai:
+            //   - count NAIK (settle ke-register), ATAU
+            //   - overcap & count SATURATED (>=target → gak bakal naik lagi, settle pasti
+            //     kelar via res.ok), ATAU
+            //   - cap opsional SWAP.settleWaitMaxMin (default 0 = infinite).
+            // Token di-refresh tiap iterasi (wait panjang → Privy token ~1jam expired).
+            const SYNC_WAITS = [15000, 20000, 30000];
+            const STEADY_MS = Math.max(10000, (Number(SWAP.settleSyncSec) || 30) * 1000);
+            const MAX_WAIT_MS = Math.max(0, Number(SWAP.settleWaitMaxMin) || 0) * 60000;
             let realDt = null;
-            for (let r = 0; r < SYNC_WAITS.length; r++) {
-              const w = SYNC_WAITS[r];
-              logActivity(`[${tag}] Sync DAY_TRADER… (cek ${r + 1}/${SYNC_WAITS.length}, tunggu ${Math.round(w / 1000)}s)`, COLOR.gray);
+            const tStart = Date.now();
+            for (let r = 0; ; r++) {
+              const w = r < SYNC_WAITS.length ? SYNC_WAITS[r] : STEADY_MS;
+              logActivity(`[${tag}] Sync DAY_TRADER… (cek ${r + 1}, tunggu ${Math.round(w / 1000)}s, sampai confirmed)`, COLOR.gray);
               await sleep(w);
+              try {
+                const fr = await ensureFreshClients(state, clients);
+                if (fr !== clients) { clients = fr; ({ sv, partyId, identityToken, proxy } = clients); }
+              } catch (_) { }
               realDt = await fetchDayTrader(sv, partyId).catch(() => null);
               if (realDt) state.dayTrader = { count: realDt.current, target: realDt.target };
               await refreshBalances(state, identityToken, proxy);
               render(global.__states);
-              if (realDt && realDt.current > baseCount) break; // sudah settle on-chain
+              if (realDt && realDt.current > baseCount) break;                          // ✓ settle ke-register on-chain
+              if (SWAP.allowOvercap && realDt && realDt.current >= realDt.target) break; // saturated — count gak bakal naik
+              if (MAX_WAIT_MS && Date.now() - tStart > MAX_WAIT_MS) {                    // cap opsional (default OFF)
+                logActivity(`[${tag}] settle belum ke-register ${Math.round(MAX_WAIT_MS / 60000)} mnt — lanjut (cap settleWaitMaxMin)`, COLOR.yellow);
+                break;
+              }
             }
             return realDt;
           };
@@ -2717,7 +2987,7 @@ async function runDayTraderSession(reason) {
               logActivity(`[${tag}] fee spike ${e.feeCC} CC > ${SWAP.maxFeeCC} CC — TUNDA swap, cek lagi ${Math.round(waitS / 60)} mnt`, COLOR.yellow);
               // Bersihin proposal sisa fee-spike (gated — cancelSettlement masih gagal).
               if (SWAP.autoCancelStale) {
-                const c = await cleanupStaleProposals(sv, clients.canton, partyId).catch(() => 0);
+                const c = await cleanupStaleProposals(sv, clients.canton, partyId, undefined, clients.privy).catch(() => 0);
                 if (c) logActivity(`[${tag}] cleanup ${c} proposal sisa fee-spike`, COLOR.gray);
               }
               await refreshBalances(state, identityToken, proxy);
@@ -2907,7 +3177,7 @@ async function pollDashboardCommands() {
       } else if (cmd.type === 'cleanup') {
         logActivity('Dashboard: cleanup proposal nyangkut', COLOR.cyan);
         for (const st of (global.__states || [])) {
-          try { const c = await buildSwapClients(st); await cleanupStaleProposals(c.sv, c.canton, c.partyId); } catch (_) { }
+          try { const c = await buildSwapClients(st); await cleanupStaleProposals(c.sv, c.canton, c.partyId, undefined, c.privy); } catch (_) { }
         }
       } else if (cmd.type === 'set_modal') {
         const a = cmd.args || {};
@@ -3195,6 +3465,83 @@ Usage:
       }
       process.exit(0);
     })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
+  } else if (argv[0] === 'diag') {
+    // `node index.js diag [idx]` — DUMP struktur ledger asli (read-only) ke diag-out.json
+    // buat cari tau kenapa proposal nyangkut: status DvpProposal, jumlah Allocation,
+    // shape getDsoInfo/getOpenRound. GAK ngubah apa-apa.
+    (async () => {
+      const idx = Number(argv[1] || 0);
+      const a = ACCOUNTS[idx];
+      if (!a) { console.error(paint(`akun idx ${idx} gak ada (total ${ACCOUNTS.length})`, COLOR.red)); process.exit(1); }
+      const state = makeStates()[idx];
+      process.stdout.write(paint(`DIAG ${a.label || a.email}…\n`, COLOR.cyan));
+      const { sv, canton, partyId } = await buildSwapClients(state);
+      const out = { account: a.label || a.email, partyId, ts: new Date().toISOString() };
+      // DvpProposal active_contracts
+      const dvps = await canton.activeContracts(SWAP.templateIds.dvpProposal).catch(e => ({ _err: (e && e.message) || String(e) }));
+      if (Array.isArray(dvps)) {
+        out.dvpCount = dvps.length;
+        out.dvpRowKeys = dvps[0] ? Object.keys(dvps[0]) : [];
+        out.dvpCreateArgKeys = (dvps[0] && dvps[0].createArgument) ? Object.keys(dvps[0].createArgument) : [];
+        const statusCount = {};
+        let mineProposer = 0, mineCounter = 0;
+        for (const c of dvps) {
+          const ca = c.createArgument || {};
+          const status = ca.status || (ca.terms && ca.terms.status) || ca.state || '(no-status-field)';
+          statusCount[String(status)] = (statusCount[String(status)] || 0) + 1;
+          if (ca.proposer === partyId) mineProposer++;
+          if (ca.counterparty === partyId) mineCounter++;
+        }
+        out.dvpStatusCount = statusCount;
+        out.dvpMineProposer = mineProposer;
+        out.dvpMineCounter = mineCounter;
+        out.dvpSampleFull = dvps.slice(0, 2).map(c => c.createArgument);
+      } else out.dvpErr = dvps;
+      // RAW probe helper (pakai identity token canton)
+      const idTok = (acctSession(a.email).privy || {}).token;
+      const px = getProxy(a.email);
+      const tryGet = async (qs) => { try { const r = await request('GET', `${SUPA}/active_contracts?${qs}`, { headers: supaHeaders(idTok), timeoutMs: 20000, proxy: px }); return { status: r.status, n: Array.isArray(r.json) ? r.json.length : (r.json ? 'obj' : (r.text || '').slice(0, 100)) }; } catch (e) { return { err: (e && e.message) || String(e) }; } };
+      // Allocation interface — coba beberapa format query (yg lama 400)
+      const HOLD = '#splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:Holding';
+      out.allocVariants = {
+        'templateIds=alloc': await tryGet('templateIds=' + encodeURIComponent(ALLOCATION_IFACE)),
+        'interfaceIds=alloc': await tryGet('interfaceIds=' + encodeURIComponent(ALLOCATION_IFACE)),
+        'interfaceIds=holding': await tryGet('interfaceIds=' + encodeURIComponent(HOLD)),
+        'templateIds=holding': await tryGet('templateIds=' + encodeURIComponent(HOLD)),
+      };
+      // DUMP row interface alloc ASLI (cari field cid yg bener) + test 1 withdraw.
+      try {
+        const ra = await request('GET', `${SUPA}/active_contracts?interfaceIds=${encodeURIComponent(ALLOCATION_IFACE)}`, { headers: supaHeaders(idTok), timeoutMs: 20000, proxy: px });
+        const arr = Array.isArray(ra.json) ? ra.json : [];
+        out.allocIfaceCount = arr.length;
+        out.allocIfaceSample = arr.slice(0, 1); // FULL 1 row → liat struktur
+      } catch (e) { out.allocIfaceErr = (e && e.message) || String(e); }
+      // TEST 1 withdraw prepare (capture error FULL) — pakai getDsoInfo context.
+      try { await sv.discoverActionIds(); } catch (_) { }
+      const dsoT = await sv.swapAction(SWAP.actionIds.getDsoInfo, []).catch(e => ({ _err: (e && e.message) }));
+      const arc = _normContract(dsoT && dsoT.amulet_rules && dsoT.amulet_rules.contract);
+      const omc = _normContract(dsoT && dsoT.latest_mining_round && dsoT.latest_mining_round.contract);
+      const testCid = (out.allocIfaceSample && out.allocIfaceSample[0] && _acContractId(out.allocIfaceSample[0]));
+      out.withdrawTest = { testCid, arc: !!(arc && arc.contractId), omc: !!(omc && omc.contractId) };
+      if (testCid && arc && omc) {
+        const body = { commands: [{ ExerciseCommand: { templateId: ALLOCATION_IFACE, contractId: testCid, choice: 'Allocation_Withdraw', choiceArgument: { extraArgs: { context: { values: { 'expire-lock': { tag: 'AV_Bool', value: true }, 'amulet-rules': { tag: 'AV_ContractId', value: arc.contractId }, 'open-round': { tag: 'AV_ContractId', value: omc.contractId } } }, meta: { values: {} } } } } }], disclosedContracts: [{ templateId: omc.templateId, contractId: omc.contractId, createdEventBlob: omc.createdEventBlob, synchronizerId: SWAP.synchronizerId }, { templateId: arc.templateId, contractId: arc.contractId, createdEventBlob: arc.createdEventBlob, synchronizerId: SWAP.synchronizerId }] };
+        try { const pr = await request('POST', `${SUPA}/prepare_transaction`, { headers: supaHeaders(idTok), body: JSON.stringify(body), timeoutMs: 30000, proxy: px }); out.withdrawTest.prepStatus = pr.status; out.withdrawTest.prepBody = (pr.text || '').slice(0, 600); } catch (e) { out.withdrawTest.prepErr = (e && e.message) || String(e); }
+      }
+      // open round dari getDsoInfo (getOpenRound action 404) → pakai latest_mining_round
+      // getDsoInfo / getOpenRound raw (force discover dulu)
+      try { await sv.discoverActionIds(); } catch (_) { }
+      out.idDso = SWAP.actionIds.getDsoInfo; out.idOmr = SWAP.actionIds.getOpenRound;
+      out.getDsoInfo = await sv.swapAction(SWAP.actionIds.getDsoInfo, []).catch(e => ({ _err: (e && e.message) || String(e) }));
+      out.getOpenRound = await sv.swapAction(SWAP.actionIds.getOpenRound, []).catch(e => ({ _err: (e && e.message) || String(e) }));
+      const fp = path.join(ROOT, 'diag-out.json');
+      fs.writeFileSync(fp, JSON.stringify(out, null, 2));
+      process.stdout.write(paint(`\n✓ ditulis ${fp}\n`, COLOR.green));
+      process.stdout.write(`  DvpProposal=${out.dvpCount} (proposer=${out.dvpMineProposer} counter=${out.dvpMineCounter})\n`);
+      process.stdout.write(`  allocVariants=${JSON.stringify(out.allocVariants)}\n`);
+      process.stdout.write(`  byCid=${JSON.stringify(out.byCid || null)}\n`);
+      process.stdout.write(`  miningRound.contract=${out.getDsoInfo && out.getDsoInfo.latest_mining_round && out.getDsoInfo.latest_mining_round.contract ? 'OK' : 'MISSING'}\n`);
+      process.exit(0);
+    })().catch(e => { console.error(paint('DIAG FATAL: ' + (e && e.stack || e), COLOR.red)); process.exit(1); });
   } else if (argv[0] === 'cleanup') {
     // `node index.js cleanup` — cancel proposal nyangkut yg 0 dana kita kekunci
     // (stage<9, belum settle, alloc kita kosong, umur >90s). Aman: gak ada dana
@@ -3203,9 +3550,9 @@ Usage:
       const a = ACCOUNTS[0];
       if (!a) { console.error(paint('accounts.json kosong', COLOR.red)); process.exit(1); }
       const state = makeStates()[0];
-      const { sv, canton, partyId } = await buildSwapClients(state);
-      const n = await cleanupStaleProposals(sv, canton, partyId, (m, c) => process.stdout.write(paint(m, c || COLOR.gray) + '\n'));
-      process.stdout.write(paint(`\ncleanup selesai — ${n} proposal di-cancel\n`, COLOR.green));
+      const { sv, canton, partyId, privy } = await buildSwapClients(state);
+      const n = await cleanupStaleProposals(sv, canton, partyId, (m, c) => process.stdout.write(paint(m, c || COLOR.gray) + '\n'), privy);
+      process.stdout.write(paint(`\ncleanup selesai — ${n} proposal dibersihin (cancel + withdraw)\n`, COLOR.green));
       process.exit(0);
     })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
   } else if (argv[0] === 'feecheck') {
@@ -3245,7 +3592,7 @@ Usage:
         }
       }
       // Auto-cleanup: reject proposal yg dibuat dry-run (0 dana kelock) biar 0 sisa.
-      const n = await cleanupStaleProposals(clients.sv, clients.canton, clients.partyId).catch(() => 0);
+      const n = await cleanupStaleProposals(clients.sv, clients.canton, clients.partyId, undefined, clients.privy).catch(() => 0);
       if (n) process.stdout.write(paint(`  ${n} proposal nyangkut dibersihin\n`, COLOR.green));
       process.exit(0);
     })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
@@ -3257,9 +3604,14 @@ Usage:
       process.stdout.write(paint('  1) swap CC→USDCx  — dashboard + auto DAY_TRADER (pair USDCx)', COLOR.gray) + '\n');
       process.stdout.write(paint('  2) check balance  — cek CC, USDCx & cETH semua akun', COLOR.gray) + '\n');
       process.stdout.write(paint('  3) run (OTP urut) — login akun 1-per-1 (OTP gak tabrakan) lalu run USDCx', COLOR.gray) + '\n');
-      const ans = (await prompt(paint('pilih [0/1/2/3]: ', COLOR.bold))).trim();
+      process.stdout.write(paint('  4) change wallet  — ganti wallet supa 1 akun (hapus lama → login email supa baru)', COLOR.gray) + '\n');
+      process.stdout.write(paint('  5) cleanup        — bersihin DvpProposal stale nyangkut di 1 akun', COLOR.gray) + '\n');
+      const ans = (await prompt(paint('pilih [0/1/2/3/4/5]: ', COLOR.bold))).trim();
       if (ans === '2') {
         const states = makeStates();
+        const tot = { cc: { u: 0, l: 0 }, usdcx: { u: 0, l: 0 }, ceth: { u: 0, l: 0 } };
+        let okCount = 0;
+        const fmt = (b) => paint(fmtNum(b.unlocked), COLOR.green) + (b.locked > 1e-8 ? paint(' (+' + fmtNum(b.locked) + ' locked)', COLOR.gray) : '');
         for (const s of states) {
           process.stdout.write('\n' + paint('▎ ' + (s.label || s.email), COLOR.bold + COLOR.cyan) + '\n');
           try {
@@ -3270,7 +3622,10 @@ Usage:
             const cc = balanceOf(s, 'amulet');
             const usdcx = balanceOf(s, 'usdcx');
             const ceth = balanceOf(s, 'ceth');
-            const fmt = (b) => paint(fmtNum(b.unlocked), COLOR.green) + (b.locked > 1e-8 ? paint(' (+' + fmtNum(b.locked) + ' locked)', COLOR.gray) : '');
+            tot.cc.u += cc.unlocked; tot.cc.l += cc.locked;
+            tot.usdcx.u += usdcx.unlocked; tot.usdcx.l += usdcx.locked;
+            tot.ceth.u += ceth.unlocked; tot.ceth.l += ceth.locked;
+            okCount++;
             process.stdout.write('  CC    : ' + fmt(cc) + '\n');
             process.stdout.write('  USDCx : ' + fmt(usdcx) + '\n');
             process.stdout.write('  cETH  : ' + fmt(ceth) + '\n');
@@ -3278,6 +3633,10 @@ Usage:
             process.stdout.write(paint('  ERROR: ' + ((e && e.message) || e) + '\n', COLOR.red));
           }
         }
+        process.stdout.write('\n' + paint(`═══ GRAND TOTAL (${okCount}/${states.length} akun) ═══`, COLOR.bold + COLOR.cyan) + '\n');
+        process.stdout.write('  CC    : ' + fmt({ unlocked: tot.cc.u, locked: tot.cc.l }) + '\n');
+        process.stdout.write('  USDCx : ' + fmt({ unlocked: tot.usdcx.u, locked: tot.usdcx.l }) + '\n');
+        process.stdout.write('  cETH  : ' + fmt({ unlocked: tot.ceth.u, locked: tot.ceth.l }) + '\n');
         process.stdout.write('\n');
         process.exit(0);
       }
@@ -3303,6 +3662,72 @@ Usage:
           }
         }
         process.stdout.write('\n' + paint(`Login selesai: ${ok} OK, ${fail} gagal. Lanjut run…`, fail ? COLOR.yellow : COLOR.green) + '\n');
+      }
+      if (ans === '4') {
+        // Ganti wallet supa 1 akun: hapus wallet lama (privy login + walletId + party +
+        // userServiceCid), login email supa BARU (OTP), re-derive party/wallet via
+        // buildSwapClients. passkey + cookie Silvana TETAP (identitas akun gak berubah).
+        process.stdout.write('\n' + paint('Ganti wallet supa — pilih akun:', COLOR.bold + COLOR.cyan) + '\n');
+        ACCOUNTS.forEach((a, i) => process.stdout.write(paint(`  ${i}) ${a.label || a.email}  (supa: ${a.privyEmail || a.email})`, COLOR.gray) + '\n'));
+        const idx = Number((await prompt(paint(`pilih akun [0-${ACCOUNTS.length - 1}]: `, COLOR.bold))).trim());
+        if (!Number.isInteger(idx) || idx < 0 || idx >= ACCOUNTS.length) { console.error(paint('pilihan gak valid', COLOR.red)); process.exit(1); }
+        const acct = ACCOUNTS[idx];
+        const newEmail = (await prompt(paint(`email supa baru utk ${acct.label || acct.email}: `, COLOR.bold))).trim().toLowerCase();
+        if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(newEmail)) { console.error(paint('format email gak valid', COLOR.red)); process.exit(1); }
+        // backup session.json
+        const bak = `session.json.bak-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+        try { fs.copyFileSync(SESS_PATH, bak); process.stdout.write(paint(`backup: ${bak}\n`, COLOR.gray)); } catch (_) { }
+        // hapus wallet supa lama (keep passkey + silvanaCookies)
+        const store = loadStore();
+        if (store[acct.email]) { for (const f of ['privy', 'privyWalletId', 'partyId', 'userServiceCid']) delete store[acct.email][f]; saveStore(store); }
+        process.stdout.write(paint(`  wallet supa lama dihapus utk ${acct.email}\n`, COLOR.green));
+        // update privyEmail di accounts.json (persist) + in-memory
+        const data = loadJSON(ACC_PATH, { accounts: [] });
+        const entry = (data.accounts || []).find(x => x.email === acct.email);
+        if (entry) { entry.privyEmail = newEmail; saveJSON(ACC_PATH, data); }
+        acct.privyEmail = newEmail;
+        // login OTP email baru + re-derive party/wallet
+        const state = { email: acct.email, privyEmail: newEmail, label: acct.label, status: 'idle', message: '' };
+        global.__states = [state];
+        process.stdout.write('\n' + paint(`Login supa baru ${newEmail} (tunggu OTP)…`, COLOR.cyan) + '\n');
+        try {
+          const clients = await buildSwapClients(state);
+          let usc = null;
+          try { const party = await clients.sv.recoverParty(clients.partyId); if (party && party.userServiceCid) { usc = party.userServiceCid; patchAcctSession(acct.email, { userServiceCid: usc }); } } catch (_) { }
+          process.stdout.write('\n' + paint('✓ wallet supa baru aktif', COLOR.bold + COLOR.green) + '\n');
+          process.stdout.write(paint(`  supa email     : ${newEmail}\n`, COLOR.gray));
+          process.stdout.write(paint(`  partyId        : ${clients.partyId}\n`, COLOR.gray));
+          process.stdout.write(paint(`  walletId       : ${(clients.privy && clients.privy.wallet && clients.privy.wallet.id) || '-'}\n`, COLOR.gray));
+          process.stdout.write(paint(`  userServiceCid : ${usc || '(auto-recover saat swap)'}\n`, COLOR.gray));
+        } catch (e) {
+          console.error(paint('ganti wallet gagal: ' + ((e && e.message) || e), COLOR.red));
+          console.error(paint(`restore session lama: cp ${bak} session.json`, COLOR.yellow));
+          process.exit(1);
+        }
+        process.exit(0);
+      }
+      if (ans === '5') {
+        // Cleanup DvpProposal stale nyangkut di 1 akun (archive yg 0-dana, tua>120s).
+        // Gantiin "ganti wallet" buat akun yg kena cap-200 "Menunggu DvpProposal".
+        process.stdout.write('\n' + paint('Cleanup — pilih akun:', COLOR.bold + COLOR.cyan) + '\n');
+        ACCOUNTS.forEach((a, i) => process.stdout.write(paint(`  ${i}) ${a.label || a.email}`, COLOR.gray) + '\n'));
+        const idx = Number((await prompt(paint(`pilih akun [0-${ACCOUNTS.length - 1}]: `, COLOR.bold))).trim());
+        if (!Number.isInteger(idx) || idx < 0 || idx >= ACCOUNTS.length) { console.error(paint('pilihan gak valid', COLOR.red)); process.exit(1); }
+        const acct = ACCOUNTS[idx];
+        const state = { email: acct.email, privyEmail: acct.privyEmail || null, label: acct.label, status: 'idle', message: '' };
+        global.__states = [state];
+        process.stdout.write('\n' + paint(`Cleanup ${acct.label || acct.email}…`, COLOR.cyan) + '\n');
+        try {
+          const { sv, canton, partyId, privy } = await buildSwapClients(state);
+          const before = (await canton.activeContracts(SWAP.templateIds.dvpProposal).catch(() => [])).length;
+          const n = await drainStaleDvpProposals(sv, canton, privy, partyId, (m, c) => process.stdout.write(paint('  ' + m, c || COLOR.gray) + '\n'));
+          const after = (await canton.activeContracts(SWAP.templateIds.dvpProposal).catch(() => [])).length;
+          process.stdout.write('\n' + paint(`✓ cleanup selesai — ${n} dibersihin reject+withdraw (DvpProposal ${before} → ${after})`, COLOR.bold + COLOR.green) + '\n');
+        } catch (e) {
+          console.error(paint('cleanup gagal: ' + ((e && e.message) || e), COLOR.red));
+          process.exit(1);
+        }
+        process.exit(0);
       }
       const pair = setActivePair(ans === '0' ? 'ceth' : 'usdcx');
       process.stdout.write('\n' + paint(`Pair aktif: ${pair.market} (CC↔${pair.tokenLabel})`, COLOR.bold + COLOR.cyan) + '\n');
