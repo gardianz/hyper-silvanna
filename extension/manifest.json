@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "SilvanaBot — Register Passkey",
+  "version": "1.0.0",
+  "description": "Daftarkan passkey kustom SilvanaBot dari app.silvana.one tanpa buka DevTools. Hasilnya 1 klik copy, tinggal paste ke 'node index.js paste'.",
+  "permissions": ["scripting", "activeTab"],
+  "host_permissions": ["https://app.silvana.one/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "SilvanaBot — Register Passkey"
+  }
+}

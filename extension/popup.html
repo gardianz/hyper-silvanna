@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <title>SilvanaBot — Register Passkey</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { width: 360px; margin: 0; padding: 14px; background: #12141a; color: #e6e8ee;
+           font: 13px/1.5 ui-sans-serif, system-ui, "Segoe UI", sans-serif; }
+    h1 { font-size: 14px; margin: 0 0 2px; color: #7dd3fc; }
+    .sub { font-size: 11px; color: #8b93a7; margin-bottom: 12px; }
+    button { width: 100%; padding: 9px 12px; margin-top: 8px; border: 0; border-radius: 7px;
+             font: inherit; font-weight: 600; cursor: pointer; background: #2563eb; color: #fff; }
+    button:hover:not(:disabled) { background: #1d4ed8; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    button.alt { background: #2a2f3a; color: #cbd2e0; }
+    button.alt:hover:not(:disabled) { background: #353b49; }
+    #status { margin-top: 10px; padding: 9px 10px; border-radius: 7px; font-size: 12px;
+              white-space: pre-wrap; word-break: break-word; display: none; }
+    #status.info { display: block; background: #1b2436; color: #9fc3ff; }
+    #status.ok   { display: block; background: #10281a; color: #86efac; }
+    #status.err  { display: block; background: #2a1418; color: #fca5a5; }
+    #result { display: none; margin-top: 10px; }
+    #json { width: 100%; height: 88px; box-sizing: border-box; resize: vertical; font: 11px/1.4 ui-monospace, monospace;
+            background: #0c0e13; color: #b9c2d4; border: 1px solid #262b36; border-radius: 7px; padding: 7px; }
+    .warn { margin-top: 8px; padding: 8px 10px; border-radius: 7px; background: #2b2109; color: #fcd34d; font-size: 11px; }
+    .steps { margin: 8px 0 0; padding-left: 16px; color: #7f8aa3; font-size: 11px; }
+    code { background: #0c0e13; padding: 1px 5px; border-radius: 4px; color: #93c5fd; }
+  </style>
+</head>
+<body>
+  <h1>SilvanaBot — Register Passkey</h1>
+  <div class="sub">Buat passkey kustom di akun Silvana yang sedang login di tab aktif.</div>
+
+  <button id="go">Daftarkan Passkey</button>
+  <div id="status"></div>
+  <ul class="steps" id="steps" hidden></ul>
+
+  <div id="result">
+    <textarea id="json" readonly spellcheck="false"></textarea>
+    <div class="warn">Berisi <b>private key</b> passkey. Jangan kirim ke siapa pun — cuma tempel ke terminal bot sendiri.</div>
+    <button id="copy">Copy JSON</button>
+    <button id="dl" class="alt">Download .json</button>
+    <div class="sub" style="margin:10px 0 0">
+      Di mesin bot jalankan <code>node index.js paste</code>, tempel, Enter.
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

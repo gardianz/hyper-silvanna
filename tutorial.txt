@@ -81,6 +81,28 @@ Set proxy.enabled = false di config.json untuk paksa direct.
 Bot perlu passkey kustom yang private key-nya ada di sisi kita,
 supaya bisa login Silvana sendiri tanpa Touch ID.
 
+── CARA A: EKSTENSI CHROME (disarankan, tanpa DevTools) ──
+
+Pasang sekali:
+  1. Buka chrome://extensions (Brave: brave://extensions)
+  2. Aktifkan "Developer mode"
+  3. "Load unpacked" → pilih folder extension/ di repo ini
+  4. Pin ikonnya
+
+Per akun:
+  a) Login akun di https://app.silvana.one
+  b) Klik ikon ekstensi → "Daftarkan Passkey"
+  c) Klik "Copy JSON"  (atau "Download .json")
+  d) Di mesin bot:
+       node index.js paste                # tempel JSON, Enter
+       node index.js paste hasil.json     # kalau tadi Download lalu di-scp ke VPS
+
+  Ganti akun di browser, ulangi a–d.
+
+  Detail + troubleshooting: extension/README.md
+
+── CARA B: SCRIPT CONSOLE (fallback) ──
+
 a) Login Silvana via browser seperti biasa (Touch ID / 1Password):
      https://app.silvana.one
 
@@ -101,6 +123,10 @@ g) Selesai. Bot simpan passkey & userServiceCid ke session.json
    (jangan share file ini, berisi private key).
 
 Ulangi a-f untuk setiap akun.
+
+CATATAN KEAMANAN: JSON hasil register berisi PRIVATE KEY passkey.
+Siapa pun yang punya file itu bisa login sebagai akun tersebut.
+Jangan tempel ke chat/issue/pastebin.
 
 
 ────────────────────────────────────────

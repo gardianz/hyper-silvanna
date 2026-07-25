@@ -10,6 +10,10 @@ proxy-assignments.json
 !config.example.json
 !proxy.example.txt
 
+# Generated at runtime — cache next-action ID hasil discoverActionIds(), berubah
+# tiap Silvana redeploy. Percuma di-commit, bikin konflik antar mesin.
+action_ids.json
+
 # Node
 node_modules/
 __MACOSX/

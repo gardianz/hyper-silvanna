@@ -234,11 +234,30 @@ const M8 = {
   // Haircut FIXED (terminal fee tetap = maker 0.1%). Ganti reduce ADAPTIF RFQ lama:
   // rf = 1 − haircut, dipakai pre-reduce max-dump + estimasi net-gate. Default 0.001 (0.1%).
   haircut: _m8num(_m8.haircut, 0.001),
-  // Aggressive cross market order (FOK): BUY price = ref×(1+cross), SELL = ref×(1−cross).
-  // PENTING sizing BUY: order dibayar cETH di ref×(1+cross) → size edelxQty di harga ORDER
-  // (bagi 1+cross), BUKAN di ref. Kalau enggak, cost cETH 2% > saldo → insufficient → retry
-  // −1% tiap swap (bug). Default 0.02 (2%). Turunin buat spread lebih ketat (risiko gak fill).
-  orderCross: _m8num(_m8.orderCross, 0.02),
+  // PENETRASI harga lewat best price ORDERBOOK (bukan deviasi dari feed cross-rate).
+  // BUY  = bestAsk×(1+cross)  → nyeberang ask, langsung jadi taker.
+  // SELL = bestBid×(1−cross)  → nyeberang bid, langsung jadi taker.
+  // Cukup kecil (default 0.001 = 0.1%) karena base-nya UDAH harga book yg bisa match —
+  // dulu 0.02 dipakai buat nutup gap feed cross-rate yg meleset ~3.6% (dan tetap gagal).
+  // PENTING sizing BUY: cost cETH = qty × harga ORDER → size dibagi (1+cross) di harga book.
+  orderCross: _m8num(_m8.orderCross, 0.001),
+  // timeInForce order terminal. GTD = kayak GTC (nempel di book, boleh partial fill)
+  // TAPI mati sendiri di expiresAt → order gak jadi zombie kalau bot mati (Ctrl+C /
+  // crash / reboot) di antara submitOrder dan cancelOrder. Server dukung GTC/IOC/FOK/GTD
+  // (dari bundle: GTD = "Good Till Date - expires at specified time").
+  orderTif: String(_m8.orderTif || 'GTD').toUpperCase(),
+  // Umur order buat GTD (detik). Cuma jaring pengaman — jalur normal tetap cancelOrder
+  // dalam ~30s. Jangan kependekan: order kudu masih hidup selama poll proposal
+  // (orderWaitSec) + grace.
+  orderTtlSec: _m8num(_m8.orderTtlSec, 120),
+  // Lama nunggu order ke-match (detik) sebelum dianggap gak ada likuiditas → cancelOrder.
+  orderWaitSec: _m8num(_m8.orderWaitSec, 30),
+  // Grace setelah proposal PERTAMA muncul: kasih waktu chunk lain (split multi-maker)
+  // nyusul sebelum kita cancel sisa order.
+  orderGraceMs: _m8num(_m8.orderGraceMs, 3000),
+  // Baca book varian lpOnly (sama kayak toggle "LP-only matching" di UI). Bot kirim
+  // requirements.lpOnly=true → HARUS baca book LP biar harga konsisten sama yg bisa match.
+  bookLpOnly: _m8.bookLpOnly !== false,
   taskCode: String(_m8.taskCode || _m8sw.edelCethTaskCode || '').toUpperCase(),
   // allowOvercap (kayak opsi 0/1): false = stop pas task 'EDELx-cETH Daily Trader'
   // penuh (10/10). true = boleh swap LEBIH dari task target sampai dailySwapCount
@@ -524,6 +543,12 @@ function rotateProxy(email) {
   _proxyOffset[email] = ((_proxyOffset[email] || 0) + 1) % PROXIES.length;
   return getProxy(email);
 }
+// Index percobaan login TERAKHIR saat rotate proxy (0..2 tergantung jumlah proxy).
+// Math.max(0, …) WAJIB: tanpa proxy (PROXIES kosong) Math.min(-1, 2) = -1, jadi loop
+// `pb <= -1` GAK PERNAH jalan sekalipun → `clients` tetap undefined → langsung crash
+// "Cannot destructure property 'sv' of 'clients' as it is undefined". Bug ini gak
+// pernah kelihatan di VPS karena di sana proxy.txt selalu keisi.
+function proxyTryMax() { return Math.max(0, Math.min(PROXIES.length - 1, 2)); }
 function isProxyErr(e) {
   const m = (e && e.message) || String(e);
   return /proxy connect timeout|proxy CONNECT failed/i.test(m);
@@ -894,6 +919,26 @@ function toScaled(s) { const [i, f = ''] = String(s).split('.'); const frac = (f
 function fromScaled(v) { const neg = v < 0n; let a = neg ? -v : v; const s = a.toString().padStart(11, '0'); return (neg ? '-' : '') + s.slice(0, -10) + '.' + s.slice(-10); }
 function addDp(a, b) { return fromScaled(toScaled(a) + toScaled(b)); }
 function fmt10(s) { return fromScaled(toScaled(s)); }
+// Bulatkan harga ke tick_size ledger (1e-10, dari /api/markets EDELx-cETH).
+//   up=true  → ke ATAS (BUY: jangan sampai jatuh di bawah ask → gak match)
+//   up=false → ke BAWAH (SELL: jangan sampai naik di atas bid → gak match)
+// toFixed(10) WAJIB: harga EDELx-cETH ~5e-6, kalau nilainya turun di bawah 1e-6
+// Number.toString() keluar notasi eksponensial ("5.3e-7") dan toScaled/fmt10 pecah.
+function tickPrice(n, up) {
+  const t = Number(n) / 1e-10;
+  return ((up ? Math.ceil(t) : Math.floor(t)) * 1e-10).toFixed(10);
+}
+// Harga level terjauh yg kudu disapu buat ngisi `qty` di sisi book ini (levels udah
+// terurut best→worst). Balikin {price, full}: full=false berarti book gak cukup dalam
+// (qty > total depth) → harga = level terakhir yg ada.
+function bookPriceForQty(levels, qty) {
+  let rem = Number(qty) || 0, price = 0, full = false;
+  for (const l of (levels || [])) {
+    price = l.price; rem -= l.quantity;
+    if (rem <= 1e-12) { full = true; break; }
+  }
+  return { price, full };
+}
 function b64HashToHex(b64) { return '0x' + Buffer.from(b64, 'base64').toString('hex'); }
 function sigHexToB64(hex) { return Buffer.from(hex.replace(/^0x/, ''), 'hex').toString('base64'); }
 // Normalisasi signature dari Privy raw_sign ke base64 untuk submit_prepared.
@@ -1267,8 +1312,13 @@ class SilvanaClient {
    * (gak ada hash). Balikin array proposal {proposalId, buyer, seller, status,
    * createdAt, ...}.
    */
-  async listSettlementProposals() {
-    const r = await request('GET', `${APP_BASE}/api/settlement-proposals`, this._opts({
+  // partyId WAJIB dikirim: tanpa param itu endpoint balikin `proposals:[]` MELULU
+  // (verified live — bukan error, cuma kosong senyap), jadi proposal tahap-awal
+  // (PENDING, belum jadi DvpProposal di ledger) gak pernah kelihatan.
+  async listSettlementProposals(partyId, { includeClosed = false } = {}) {
+    const pid = partyId || this.partyId;
+    const qs = [pid ? `partyId=${encodeURIComponent(pid)}` : '', includeClosed ? 'includeClosed=1' : ''].filter(Boolean).join('&');
+    const r = await request('GET', `${APP_BASE}/api/settlement-proposals${qs ? '?' + qs : ''}`, this._opts({
       headers: this._hdr({ 'Accept': '*/*', 'Referer': APP_BASE + '/swap', ...this._bearerHdr }),
     }));
     if (r.status !== 200) return [];
@@ -1303,6 +1353,31 @@ class SilvanaClient {
   // (anti "Waiting for an unlocked CC balance" pas split multi-settlement).
   async settlementHistory(proposalId, partyId) {
     return this.swapAction(SWAP.actionIds.getSettlementHistory, [{ proposalId, partyId }]).catch(() => null);
+  }
+  /**
+   * ORDERBOOK asli (REST, endpoint yg sama dipakai UI /terminal — verified live).
+   *   GET /api/orderbook-depth/{market}?depth=20[&lpOnly=1]  -> {bids:[], asks:[]}
+   * WAJIB dipakai buat harga order, JANGAN getPrice(): EDELx-cETH itu market
+   * `cross_rate` (price_feeds: EDELx-USDCx ÷ cETH-USDCx) — getPrice balikin
+   * source:"Calculated" yg terukur meleset +3.6% di atas bestBid → limit SELL
+   * nyangkut di atas bid (gak pernah match) & BUY overpay.
+   * lpOnly=1 = book yg beneran bisa match order kita (kita kirim requirements.lpOnly),
+   * sama kayak toggle "LP-only matching" di UI.
+   * Balikin {bids,asks,bestBid,bestAsk} — bids desc, asks asc — atau null kalau gagal.
+   */
+  async orderbookDepth(market, { lpOnly = true, depth = 20 } = {}) {
+    const mk = market || 'EDELx-cETH';
+    const u = `${APP_BASE}/api/orderbook-depth/${encodeURIComponent(mk)}?depth=${depth}${lpOnly ? '&lpOnly=1' : ''}`;
+    const r = await request('GET', u, this._opts({ headers: this._hdr({ 'Accept': '*/*', 'Referer': `${APP_BASE}/terminal?market=${encodeURIComponent(mk)}`, ...this._bearerHdr }) }));
+    if (r.status !== 200) return null;
+    let j = r.json; if (!j) { try { j = JSON.parse(r.text); } catch (_) { } }
+    if (!j) return null;
+    const norm = (a) => (Array.isArray(a) ? a : [])
+      .map(x => ({ price: Number(x.price), quantity: Number(x.quantity) }))
+      .filter(x => x.price > 0 && x.quantity > 0);
+    const bids = norm(j.bids).sort((a, b) => b.price - a.price);
+    const asks = norm(j.asks).sort((a, b) => a.price - b.price);
+    return { bids, asks, bestBid: bids.length ? bids[0].price : 0, bestAsk: asks.length ? asks[0].price : 0 };
   }
   // Proposal(s) hasil 1 order (>1 kalau split ke banyak maker). REST, cookie+Bearer.
   async proposalsByOrderId(partyId, orderId) {
@@ -2078,26 +2153,76 @@ async function terminalSwapOnce(ctx, side, edelxQty) {
   //    Clean slate → gak ada dana ke-lock dari settlement lama (dust/gagal) → "Waiting
   //    for an unlocked balance" gak muncul. SKIP yg udah settle / dana kita udah alloc.
   try { await cancelPendingForFresh(ctx.sv, ctx.canton, ctx.partyId, market, log); } catch (_) { }
+  //    cancelPendingForFresh cuma baca DvpProposal di LEDGER — settlement tahap AWAL
+  //    (PENDING, belum naik jadi DvpProposal) gak kejaring. Sapu lewat REST juga:
+  //    order GTC yg settle-nya batal bisa ke-match ULANG sama LP → PENDING nyantol.
+  try {
+    const pend = await sv.listSettlementProposals(ctx.partyId).catch(() => []);
+    for (const p of pend) {
+      if (String(p.marketId || '') !== market) continue;
+      if (!/PENDING/i.test(String(p.status || ''))) continue;
+      if (p.buyer !== ctx.partyId && p.seller !== ctx.partyId) continue;
+      log(`settlement PENDING nyantol ${String(p.proposalId).slice(0, 12)}… → cancel (fresh start)`);
+      await sv.cancelSettlement(p.proposalId, ctx.partyId, 'stale pending before new order').catch(() => { });
+    }
+  } catch (_) { }
 
-  // 1. Harga market order (cross agresif, sama frontend) + submitOrder FOK lpOnly.
-  const pec = await sv.getPrice(market).catch(() => null);
-  const ref = Number(pec && pec.last) || Number(ctx.cethPerEdelx) || 0;
-  if (!(ref > 0)) throw new Error('harga EDELx-cETH belum ada');
-  const cross = Number(M8.orderCross) || 0.02;
-  const price = fmt10(String(ref * (side === 'buy' ? 1 + cross : 1 - cross)));
-  const qtyStr = fmt10(String(edelxQty));
-  log(`terminal ${side.toUpperCase()} ${qtyStr} EDELx @ ${price} cETH (FOK lpOnly)`);
-  const ord = await sv.submitOrder({ partyId: ctx.partyId, marketId: market, orderType: side, price, quantity: qtyStr, timeInForce: 'FOK', requirements: { lpOnly: true } });
+  // 1. HARGA dari ORDERBOOK (bukan getPrice). getPrice(EDELx-cETH) itu feed synthetic
+  //    `cross_rate` (EDELx-USDCx ÷ cETH-USDCx) — terukur live +3.6% di atas bestBid,
+  //    jadi limit SELL kita nangkring DI ATAS bid (gak pernah match, FOK kill →
+  //    "likuiditas belum ada") dan BUY overpay ~5%. Book lpOnly = book yg beneran
+  //    bisa match order kita (requirements.lpOnly). Book kosong → noLiquidity (retry),
+  //    JANGAN submit ngawur.
+  const book = await sv.orderbookDepth(market, { lpOnly: M8.bookLpOnly !== false, depth: 20 }).catch(() => null);
+  const best = book ? (side === 'buy' ? book.bestAsk : book.bestBid) : 0;
+  if (!(best > 0)) {
+    const e = new Error(`book ${market} ${side} kosong (bestBid=${(book && book.bestBid) || 0}, bestAsk=${(book && book.bestAsk) || 0})`);
+    e.noLiquidity = true; throw e;
+  }
+  // Sapu N level kalau qty > size level teratas → limit dipasang di level TERJAUH yg
+  // kudu disapu, biar sisa qty gak nyangkut di harga best doang.
+  const sweep = bookPriceForQty(side === 'buy' ? book.asks : book.bids, edelxQty);
+  const base = sweep.price > 0 ? sweep.price : best;
+  const cross = Number(M8.orderCross) || 0.001;
+  // Nyeberang (crossing) + bulatkan ke tick ke arah yg AMAN: BUY ke atas, SELL ke bawah.
+  const price = tickPrice(base * (side === 'buy' ? 1 + cross : 1 - cross), side === 'buy');
+  let qty = Number(edelxQty);
+  // Safety net BUY: cost cETH = qty × price. Kalau harga book gerak naik antara sizing
+  // (call-site) dan submit, potong qty biar gak "Insufficient cETH balance".
+  const maxCeth = Number(ctx.maxDeliverCeth) || 0;
+  if (side === 'buy' && maxCeth > 0) {
+    const cost = qty * Number(price);
+    if (cost > maxCeth) {
+      const trimmed = Math.floor((maxCeth / Number(price)) * 1e6) / 1e6;
+      log(`cost ${cost.toFixed(8)} > saldo cETH ${maxCeth.toFixed(8)} → qty ${qty} → ${trimmed}`);
+      qty = trimmed;
+    }
+  }
+  if (!(qty > 0)) { const e = new Error('qty jadi 0 setelah cap saldo cETH'); e.insufficientBalance = true; throw e; }
+  const qtyStr = fmt10(String(qty));
+  const tif = M8.orderTif || 'GTD';
+  // GTD → expiresAt WAJIB (frontend: `expiresAt: "GTD"===tif ? new Date(x).toISOString() : undefined`).
+  // Ini jaring pengaman kalau proses mati di antara submitOrder dan cancelOrder: order
+  // GTC yg ditinggalkan bakal hidup selamanya dan ke-match ulang tiap settlement dibatalin,
+  // sedangkan GTD mati sendiri. TTL dibikin > orderWaitSec + grace biar jalur normal aman.
+  const ttlSec = Math.max(Number(M8.orderWaitSec || 30) + 30, Number(M8.orderTtlSec) || 120);
+  const expiresAt = tif === 'GTD' ? new Date(Date.now() + ttlSec * 1000).toISOString() : undefined;
+  log(`terminal ${side.toUpperCase()} ${qtyStr} EDELx @ ${price} cETH (${tif}${expiresAt ? ` ttl ${ttlSec}s` : ''} lpOnly; book bid ${book.bestBid.toFixed(10)} / ask ${book.bestAsk.toFixed(10)}${sweep.full ? '' : ' — depth kurang'})`);
+  const ord = await sv.submitOrder({ partyId: ctx.partyId, marketId: market, orderType: side, price, quantity: qtyStr, timeInForce: tif, expiresAt, requirements: { lpOnly: true } });
   if (!ord || ord.success === false || !ord.order) {
     const e = new Error(`submitOrder: ${(ord && (ord.error || ord.message)) || 'gagal'}`); e.noLiquidity = true; throw e;
   }
   const orderId = ord.order.orderId || ord.order.id;
 
-  // 2. Proposal(s) hasil order (poll; split → >1). Order gak match (FOK kill / rest
-  //    ACTIVE pas book kosong) → gak ada proposal → cancelOrder + noLiquidity (retry).
+  // 2. Proposal(s) hasil order (poll; split → >1). Beda dari FOK: GTC yg gak match
+  //    TETAP NEMPEL di book (ngunci dana) → wajib cancelOrder di semua jalur keluar.
+  const pollProps = () => sv.proposalsByOrderId(ctx.partyId, orderId)
+    .catch(() => [])
+    .then(list => list.filter(p => p.buyer === ctx.partyId || p.seller === ctx.partyId));
   let props = [];
-  for (let i = 0; i < 14; i++) {
-    props = (await sv.proposalsByOrderId(ctx.partyId, orderId).catch(() => [])).filter(p => p.buyer === ctx.partyId || p.seller === ctx.partyId);
+  const deadline = Date.now() + Math.max(5000, (Number(M8.orderWaitSec) || 30) * 1000);
+  while (Date.now() < deadline) {
+    props = await pollProps();
     if (props.length) break;
     await sleep(2500);
   }
@@ -2105,6 +2230,21 @@ async function terminalSwapOnce(ctx, side, edelxQty) {
     await sv.cancelOrder(orderId, ctx.partyId).catch(() => { });
     const e = new Error('order gak match (book kosong / LP absen)'); e.noLiquidity = true; throw e;
   }
+  // Grace: kasih chunk lain (split multi-maker) waktu nyusul, baru putuskan sisa.
+  if (M8.orderGraceMs > 0) {
+    await sleep(M8.orderGraceMs);
+    const again = await pollProps();
+    if (again.length > props.length) props = again;
+  }
+  // WAJIB cancelOrder di sini — SELALU, bukan cuma pas partial fill. Beda kritis dari
+  // FOK: order GTC TETAP HIDUP di book sesudah match. Kalau settle-nya gagal/di-cancel
+  // (mis. fee gate), order yg masih hidup itu KE-MATCH LAGI sama LP → lahir proposal
+  // PENDING liar yg gak ada yg urus (terpantau live: order 107718813 → 1 CANCELLED +
+  // 1 PENDING). Chunk yg UDAH jadi proposal gak kena cancel ini — proposal berdiri
+  // sendiri, lepas dari order. Full fill → cancelOrder no-op (error diabaikan).
+  const filled = props.reduce((s, p) => s + (Number(p.baseQuantity) || 0), 0);
+  if (filled + 1e-9 < qty) log(`partial fill ${filled.toFixed(6)}/${qtyStr} EDELx → sisa di-cancel`);
+  await sv.cancelOrder(orderId, ctx.partyId).catch(() => { });
   log(`order ${orderId} → ${props.length} settlement${props.length > 1 ? ' (SPLIT)' : ''}`);
 
   // 3. Klasifikasi tiap chunk pakai minUsd (config mode8.minUsd). value = base×usdPerEdelx.
@@ -2296,7 +2436,10 @@ function pad(s, w, side = 'right') {
 
 let W = 44, ROWS = 24;
 function computeLayout() {
-  const cols = process.stdout.columns || 0, rows = process.stdout.rows || 0;
+  // Headless (pm2/nohup/`> log`) gak punya TTY → stdout.columns undefined → W jatuh ke
+  // 44 dan SEMUA baris aktivitas kepotong "…", pesan error jadi gak kebaca di file log.
+  // Hormati env COLUMNS/LINES dulu (COLUMNS=200 node index.js pingpong > log).
+  const cols = process.stdout.columns || Number(process.env.COLUMNS) || 0, rows = process.stdout.rows || Number(process.env.LINES) || 0;
   ROWS = rows > 0 ? rows : 24;
   W = cols > 0 ? Math.max(30, Math.min(cols, 160)) : 44;
 }
@@ -2961,7 +3104,7 @@ async function fetchDayTrader(sv, partyId) { const tasks = await sv.earnTasks(pa
  * lanjut buka posisi baru. Server akan auto-expire di settleBefore (12h).
  */
 async function fetchActiveSettlements(sv, partyId, { staleMaxSec = 300, statusBudgetMs = 12000 } = {}) {
-  const proposals = await sv.listSettlementProposals().catch(() => []);
+  const proposals = await sv.listSettlementProposals(partyId).catch(() => []);
   if (!proposals.length) return [];
   const now = Date.now();
   const out = [];
@@ -3332,10 +3475,10 @@ async function _accountSwapOnce(i) {
   try {
     state.status = 'login'; render(global.__states);
     let clients;
-    for (let _pb = 0; _pb <= Math.min(PROXIES.length - 1, 2); _pb++) {
+    for (let _pb = 0; _pb <= proxyTryMax(); _pb++) {
       try { clients = await buildSwapClients(state); break; }
       catch (e) {
-        if ((isProxyErr(e) || isIpBlockErr(e)) && PROXIES.length > 1 && _pb < Math.min(PROXIES.length - 1, 2)) {
+        if ((isProxyErr(e) || isIpBlockErr(e)) && PROXIES.length > 1 && _pb < proxyTryMax()) {
           const np = rotateProxy(a.email);
           logActivity(`[${tag}] proxy error saat login → rotate ke ${np ? np.host + ':' + np.port : '-'}`, COLOR.yellow);
         } else { throw e; }
@@ -3890,10 +4033,10 @@ async function swapBackAccountToCC(state, log = () => { }) {
     : minSwap;
   state.status = 'login';
   let clients;
-  for (let pb = 0; pb <= Math.min(PROXIES.length - 1, 2); pb++) {
+  for (let pb = 0; pb <= proxyTryMax(); pb++) {
     try { clients = await buildSwapClients(state); break; }
     catch (e) {
-      if ((isProxyErr(e) || isIpBlockErr(e)) && PROXIES.length > 1 && pb < Math.min(PROXIES.length - 1, 2)) { const np = rotateProxy(state.email); log(`[${tag}] proxy error login → rotate ${np ? np.host + ':' + np.port : '-'}`, COLOR.yellow); }
+      if ((isProxyErr(e) || isIpBlockErr(e)) && PROXIES.length > 1 && pb < proxyTryMax()) { const np = rotateProxy(state.email); log(`[${tag}] proxy error login → rotate ${np ? np.host + ':' + np.port : '-'}`, COLOR.yellow); }
       else throw e;
     }
   }
@@ -4017,9 +4160,9 @@ async function runEdelCethAccount(i) {
   try {
     state.status = 'login'; render(global.__states);
     let clients;
-    for (let pb = 0; pb <= Math.min(PROXIES.length - 1, 2); pb++) {
+    for (let pb = 0; pb <= proxyTryMax(); pb++) {
       try { clients = await buildSwapClients(state); break; }
-      catch (e) { if ((isProxyErr(e) || isIpBlockErr(e)) && PROXIES.length > 1 && pb < Math.min(PROXIES.length - 1, 2)) { const np = rotateProxy(state.email); logActivity(`[${tag}] proxy error login → rotate ${np ? np.host + ':' + np.port : '-'}`, COLOR.yellow); } else throw e; }
+      catch (e) { if ((isProxyErr(e) || isIpBlockErr(e)) && PROXIES.length > 1 && pb < proxyTryMax()) { const np = rotateProxy(state.email); logActivity(`[${tag}] proxy error login → rotate ${np ? np.host + ':' + np.port : '-'}`, COLOR.yellow); } else throw e; }
     }
     let { sv, partyId, identityToken, proxy } = clients;
     state.status = 'ok';
@@ -4092,11 +4235,16 @@ async function runEdelCethAccount(i) {
         const valE = edelx * usdPerEdelx, valC = ceth * usdPerCeth;
         minQty = floor6(minUsd / usdPerEdelx);
         if (valC > minUsd) {
-          // cETH → EDELx (buy), dump SEMUA cETH. Order dibayar cETH di ref×(1+orderCross)
-          // (aggressive cross). Size di harga ORDER (bagi 1+orderCross) biar cost ≤ saldo cETH
-          // → gak insufficient → gak retry −1% tiap swap. (Sebelumnya size di ref → 2% overshoot.)
+          // cETH → EDELx (buy), dump SEMUA cETH. Order dibayar cETH di bestAsk×(1+orderCross).
+          // Size di harga ORDER dari ORDERBOOK (bukan cross-rate USD: feed itu meleset ~3.6%,
+          // bikin qty overshoot → "Insufficient cETH" → retry −1% tiap swap). Book gagal →
+          // fallback cross-rate USD (terminalSwapOnce tetap nge-cap pakai maxDeliverCeth).
           deliver = 'cETH';
-          edelxQty = floor6((ceth * usdPerCeth) / usdPerEdelx / (1 + M8.orderCross));
+          const bkA = await sv.orderbookDepth(EDEL_CETH.market, { lpOnly: M8.bookLpOnly !== false, depth: 20 }).catch(() => null);
+          const askPx = (bkA && bkA.bestAsk) || 0;   // cETH per EDELx
+          edelxQty = askPx > 0
+            ? floor6(ceth / (askPx * (1 + M8.orderCross)))
+            : floor6((ceth * usdPerCeth) / usdPerEdelx / (1 + M8.orderCross));
           deliveredUsd = valC;
           isMaxDump = true;   // dump penuh cETH → pre-reduce haircut buffer
           logActivity(`[${tag}] deliver cETH MAX ${floor6(ceth)} (~$${valC.toFixed(2)}) → ${edelxQty} EDELx`, COLOR.gray);
@@ -4167,7 +4315,7 @@ async function runEdelCethAccount(i) {
         const q = fmt10(String(edelxQty));
         logActivity(`[${tag}] ping-pong #${swaps + 1}: ${direction} ${deliver}→${deliver === 'EDELx' ? 'cETH' : 'EDELx'} (${q} EDELx${adj ? ` adj#${adj}` : ''})`, COLOR.cyan);
         try {
-          const res = await terminalSwapOnce({ ...clients, userServiceCid, leg, maxFeeCC: night ? Infinity : M8.maxFeeCC, minUsd, usdPerEdelx, cethPerEdelx: (usdPerCeth > 0 ? usdPerEdelx / usdPerCeth : 0), log: (m) => logActivity(`[${tag}] ${m}`, COLOR.gray), onWalletPicked: (id) => { try { patchAcctSession(state.email, { privyWalletId: id }); } catch (_) { } } }, direction, q);
+          const res = await terminalSwapOnce({ ...clients, userServiceCid, leg, maxFeeCC: night ? Infinity : M8.maxFeeCC, minUsd, usdPerEdelx, maxDeliverCeth: (deliver === 'cETH' ? ceth : 0), log: (m) => logActivity(`[${tag}] ${m}`, COLOR.gray), onWalletPicked: (id) => { try { patchAcctSession(state.email, { privyWalletId: id }); } catch (_) { } } }, direction, q);
           if (res && res.ok) { swaps++; proxyFails = 0; hardErrs = 0; lastDustEdelx = Number(res.dustEdelx) || 0; if (res.feeCC) { recordBurn(res.feeCC, tag); bumpDaily(state, res.feeCC, 0); } logActivity(`[${tag}] ✓ ping-pong #${swaps} sukses (fee ${res.feeCC != null ? res.feeCC + ' CC' : '?'})`, COLOR.green); outcome = 'ok'; }
           else { logActivity(`[${tag}] ping-pong gagal (no ok) — retry`, COLOR.yellow); await sleep(4000); outcome = 'retry'; }
           break;
@@ -4657,7 +4805,18 @@ function awaitPastedPasskey() {
   });
 }
 
-async function runPaste() {
+async function runPaste(file) {
+  // `node index.js paste <file.json>` — buat hasil tombol "Download .json" di ekstensi
+  // (tinggal scp ke VPS), gak usah nempel manual. Tanpa argumen = tempel seperti biasa.
+  if (file) {
+    let obj;
+    try { obj = JSON.parse(fs.readFileSync(file, 'utf8')); }
+    catch (e) { console.error(paint(`gagal baca ${file}: ${(e && e.message) || e}`, COLOR.red)); process.exit(1); }
+    if (!obj || !obj.email || !obj.silvanaPasskey) { console.error(paint('JSON butuh email + silvanaPasskey', COLOR.red)); process.exit(1); }
+    const total = saveAccountPasskey(obj);
+    process.stdout.write(paint(`✓ passkey → session.json, akun ${obj.email} → accounts.json (total ${total})`, COLOR.green) + '\n');
+    process.exit(0);
+  }
   process.stdout.write(`\n${paint('SilvanaBot — Paste Passkey JSON', COLOR.bold + COLOR.cyan)}\nTempel ${paint('1 baris JSON', COLOR.cyan)} hasil register lalu Enter.\n\n`);
   await awaitPastedPasskey();
   process.exit(0);
@@ -4711,6 +4870,11 @@ console.log(payloadStr);
 
 async function runRegister() {
   process.stdout.write('\n' + paint('SilvanaBot — Register Passkey', COLOR.bold + COLOR.cyan) + '\n\n');
+  process.stdout.write(paint('CARA GAMPANG (disarankan): pakai ekstensi di folder extension/\n', COLOR.green));
+  process.stdout.write(paint('  chrome://extensions → Developer mode → Load unpacked → pilih folder extension/\n', COLOR.gray));
+  process.stdout.write(paint('  Buka app.silvana.one (sudah login) → klik ikon ekstensi → "Daftarkan Passkey" → "Copy JSON"\n', COLOR.gray));
+  process.stdout.write(paint('  Lalu di sini: node index.js paste   (atau: node index.js paste hasil.json)\n', COLOR.gray));
+  process.stdout.write('\n' + paint('CARA MANUAL (fallback, tanpa ekstensi):', COLOR.yellow) + '\n');
   process.stdout.write(paint('1) Buka https://app.silvana.one dan pastikan SUDAH LOGIN.\n', COLOR.gray));
   process.stdout.write(paint('2) F12 → Console → (ketik "allow pasting" bila diminta) → paste script di bawah → Enter.\n', COLOR.gray));
   process.stdout.write(paint('3) Console mencetak 1 baris JSON. Copy baris itu, paste ke terminal ini, Enter.\n', COLOR.gray));
@@ -4742,8 +4906,11 @@ Usage:
   node index.js terminal-swap [idx] [buy|sell] [go]   test 1 swap terminal penuh (submitOrder→settle), sizing usdAmount
   node index.js proposals  list settlement aktif (read-only) — cek proposal nyangkut
   node index.js cleanup    reject semua proposal nyangkut yg 0 dana kelock (sampah)
-  node index.js register  cetak script utk daftarkan passkey baru via Console, lalu paste hasil
-  node index.js paste     tempel JSON passkey hasil register → simpan ke session.json
+  node index.js cancel-order <orderId> [idx]   batalin order terminal yg masih nyantol di orderbook (TiF GTC)
+  node index.js pingpong   mode 8 (ping-pong EDELx↔cETH) SEMUA akun tanpa menu — buat headless/pm2
+  node index.js tif-probe [idx] [GTD|GTC] [ttlSec]  cek server hormatin expiresAt (order jauh dari book, 0 CC)
+  node index.js register  cara daftar passkey baru (pakai ekstensi di extension/, atau script Console)
+  node index.js paste [file.json]  simpan JSON passkey → session.json (tanpa arg = tempel manual)
   node index.js wallets   list Privy wallets per akun + tandai mana yg cached/match partyId
   node index.js pin <id>  pin privyWalletId ke session.json (utk akun pertama)
   node index.js help      tampilkan bantuan
@@ -4796,7 +4963,7 @@ Usage:
   } else if (argv[0] === 'register') {
     runRegister().catch(e => { console.error(paint('FATAL: ' + e.message, COLOR.red)); process.exit(1); });
   } else if (argv[0] === 'paste') {
-    runPaste().catch(e => { console.error(paint('FATAL: ' + e.message, COLOR.red)); process.exit(1); });
+    runPaste(argv[1] || null).catch(e => { console.error(paint('FATAL: ' + e.message, COLOR.red)); process.exit(1); });
   } else if (argv[0] === 'terminal') {
     // `node index.js terminal [idx] [MARKET]` — RESEARCH read-only: dump semua
     // server-action (name→id) + /api literal + probe endpoint orderbook di page
@@ -5065,15 +5232,30 @@ Usage:
       let side = sideArg || ((valE >= M8.usdAmount) ? 'sell' : (valC >= M8.usdAmount ? 'buy' : (valE >= valC ? 'sell' : 'buy')));
       const deliver = side === 'buy' ? 'cETH' : 'EDELx';
       const { leg } = edelCethLeg(deliver);
-      // Sizing SAMA kayak mode 8: BUY = dump SEMUA cETH di harga ORDER (÷1+orderCross);
-      // SELL = min(valE, usdAmount). Biar test faithful (reproduksi dump-all).
+      // Sizing SAMA kayak mode 8: BUY = dump SEMUA cETH di harga ORDER dari ORDERBOOK
+      // (÷1+orderCross); SELL = min(valE, usdAmount). Biar test faithful (reproduksi dump-all).
+      const bk = await sv.orderbookDepth(leg.market, { lpOnly: M8.bookLpOnly !== false, depth: 20 }).catch(() => null);
+      const askPx = (bk && bk.bestAsk) || 0;
       const edelxQty = side === 'buy'
-        ? Math.floor(((ceth * usdPerCeth) / (usdPerEdelx || 1) / (1 + M8.orderCross)) * 1e6) / 1e6
+        ? (askPx > 0
+          ? Math.floor((ceth / (askPx * (1 + M8.orderCross))) * 1e6) / 1e6
+          : Math.floor(((ceth * usdPerCeth) / (usdPerEdelx || 1) / (1 + M8.orderCross)) * 1e6) / 1e6)
         : Math.floor((Math.min(valE, M8.usdAmount) / (usdPerEdelx || 1)) * 1e6) / 1e6;
       process.stdout.write(paint(`saldo EDELx ${edelx.toFixed(2)} ($${valE.toFixed(2)}) cETH ${ceth.toFixed(6)} ($${valC.toFixed(2)}) CC ${cc.toFixed(2)}\n`, COLOR.gray));
+      // Bandingin book (yg bisa match) vs feed cross-rate (yg dulu dipakai & bikin gagal).
+      if (bk) {
+        const refFeed = usdPerCeth > 0 ? usdPerEdelx / usdPerCeth : 0;
+        const basePx = side === 'buy' ? bk.bestAsk : bk.bestBid;
+        const px = tickPrice(basePx * (side === 'buy' ? 1 + M8.orderCross : 1 - M8.orderCross), side === 'buy');
+        process.stdout.write(paint(`book lpOnly: bid ${bk.bestBid.toFixed(10)} (${bk.bids.length} lvl) | ask ${bk.bestAsk.toFixed(10)} (${bk.asks.length} lvl)\n`, COLOR.gray));
+        process.stdout.write(paint(`feed cross-rate (LAMA, salah): ${refFeed.toFixed(10)} → selisih vs bestBid ${(refFeed && bk.bestBid ? ((refFeed / bk.bestBid - 1) * 100).toFixed(2) : '?')}%\n`, COLOR.yellow));
+        process.stdout.write(paint(`harga order ${side.toUpperCase()} (BARU, dari book): ${px} cETH — TiF ${M8.orderTif}\n`, COLOR.green));
+      } else {
+        process.stdout.write(paint(`book gak kebaca — terminalSwapOnce bakal noLiquidity\n`, COLOR.red));
+      }
       process.stdout.write(paint(`→ ${side.toUpperCase()} ${edelxQty} EDELx (deliver ${deliver}, sizing $${M8.usdAmount}, minUsd $${M8.minUsd})\n`, COLOR.cyan));
       if (!GO) { process.stdout.write(paint(`[DRY] gak submit. Tambah 'go' buat live.\n`, COLOR.yellow)); process.exit(0); }
-      const res = await terminalSwapOnce({ ...clients, userServiceCid, leg, maxFeeCC: M8.maxFeeCC, minUsd: M8.minUsd, usdPerEdelx, cethPerEdelx: (usdPerCeth > 0 ? usdPerEdelx / usdPerCeth : 0), log: (m) => process.stdout.write(paint('  ' + m + '\n', COLOR.gray)), onWalletPicked: (id) => { try { patchAcctSession(a.email, { privyWalletId: id }); } catch (_) { } } }, side, edelxQty);
+      const res = await terminalSwapOnce({ ...clients, userServiceCid, leg, maxFeeCC: M8.maxFeeCC, minUsd: M8.minUsd, usdPerEdelx, maxDeliverCeth: (side === 'buy' ? ceth : 0), log: (m) => process.stdout.write(paint('  ' + m + '\n', COLOR.gray)), onWalletPicked: (id) => { try { patchAcctSession(a.email, { privyWalletId: id }); } catch (_) { } } }, side, edelxQty);
       process.stdout.write(paint(`\n✓ hasil: ${JSON.stringify(res)}\n`, COLOR.green));
       await sleep(4000); SWAP.tokenId = 'EDELX'; await refreshBalances(state, identityToken, proxy).catch(() => 0);
       process.stdout.write(paint(`saldo after: EDELx ${unlockedOf(state, 'EDELX').toFixed(2)} cETH ${unlockedOf(state, 'CETH').toFixed(6)} CC ${ccUnlockedFrom(state).toFixed(2)}\n`, COLOR.gray));
@@ -5095,7 +5277,7 @@ Usage:
       if (!a) { console.error(paint('accounts.json kosong', COLOR.red)); process.exit(1); }
       const state = makeStates()[0];
       const { sv, partyId } = await buildSwapClients(state);
-      const allRaw = await sv.listSettlementProposals().catch(() => []);
+      const allRaw = await sv.listSettlementProposals(partyId).catch(() => []);
       const all = allRaw.filter(p => p.buyer === partyId || p.seller === partyId);
       process.stdout.write(paint(`\nparty ${partyId.slice(0, 24)}… — total proposals: ${all.length}\n`, COLOR.cyan));
       for (const p of all) {
@@ -5187,6 +5369,78 @@ Usage:
       process.stdout.write(`  miningRound.contract=${out.getDsoInfo && out.getDsoInfo.latest_mining_round && out.getDsoInfo.latest_mining_round.contract ? 'OK' : 'MISSING'}\n`);
       process.exit(0);
     })().catch(e => { console.error(paint('DIAG FATAL: ' + (e && e.stack || e), COLOR.red)); process.exit(1); });
+  } else if (argv[0] === 'pingpong') {
+    // `node index.js pingpong` — mode 8 (ping-pong EDELx↔cETH) SEMUA akun, PERSIS
+    // menu 8 tapi tanpa prompt interaktif → bisa jalan headless (pm2/nohup/tee log).
+    SESSION_ENGINE = 'pingpong';
+    parallelSwapActive = SWAP.parallel;
+    process.stdout.write('\n' + paint(`Engine: PING-PONG EDELx↔cETH — SEMUA akun${parallelSwapActive ? ` · PARALLEL x${SWAP.concurrency}` : ''}`, COLOR.bold + COLOR.cyan) + '\n');
+    runMain().catch(e => { console.error(paint('FATAL: ' + (e && e.stack || e), COLOR.red)); process.exit(1); });
+  } else if (argv[0] === 'tif-probe') {
+    // `node index.js tif-probe [idx] [GTD|GTC|IOC] [ttlSec]` — buktiin server beneran
+    // hormatin expiresAt. Order dipasang JAUH dari book (SELL 5x bestAsk) supaya GAK
+    // MUNGKIN match → 0 settlement, 0 CC, 0 dana ke-lock. Lalu tunggu lewat TTL dan
+    // pakai cancelOrder sebagai PROBE: masih `success:true` = order MASIH HIDUP (TiF
+    // gak dihormati); error/`false` = order udah mati sendiri (persis yg kita mau).
+    // `/api/orders?mine=true` gak bisa dipakai — dia balik 0 walau order masih aktif.
+    (async () => {
+      const idx = Number(argv[1] || 0);
+      const tif = String(argv[2] || 'GTD').toUpperCase();
+      const ttlSec = Math.max(30, Number(argv[3]) || 60);
+      const a = ACCOUNTS[idx]; if (!a) { console.error(paint(`akun idx ${idx} gak ada`, COLOR.red)); process.exit(1); }
+      const state = makeStates()[idx];
+      const { sv, partyId } = await buildSwapClients(state);
+      await ensureActionIds(sv, partyId, a.label || a.email);
+      const market = EDEL_CETH.market;
+      const book = await sv.orderbookDepth(market, { lpOnly: M8.bookLpOnly !== false, depth: 20 });
+      if (!book || !(book.bestAsk > 0)) { console.error(paint('book kosong — probe dibatalin', COLOR.red)); process.exit(1); }
+      const price = tickPrice(book.bestAsk * 5, true);   // 5x ask → mustahil match
+      // Server nolak order di bawah nilai minimum ($10): "Order value $X is below the
+      // minimum order value $10.00". Nilai dihitung qty × price × USD/cETH, jadi qty
+      // dihitung mundur dari target $12 (bukan angka mati) — di harga 5x ask tetap
+      // mustahil match.
+      const pc = await sv.getPrice('cETH-USDCx').catch(() => null);
+      const usdPerCeth = Number(pc && (pc.last || pc.ask || pc.bid)) || 0;
+      if (!(usdPerCeth > 0)) { console.error(paint('harga cETH-USDCx gak kebaca — probe dibatalin', COLOR.red)); process.exit(1); }
+      const qty = Math.ceil(12 / (Number(price) * usdPerCeth));
+      const expiresAt = tif === 'GTD' ? new Date(Date.now() + ttlSec * 1000).toISOString() : undefined;
+      const olog = (m, c) => process.stdout.write(paint(m, c || COLOR.gray) + '\n');
+      olog(`book: bid ${book.bestBid.toFixed(10)} / ask ${book.bestAsk.toFixed(10)} | cETH $${usdPerCeth}`);
+      olog(`submitOrder SELL ${qty} EDELx @ ${price} (5x ask — mustahil match, ~$${(qty * Number(price) * usdPerCeth).toFixed(2)}), TiF ${tif}${expiresAt ? ` expiresAt ${expiresAt}` : ''}`, COLOR.cyan);
+      const ord = await sv.submitOrder({ partyId, marketId: market, orderType: 'sell', price, quantity: fmt10(String(qty)), timeInForce: tif, expiresAt, requirements: { lpOnly: true } });
+      if (!ord || ord.success === false || !ord.order) { console.error(paint(`submitOrder DITOLAK: ${JSON.stringify(ord).slice(0, 300)}`, COLOR.red)); process.exit(1); }
+      const orderId = ord.order.orderId || ord.order.id;
+      olog(`✓ diterima — orderId ${orderId} status ${ord.order.status || '?'}`, COLOR.green);
+      olog(`tunggu ${ttlSec + 20}s (TTL + 20s margin)…`);
+      await sleep((ttlSec + 20) * 1000);
+      const c = await sv.cancelOrder(orderId, partyId);
+      const alive = !!(c && c.success === true);
+      olog(`cancelOrder (probe) → ${JSON.stringify(c).slice(0, 220)}`);
+      olog(alive
+        ? `✗ order MASIH HIDUP setelah ${ttlSec}s — ${tif} gak bikin order expired (udah saya cancel barusan)`
+        : `✓ order UDAH MATI sendiri — ${tif} dihormati server`, alive ? COLOR.red : COLOR.green);
+      process.exit(0);
+    })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
+  } else if (argv[0] === 'cancel-order') {
+    // `node index.js cancel-order <orderId> [idx]` — bunuh order terminal yg masih
+    // nyantol di orderbook. WAJIB ada sejak TiF pindah ke GTC: order yg belum di-cancel
+    // TETAP HIDUP di book, dan tiap settlement-nya dibatalin dia KE-MATCH LAGI →
+    // proposal PENDING lahir terus-terusan (terpantau live di order 107718813).
+    // CATATAN: `/api/orders?mine=true` balik 0 walau order kita masih aktif — jangan
+    // percaya endpoint itu buat mastiin order udah mati; lihat proposal PENDING yg
+    // muncul lagi sesudah cleanup sebagai tandanya.
+    (async () => {
+      const orderId = String(argv[1] || '').trim();
+      if (!orderId) { console.error(paint('pakai: node index.js cancel-order <orderId> [idx]', COLOR.red)); process.exit(1); }
+      const idx = Number(argv[2] || 0);
+      const a = ACCOUNTS[idx]; if (!a) { console.error(paint(`akun idx ${idx} gak ada`, COLOR.red)); process.exit(1); }
+      const state = makeStates()[idx];
+      const { sv, partyId } = await buildSwapClients(state);
+      await ensureActionIds(sv, partyId, a.label || a.email);
+      const r = await sv.cancelOrder(orderId, partyId);
+      process.stdout.write(paint(`cancelOrder ${orderId} → `, COLOR.cyan) + JSON.stringify(r).slice(0, 300) + '\n');
+      process.exit(0);
+    })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
   } else if (argv[0] === 'cleanup') {
     // `node index.js cleanup` — cancel proposal nyangkut yg 0 dana kita kekunci
     // (stage<9, belum settle, alloc kita kosong, umur >90s). Aman: gak ada dana
@@ -5197,7 +5451,29 @@ Usage:
       const state = makeStates()[0];
       const { sv, canton, partyId, privy } = await buildSwapClients(state);
       const n = await cleanupStaleProposals(sv, canton, partyId, (m, c) => process.stdout.write(paint(m, c || COLOR.gray) + '\n'), privy);
-      process.stdout.write(paint(`\ncleanup selesai — ${n} proposal dibersihin (cancel + withdraw)\n`, COLOR.green));
+      // Sapuan kedua lewat REST: settlement tahap AWAL (stage<5, PENDING) belum jadi
+      // DvpProposal di ledger jadi lolos dari cleanupStaleProposals. Umur >120s biar
+      // gak nyenggol settlement yg lagi jalan. 0 dana kita ke-lock di stage ini.
+      let nRest = 0;
+      const pend = await sv.listSettlementProposals(partyId).catch(() => []);
+      for (const p of pend) {
+        if (!/PENDING/i.test(String(p.status || ''))) continue;
+        if (p.buyer !== partyId && p.seller !== partyId) continue;
+        // createdAt REST = protobuf Timestamp {seconds:"...",nanos:N}, BUKAN string ISO
+        // (new Date(obj) → Invalid Date → NaN). Pola sama fetchActiveSettlements.
+        const createdMs = Number((p.createdAt && p.createdAt.seconds) || 0) * 1000;
+        const ageSec = createdMs > 0 ? (Date.now() - createdMs) / 1000 : 1e9;
+        if (ageSec < 120) { process.stdout.write(paint(`  skip ${String(p.proposalId).slice(0, 16)}… (baru ${Math.round(ageSec)}s, mungkin lagi jalan)\n`, COLOR.gray)); continue; }
+        const st = await sv.swapAction(SWAP.actionIds.pollProposal, [{ settlementId: p.proposalId, partyId }]).catch(() => null);
+        const isBuyer = p.buyer === partyId;
+        const ourAlloc = st ? (isBuyer ? st.allocationBuyerCid : st.allocationSellerCid) : null;
+        if (ourAlloc && ourAlloc !== '$undefined') { process.stdout.write(paint(`  skip ${String(p.proposalId).slice(0, 16)}… — dana KITA ke-lock\n`, COLOR.yellow)); continue; }
+        if (st && (st.stage || 0) >= 9) continue;   // settled — jangan sentuh
+        await sv.cancelSettlement(p.proposalId, partyId, 'stale pending cleanup').catch(() => { });
+        nRest++;
+        process.stdout.write(paint(`  cancel PENDING ${String(p.proposalId).slice(0, 16)}… (${p.marketId}, stage ${(st && st.stage) || '?'}, umur ${Math.round(ageSec)}s)\n`, COLOR.yellow));
+      }
+      process.stdout.write(paint(`\ncleanup selesai — ${n} DvpProposal (ledger) + ${nRest} PENDING (REST) dibersihin\n`, COLOR.green));
       process.exit(0);
     })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
   } else if (argv[0] === 'feecheck') {
