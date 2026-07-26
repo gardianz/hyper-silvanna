@@ -2399,6 +2399,7 @@ async function terminalSwapOnce(ctx, side, edelxQty) {
     const e = new Error(`submitOrder: ${(ord && (ord.error || ord.message)) || 'gagal'}`); e.noLiquidity = true; throw e;
   }
   const orderId = ord.order.orderId || ord.order.id;
+  inflightAdd(ctx, 'orders', orderId);   // biar ke-cancel kalau bot dihentikan di tengah jalan
 
   // 2. Proposal(s) hasil order (poll; split → >1). Beda dari FOK: GTC yg gak match
   //    TETAP NEMPEL di book (ngunci dana) → wajib cancelOrder di semua jalur keluar.
@@ -2414,6 +2415,7 @@ async function terminalSwapOnce(ctx, side, edelxQty) {
   }
   if (!props.length) {
     await sv.cancelOrder(orderId, ctx.partyId).catch(() => { });
+    inflightDone(ctx, 'orders', orderId);
     const e = new Error('order gak match (book kosong / LP absen)'); e.noLiquidity = true; throw e;
   }
   // Grace: kasih chunk lain (split multi-maker) waktu nyusul, baru putuskan sisa.
@@ -2431,6 +2433,10 @@ async function terminalSwapOnce(ctx, side, edelxQty) {
   const filled = props.reduce((s, p) => s + (Number(p.baseQuantity) || 0), 0);
   if (filled + 1e-9 < qty) log(`partial fill ${filled.toFixed(6)}/${qtyStr} EDELx → sisa di-cancel`);
   await sv.cancelOrder(orderId, ctx.partyId).catch(() => { });
+  inflightDone(ctx, 'orders', orderId);
+  // Daftar SEMUA proposal SEKARANG (bukan pas masuk loop settle) — kalau bot dihentikan
+  // di sela-sela, proposal yang belum sempat kedaftar bakal ngegantung.
+  for (const _p of props) inflightAdd(ctx, 'proposals', _p.proposalId);
   log(`order ${orderId} → ${props.length} settlement${props.length > 1 ? ' (SPLIT)' : ''}`);
 
   // 3. Klasifikasi tiap chunk pakai minUsd (config mode8.minUsd). value = base×usdPerEdelx.
@@ -2466,6 +2472,7 @@ async function terminalSwapOnce(ctx, side, edelxQty) {
   for (const { p, valUsd } of toCancel) {
     log(`dust ${Number(p.baseQuantity).toFixed(2)} EDELx (~$${valUsd.toFixed(2)} < minUsd $${minUsd}) → cancelSettlement (sebelum sign, 0 fee)`);
     await sv.cancelSettlement(p.proposalId, ctx.partyId, 'dust chunk below minUsd').catch(() => { });
+    inflightDone(ctx, 'proposals', p.proposalId);
     dustCount++;
     dustEdelxTotal += Number(p.baseQuantity) || 0;
   }
@@ -2473,9 +2480,11 @@ async function terminalSwapOnce(ctx, side, edelxQty) {
   //   Cuma chunk yg value USD ≥ minUsd (config) yg di-sign & bayar fee.
   toSettle.sort((a, b) => Number(b.baseQuantity) - Number(a.baseQuantity));
   for (const p of toSettle) {
+    inflightAdd(ctx, 'proposals', p.proposalId);
     try {
       const r = await settleTerminalProposal(ctx, p, consumed);
       if (r && r.ok) { settledCount++; if (r.feeCC) feeTotal += r.feeCC; (r.consumed || []).forEach(c => consumed.add(c)); }
+      inflightDone(ctx, 'proposals', p.proposalId);
     } catch (e) {
       lastErr = e; log(`settle ${p.proposalId.slice(0, 12)}… gagal: ${(e && e.message) || e}`);
       if (e && e.feeSpike) throw e; // fee gate → bubble up (mode 8 tunggu)
@@ -2505,6 +2514,37 @@ async function terminalSwapOnce(ctx, side, edelxQty) {
 // Alur: requestQuotesV2 → acceptQuoteAtomic (dapat envelope + tanda tangan LP)
 //       → utilityTransferFactory per instrument → getTransferFactoryContext(Amulet)
 //       → rakit AtomicDVP_Settle → prepare → sign → submit.
+// ── Registry in-flight: order & settlement yang BELUM kelar ─────────────────
+// Dipakai graceful shutdown (Ctrl+C): order GTD/GTC yang keburu ditinggal bakal
+// nempel di orderbook dan bisa ke-match ulang, settlement PENDING ngegantung di
+// akun. Dua-duanya di-cancel dulu sebelum proses mati.
+const INFLIGHT = new Map();   // email -> {sv, partyId, label, orders:Set, proposals:Set}
+function inflightOf(ctx) {
+  const key = ctx.email || (ctx.state && ctx.state.email) || String(ctx.partyId || 'x');
+  let e = INFLIGHT.get(key);
+  if (!e) { e = { sv: ctx.sv, partyId: ctx.partyId, label: ctx.label || key, orders: new Set(), proposals: new Set() }; INFLIGHT.set(key, e); }
+  e.sv = ctx.sv; e.partyId = ctx.partyId;   // refresh (client bisa di-rebuild)
+  return e;
+}
+const inflightAdd = (ctx, kind, id) => { if (id) inflightOf(ctx)[kind].add(id); };
+const inflightDone = (ctx, kind, id) => { const e = INFLIGHT.get(ctx.email || (ctx.state && ctx.state.email) || String(ctx.partyId || 'x')); if (e && id) e[kind].delete(id); };
+// Bersihin semua yang masih nyantol. Dipakai SIGINT — dibatasi waktu biar Ctrl+C
+// gak ngegantung; Ctrl+C kedua langsung maksa keluar.
+async function cancelInflight(log = () => { }) {
+  let n = 0;
+  for (const [, e] of INFLIGHT) {
+    for (const oid of [...e.orders]) {
+      try { await e.sv.cancelOrder(oid, e.partyId); log(`  [${e.label}] order ${oid} di-cancel`); n++; } catch (_) { }
+      e.orders.delete(oid);
+    }
+    for (const pid of [...e.proposals]) {
+      try { await e.sv.cancelSettlement(pid, e.partyId, 'bot dihentikan'); log(`  [${e.label}] settlement ${String(pid).slice(0, 12)}… di-cancel`); n++; } catch (_) { }
+      e.proposals.delete(pid);
+    }
+  }
+  return n;
+}
+
 const UTIL_NS = 'utility.digitalasset.com/';
 // Konteks transfer utk 1 instrument. inputHoldingCids WAJIB punya SISI PENGIRIM —
 // kosong / salah sisi = 500 (terverifikasi: digest 4118613165 / 1034054957).
@@ -4795,7 +4835,7 @@ async function runEdelCethAccount(i) {
         const useRfq = mode8ShouldUseRfq();
         logActivity(`[${tag}] ping-pong #${swaps + 1}: ${direction} ${deliver}→${deliver === 'EDELx' ? 'cETH' : 'EDELx'} (${q} EDELx${adj ? ` adj#${adj}` : ''})${useRfq ? ` [RFQ — sisa ${hoursUntilDailyReset()}j ke reset]` : ''}`, COLOR.cyan);
         try {
-          const swapCtx = { ...clients, userServiceCid, leg, maxFeeCC: night ? Infinity : M8.maxFeeCC, minUsd, usdPerEdelx, maxDeliverCeth: (deliver === 'cETH' ? ceth : 0), log: (m) => logActivity(`[${tag}] ${m}`, COLOR.gray), onWalletPicked: (id) => { try { patchAcctSession(state.email, { privyWalletId: id }); } catch (_) { } } };
+          const swapCtx = { ...clients, email: state.email, label: tag, userServiceCid, leg, maxFeeCC: night ? Infinity : M8.maxFeeCC, minUsd, usdPerEdelx, maxDeliverCeth: (deliver === 'cETH' ? ceth : 0), log: (m) => logActivity(`[${tag}] ${m}`, COLOR.gray), onWalletPicked: (id) => { try { patchAcctSession(state.email, { privyWalletId: id }); } catch (_) { } } };
           // RFQ pakai qty BASE yg sama (EDELx) + ctx.leg yg sama → aman buat token↔token.
           const res = useRfq
             ? await swapOnceAtomic(swapCtx, direction, q)
@@ -5754,7 +5794,7 @@ Usage:
       const VIA_RFQ = argv.includes('rfq');
       process.stdout.write(paint(`→ ${side.toUpperCase()} ${edelxQty} EDELx (deliver ${deliver}, sizing $${M8.usdAmount}, minUsd $${M8.minUsd})${VIA_RFQ ? '  [jalur RFQ /swap]' : '  [jalur CLOB /terminal]'}\n`, COLOR.cyan));
       if (!GO) { process.stdout.write(paint(`[DRY] gak submit. Tambah 'go' buat live${VIA_RFQ ? '' : ', atau `rfq` buat lewat jalur /swap'}.\n`, COLOR.yellow)); process.exit(0); }
-      const swapCtx = { ...clients, userServiceCid, leg, maxFeeCC: M8.maxFeeCC, minUsd: M8.minUsd, usdPerEdelx, maxDeliverCeth: (side === 'buy' ? ceth : 0), log: (m) => process.stdout.write(paint('  ' + m + '\n', COLOR.gray)), onWalletPicked: (id) => { try { patchAcctSession(a.email, { privyWalletId: id }); } catch (_) { } } };
+      const swapCtx = { ...clients, email: a.email, label: a.label || a.email, userServiceCid, leg, maxFeeCC: M8.maxFeeCC, minUsd: M8.minUsd, usdPerEdelx, maxDeliverCeth: (side === 'buy' ? ceth : 0), log: (m) => process.stdout.write(paint('  ' + m + '\n', COLOR.gray)), onWalletPicked: (id) => { try { patchAcctSession(a.email, { privyWalletId: id }); } catch (_) { } } };
       const res = VIA_RFQ
         ? await swapOnceAtomic(swapCtx, side, edelxQty)
         : await terminalSwapOnce(swapCtx, side, edelxQty);
@@ -6605,5 +6645,19 @@ Usage:
     console.error(paint('cmd tidak dikenal: ' + argv[0] + '. Lihat: node index.js help', COLOR.red));
     process.exit(1);
   }
-  process.on('SIGINT', () => { process.stdout.write('\n' + paint('bye 👋', COLOR.gray) + '\n'); process.exit(0); });
+  // Ctrl+C: order GTD/GTC & settlement PENDING yang masih nyantol di-CANCEL dulu —
+  // order yang ditinggalkan bisa ke-match ulang dan bikin settlement yatim, sedangkan
+  // settlement PENDING ngegantung di akun. Dibatasi 20 detik; Ctrl+C kedua maksa keluar.
+  let _sigint = 0;
+  process.on('SIGINT', () => {
+    if (++_sigint > 1) { process.stdout.write(paint('\npaksa keluar (masih ada yang belum di-cancel)\n', COLOR.yellow)); process.exit(1); }
+    const pending = [...INFLIGHT.values()].reduce((n, e) => n + e.orders.size + e.proposals.size, 0);
+    if (!pending) { process.stdout.write('\n' + paint('bye 👋', COLOR.gray) + '\n'); process.exit(0); }
+    process.stdout.write('\n' + paint(`${pending} order/settlement nyantol → cancel dulu (Ctrl+C lagi = paksa)…`, COLOR.yellow) + '\n');
+    const done = (n) => { process.stdout.write(paint(`✓ ${n} dibersihin — bye 👋\n`, COLOR.green)); process.exit(0); };
+    const t = setTimeout(() => { process.stdout.write(paint('timeout 20s — keluar, sisanya bakal auto-expire / kesapu sesi berikutnya\n', COLOR.yellow)); process.exit(0); }, 20000);
+    cancelInflight((m) => process.stdout.write(paint(m + '\n', COLOR.gray)))
+      .then(n => { clearTimeout(t); done(n); })
+      .catch(() => { clearTimeout(t); process.exit(0); });
+  });
 }
