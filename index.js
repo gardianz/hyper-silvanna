@@ -205,9 +205,14 @@ const SWAP = {
     estimateFee: '4074ab0f8f8520c7db51cdc9553113534d890eb95e',
     acceptQuote: '40a1adcd089f85984250205b5ea4e17f06a40dbeba',
     // RFQ atomic (atomic-dvp-v2) — fallback dari capture live 26/07; di-refresh discovery.
-    requestQuotesV2: '401e90ccccc364376b6aba76ae32e6fa25f3458914',
-    acceptQuoteAtomic: '40c7fb7cd7162b5ccf72d432cb58142be30bf16b11',
-    estimateAtomicFee: '40578448cfea3c180436b4eca703bb5fe76ce67844',
+    // WAJIB ada di sini walau cuma fallback: loadActionIds() cuma nyalin key yang SUDAH
+    // kedaftar di blok ini, jadi kalau absen → id undefined → request kirim
+    // header "next-action: undefined" dan gagal.
+    requestQuotesV2: '40e78d795076258197adc5a17f1f85f08f66fadd57',
+    acceptQuoteAtomic: '407aa32e2cafb0913a28a50790e93f7067e0a76995',
+    estimateAtomicFee: '40ff80578b40a2c5566773980bc129e555e8608708',
+    utilityTransferFactory: '403012b2ecabece63b143fb85b33121dc20aff6efd',
+    utilityAcceptContext: '40085ee36335ef548b28082bcc171a91c65793cf74',
     recordEvent: '40e87910772c03d8a7421cfb88978ac8f2cd4c456b',
     pollProposal: '40394b3565003b5772b75a4d82bdd88f26fe3af6a0',
     getMultiCall: '402effcb926d81e596e8d19b4f5a645a5b604a03ed',
@@ -332,7 +337,13 @@ function hoursUntilDailyReset() {
 // sering sepi/cepat habis dan counterparty CLOB kadang gak nyelesaiin settlement,
 // sedangkan RFQ di-quote LANGSUNG sama LP (terbukti tetap jalan pas CLOB mandek total,
 // fee malah lebih murah). Dipakai cuma pas mepet reset & target belum kekejar.
+// Jalur ping-pong yg dipilih SAAT RUN (bukan config): 'clob' = orderbook /terminal
+// (default, perilaku lama), 'rfq' = jalur /swap AtomicDVP. Di-set menu 8 / 8r atau
+// subcommand pingpong / pingpong-rfq. Dipisah biar dua mode gak campur.
+let PINGPONG_ROUTE = 'clob';
 function mode8ShouldUseRfq() {
+  if (PINGPONG_ROUTE === 'rfq') return true;
+  // Mode CLOB tetap punya jaring pengaman: pindah RFQ kalau mepet reset & belum kelar.
   const lim = Number(M8.rfqFallbackHour) || 0;
   return lim > 0 && hoursUntilDailyReset() <= lim;
 }
@@ -1150,6 +1161,10 @@ const ACTION_NAME = {
   requestQuotesV2: 'requestQuotesV2Action',
   acceptQuoteAtomic: 'acceptQuoteAtomicAction',
   estimateAtomicFee: 'estimateAtomicFeeAction',
+  // Konteks transfer/accept per instrument → sumber base/quoteTransferFactoryCid,
+  // instrument-configuration cid, dan sisa disclosedContracts buat AtomicDVP_Settle.
+  utilityTransferFactory: 'getUtilityTransferFactoryContextAction',
+  utilityAcceptContext: 'getUtilityAcceptContextAction',
 };
 // recoverParty (party + userServiceCid) skrg lewat REST GET /api/parties/{id},
 // bukan server action /connect lagi (lihat SilvanaClient.recoverParty).
@@ -2477,6 +2492,235 @@ async function terminalSwapOnce(ctx, side, edelxQty) {
     throw (lastErr || new Error('tidak ada chunk yg settle'));
   }
   return { ok: true, direction: side, orderId, settled: settledCount, dust: dustCount, dustEdelx: dustEdelxTotal, feeCC: feeTotal || null };
+}
+
+// ============================================================================
+//  RFQ ATOMIC (atomic-dvp-v2) — settle SEKALI TEMBAK, tanpa DvpProposal
+// ============================================================================
+// Silvana pindah dari alur DvpProposal ke AtomicDVP_Settle. swapOnce lama nunggu
+// dvpProposalCid yg GAK PERNAH muncul di jalur ini → "poll: dvpProposalCid timeout"
+// stage 3 (server malah nunggu KITA lanjut). Dipetakan live 26/07 dari UI /swap.
+// Untung ganda: fee ~1.24 CC (vs 4.3 CC CLOB) & harga lebih bagus dari orderbook.
+//
+// Alur: requestQuotesV2 → acceptQuoteAtomic (dapat envelope + tanda tangan LP)
+//       → utilityTransferFactory per instrument → getTransferFactoryContext(Amulet)
+//       → rakit AtomicDVP_Settle → prepare → sign → submit.
+const UTIL_NS = 'utility.digitalasset.com/';
+// Konteks transfer utk 1 instrument. inputHoldingCids WAJIB punya SISI PENGIRIM —
+// kosong / salah sisi = 500 (terverifikasi: digest 4118613165 / 1034054957).
+async function utilityTransferCtx(sv, { admin, id, amount, sender, receiver, holdingCids, altHoldingCids }) {
+  const now = new Date();
+  const mk = (hold) => [{
+    receiver, amount, instrumentId: { admin, id },
+    requestedAt: now.toISOString(),
+    executeBefore: new Date(now.getTime() + 130_000).toISOString(),
+    sender, inputHoldingCids: hold || [],
+  }];
+  // Server nolak (500, pesan disembunyiin Next.js) kalau inputHoldingCids bukan milik
+  // sisi pengirim. Aturan pastinya beda-beda per arah, jadi coba beberapa bentuk.
+  const tries = [holdingCids || []];
+  if (altHoldingCids && altHoldingCids.length) tries.push(altHoldingCids);
+  tries.push([]);
+  let last = null;
+  for (const hold of tries) {
+    const r = await sv.swapAction(SWAP.actionIds.utilityTransferFactory, mk(hold)).catch(e => ({ _err: (e && e.message) || String(e) }));
+    if (r && !r._err && (r.factoryId || (r.factory && r.factory.factoryId))) return r;
+    last = r;
+  }
+  throw new Error(`utilityTransferFactory(${id}) gagal: ${JSON.stringify(last).slice(0, 200)}`);
+}
+// Ambil cid InstrumentConfiguration dari disclosedContracts hasil context.
+function pickInstrumentConfigCid(ctx) {
+  const dc = (ctx && (ctx.disclosedContracts || ctx.disclosed)) || [];
+  const hit = dc.find(d => /Configuration\.Instrument:InstrumentConfiguration/.test(String(d.templateId || '')));
+  return hit && hit.contractId;
+}
+// transferArgs == acceptArgs (terverifikasi identik di capture UI).
+function utilArgs({ transferRuleCid, instrumentConfigCid }) {
+  return {
+    context: {
+      values: {
+        [UTIL_NS + 'receiver-credentials']: { tag: 'AV_List', value: [] },
+        [UTIL_NS + 'transfer-rule']: { tag: 'AV_ContractId', value: transferRuleCid },
+        [UTIL_NS + 'sender-credentials']: { tag: 'AV_List', value: [] },
+        [UTIL_NS + 'enable-result-contracts']: { tag: 'AV_Bool', value: true },
+        [UTIL_NS + 'instrument-configuration']: { tag: 'AV_ContractId', value: instrumentConfigCid },
+      },
+    },
+    // WAJIB ada walau kosong — tanpa ini Canton nolak:
+    // "Missing non-optional fields: HashSet(extraArgs)".
+    meta: { values: {} },
+  };
+}
+
+// Swap 1x lewat jalur RFQ ATOMIC. `side`: 'sell' = kirim EDELx terima cETH.
+// `baseQty` = jumlah base (EDELx). Balikin {ok, feeCC, quoteId}.
+async function swapOnceAtomic(ctx, side, baseQty) {
+  const { sv, privy, canton, partyId, identityToken, proxy, log = () => { } } = ctx;
+  const L = ctx.leg || {};
+  const market = L.market || 'EDELx-cETH';
+  const [baseId, quoteId2] = String(market).split('-');     // EDELx, cETH
+  const feeCap = ctx.maxFeeCC != null ? Number(ctx.maxFeeCC) : Number(SWAP.maxFeeCC);
+
+  // 1. Quote v2 (rfqId dari /api/rfq/stream v1 DITOLAK acceptQuoteAtomic).
+  const rq = await sv.swapAction(SWAP.actionIds.requestQuotesV2, [{ partyId, marketId: market, direction: side, quantity: String(baseQty) }]);
+  const quotes = (rq && rq.quotes) || [];
+  if (!rq || rq.success === false || !quotes.length) {
+    const e = new Error(`requestQuotesV2: ${(rq && (rq.error || rq.message)) || 'gak ada quote'}`); e.noLiquidity = true; throw e;
+  }
+  // quoteQuantity terbaik: sell → paling BANYAK diterima; buy → paling SEDIKIT dibayar.
+  quotes.sort((a, b) => side === 'sell' ? Number(b.quoteQuantity) - Number(a.quoteQuantity) : Number(a.quoteQuantity) - Number(b.quoteQuantity));
+
+  // 2. Accept → envelope bertanda tangan LP. LP kadang OVER-QUOTE (nawarin lebih dari
+  //    yg dia pegang) lalu nolak pas confirm ("InsufficientHoldings") — jangan langsung
+  //    nyerah, coba LP berikutnya yg harganya nomor 2.
+  let acc = null, env = null, pick = null, lastErr = '';
+  for (const cand of quotes) {
+    log(`RFQ ${side} ${baseQty} ${baseId} → ${cand.quoteQuantity} ${quoteId2} @ ${cand.price} (${cand.lpName}, ${quotes.length} quote)`);
+    const r = await sv.swapAction(SWAP.actionIds.acceptQuoteAtomic, [{ partyId, rfqId: rq.rfqId, quoteId: cand.quoteId }]).catch(e => ({ success: false, error: (e && e.message) || String(e) }));
+    if (r && r.success !== false && r.envelope) { acc = r; env = r.envelope; pick = cand; break; }
+    lastErr = (r && (r.error || r.message)) || 'no envelope';
+    log(`   ${cand.lpName} nolak: ${String(lastErr).slice(0, 100)} — coba LP lain`);
+  }
+  if (!env) {
+    const e = new Error(`acceptQuoteAtomic: semua ${quotes.length} LP nolak (${String(lastErr).slice(0, 120)})`);
+    if (/InsufficientHoldings/i.test(lastErr)) e.noLiquidity = true; else e.transient = true;
+    throw e;
+  }
+  const q = env.quote || {};
+  const weSendBase = String(q.side || side).toLowerCase() === 'sell';
+
+  // fee gate SEBELUM bikin transaksi apa pun
+  const feeCC = Number((q.lpFees && q.lpFees[0] && q.lpFees[0].amount) || 0);
+  if (Number.isFinite(feeCC) && feeCC > 0) {
+    log(`Fee RFQ: ${feeCC} CC (batas ${feeCap})`);
+    if (feeCC > feeCap) { const e = new Error(`fee ${feeCC} CC > batas ${feeCap} CC`); e.feeSpike = true; e.feeCC = feeCC; throw e; }
+  }
+
+  // 3. Holding kita + CC utk fee.
+  const bal = await supaBalances(identityToken || (canton && canton.token), proxy);
+  const toks = (bal && bal.tokens) || [];
+  const holdOf = (id) => { const t = toks.find(x => String((x.instrumentId && x.instrumentId.id) || '').toUpperCase() === String(id).toUpperCase()); return ((t && t.unlockedUtxos) || []).map(u => u.contractId).filter(Boolean); };
+  const sendId = weSendBase ? baseId : quoteId2;
+  const userHoldings = holdOf(sendId);
+  if (!userHoldings.length) { const e = new Error(`gak ada holding ${sendId}`); e.insufficientBalance = true; throw e; }
+  const ccHoldings = holdOf('Amulet');
+  if (!ccHoldings.length) { const e = new Error('gak ada CC buat fee'); e.insufficientFunds = true; throw e; }
+
+  // 4. Konteks transfer per instrument. Sisi PENGIRIM yang nyetor holding.
+  const refs = env.utilityAcceptRefs || [];
+  const refOf = (id) => refs.find(r => String(r.instrumentId).toUpperCase() === String(id).toUpperCase());
+  const lp = env.lpPartyId;
+  const mkCtx = async (id, amount, weSend) => {
+    const ref = refOf(id);
+    if (!ref) throw new Error(`utilityAcceptRefs gak punya ${id}`);
+    const c = await utilityTransferCtx(sv, {
+      admin: ref.instrumentAdmin, id, amount,
+      sender: weSend ? partyId : lp, receiver: weSend ? lp : partyId,
+      holdingCids: weSend ? userHoldings.slice(0, 8) : (env.lpInputHoldingCids || []),
+      altHoldingCids: weSend ? (env.lpInputHoldingCids || []) : userHoldings.slice(0, 8),
+    });
+    return { ctx: c, ref };
+  };
+  const baseCtx = await mkCtx(baseId, String(q.baseAmount), weSendBase);
+  const quoteCtx = await mkCtx(quoteId2, String(q.quoteAmount), !weSendBase);
+
+  // 5. Konteks fee (Amulet) — factoryCid utk `fees`.
+  const fee0 = (q.lpFees && q.lpFees[0]) || null;
+  let feeFactoryCid = null, feeDisclosed = [], feeExtraArgs = null;
+  if (fee0) {
+    // Amulet TIDAK lewat getUtilityTransferFactoryContext (itu buat instrument Utility
+    // registry: EDELx/cETH). UI pakai getTransferFactoryContextAction = SWAP.actionIds
+    // .prepareTransfer — bentuk args-nya sama persis (capture UI reqid 492).
+    const now = new Date();
+    const fc = await sv.swapAction(SWAP.actionIds.prepareTransfer, [{
+      receiver: fee0.receiver, amount: String(fee0.amount),
+      instrumentId: { admin: fee0.instrumentAdmin, id: fee0.instrumentId },
+      requestedAt: now.toISOString(),
+      executeBefore: new Date(now.getTime() + 130_000).toISOString(),
+      sender: partyId, inputHoldingCids: ccHoldings.slice(0, 8),
+    }]);
+    feeFactoryCid = (fc && (fc.factoryId || (fc.factory && fc.factory.factoryId))) || null;
+    feeDisclosed = (fc && (fc.disclosedContracts || fc.disclosed)) || [];
+    // fees[].extraArgs WAJIB = choiceContextData dari factory Amulet (transfer-preapproval,
+    // open-round, external-party-config-state, amulet-rules). Tanpa ini Canton nolak
+    // "Missing non-optional fields: HashSet(extraArgs)".
+    const fcv = (fc && fc.choiceContextData && fc.choiceContextData.values)
+      || (fc && fc.choiceContext && fc.choiceContext.choiceContextData && fc.choiceContext.choiceContextData.values)
+      || null;
+    if (!fcv) throw new Error(`fee choiceContext (Amulet) kosong: ${JSON.stringify(fc).slice(0, 200)}`);
+    feeExtraArgs = { context: { values: fcv }, meta: { values: {} } };
+    if (!feeFactoryCid) throw new Error(`fee factory (Amulet) gagal: ${JSON.stringify(fc).slice(0, 160)}`);
+  }
+
+  // 6. Rakit AtomicDVP_Settle.
+  const facOf = (c) => c.factoryId || (c.factory && c.factory.factoryId);
+  const argsFor = (c) => utilArgs({ transferRuleCid: c.ref.transferRule.contractId, instrumentConfigCid: pickInstrumentConfigCid(c.ctx) });
+  const baseArgs = argsFor(baseCtx), quoteArgs = argsFor(quoteCtx);
+  const disclosed = [];
+  const seen = new Set();
+  // utilityAcceptRefs[].transferRule juga HARUS ikut di-disclose — cid-nya dipakai di
+  // *TransferArgs, dan tanpa blob-nya Canton nolak "Contract could not be found".
+  const refDisclosed = refs.map(r => r && r.transferRule).filter(x => x && x.contractId && x.createdEventBlob);
+  for (const d of [...(env.disclosed || []), ...refDisclosed, ...(baseCtx.ctx.disclosedContracts || baseCtx.ctx.disclosed || []), ...(quoteCtx.ctx.disclosedContracts || quoteCtx.ctx.disclosed || []), ...feeDisclosed]) {
+    if (!d || !d.contractId || seen.has(d.contractId)) continue;
+    seen.add(d.contractId);
+    disclosed.push({ contractId: d.contractId, createdEventBlob: d.createdEventBlob, templateId: d.templateId, synchronizerId: d.synchronizerId || env.synchronizerId });
+  }
+  const body = {
+    commands: [{
+      ExerciseCommand: {
+        templateId: env.dvp.templateId, contractId: env.dvp.contractId, choice: 'AtomicDVP_Settle',
+        choiceArgument: {
+          // lpFees dari envelope pakai bentuk {instrumentAdmin, instrumentId:"Amulet"},
+          // sedangkan Canton mau {instrumentId:{admin,id}} — kalau diteruskan apa adanya
+          // ditolak "Unexpected fields: instrumentAdmin".
+          quote: {
+            ...q,
+            lpFees: (q.lpFees || []).map(f => (f && f.instrumentAdmin)
+              ? { receiver: f.receiver, instrumentId: { admin: f.instrumentAdmin, id: f.instrumentId }, amount: String(f.amount) }
+              : f),
+          },
+          quoteSignature: env.quoteSignature,
+          ticketCid: q.ticketId ? q.ticketId : null,
+          lpInputHoldingCids: env.lpInputHoldingCids || [],
+          // GABUNGAN holding token yg kita kirim + UTXO CC buat fee. Daml-nya ngambil
+          // fee dari "pool" yg sama; kalau CC gak ikut → "no pool holdings for fee
+          // instrument". Di capture UI userInputHoldingCids memang campuran keduanya.
+          userInputHoldingCids: [...userHoldings.slice(0, 8), ...ccHoldings.slice(0, 4)],
+          baseTransferFactoryCid: facOf(baseCtx.ctx), quoteTransferFactoryCid: facOf(quoteCtx.ctx),
+          baseTransferArgs: baseArgs, baseAcceptArgs: baseArgs,      // identik (verified)
+          quoteTransferArgs: quoteArgs, quoteAcceptArgs: quoteArgs,
+          fees: fee0 ? [{ receiver: fee0.receiver, amount: String(fee0.amount), instrumentId: { admin: fee0.instrumentAdmin, id: fee0.instrumentId }, factoryCid: feeFactoryCid, extraArgs: feeExtraArgs, description: null }] : [],
+        },
+      },
+    }],
+    disclosedContracts: disclosed,
+  };
+  log(`AtomicDVP_Settle: ${disclosed.length} disclosed · fee ${feeCC} CC`);
+
+  // 7. prepare → sign → submit.
+  const prep = await canton.prepareTransaction(body);
+  if (!prep || !prep.hash) throw new Error('prepare_transaction gagal (no hash)');
+  const hashHex = b64HashToHex(prep.hash);
+  const sigMaxTries = Math.max(1, (privy.walletCandidates && privy.walletCandidates.length) || 1) + 1;
+  let sub = null;
+  for (let i = 1; i <= sigMaxTries; i++) {
+    const sig = await privy.rawSign(hashHex);
+    try { sub = await canton.submitPrepared({ hash: prep.hash, signature: sigToB64(sig) }); if (ctx.onWalletPicked && privy.wallet) { try { ctx.onWalletPicked(privy.wallet.id); } catch (_) { } } break; }
+    catch (e) {
+      if (/bad signature/i.test((e && e.message) || '')) { const nx = privy.nextWallet(); if (nx) { log(`BAD SIGNATURE → rotasi wallet ${String(nx.id).slice(0, 8)}…`); continue; } }
+      throw e;
+    }
+  }
+  if (!sub || !sub.submissionId) throw new Error('submit_prepared gagal');
+  for (let i = 0; i < SWAP.completionMaxTries; i++) {
+    const c = await canton.queryCompletion(sub.submissionId).catch(() => null);
+    if (c && c.status === 'completed') break;
+    if (c && (c.status === 'failed' || c.status === 'rejected')) throw new Error(`transaksi ${c.status}: ${c.message || ''}`);
+    await sleep(SWAP.completionPollMs);
+  }
+  return { ok: true, direction: side, quoteId: pick.quoteId, feeCC: Number.isFinite(feeCC) ? feeCC : null, settled: 1, dust: 0, dustEdelx: 0 };
 }
 
 // Settle SATU DvpProposal hasil order terminal. Mirror back-half swapOnce (getMultiCall
@@ -4554,7 +4798,7 @@ async function runEdelCethAccount(i) {
           const swapCtx = { ...clients, userServiceCid, leg, maxFeeCC: night ? Infinity : M8.maxFeeCC, minUsd, usdPerEdelx, maxDeliverCeth: (deliver === 'cETH' ? ceth : 0), log: (m) => logActivity(`[${tag}] ${m}`, COLOR.gray), onWalletPicked: (id) => { try { patchAcctSession(state.email, { privyWalletId: id }); } catch (_) { } } };
           // RFQ pakai qty BASE yg sama (EDELx) + ctx.leg yg sama → aman buat token↔token.
           const res = useRfq
-            ? await swapOnce(swapCtx, direction, q)
+            ? await swapOnceAtomic(swapCtx, direction, q)
             : await terminalSwapOnce(swapCtx, direction, q);
           if (res && res.ok) { swaps++; proxyFails = 0; hardErrs = 0; noLiqStreak = 0; lastDustEdelx = Number(res.dustEdelx) || 0; if (res.feeCC) { recordBurn(res.feeCC, tag); bumpDaily(state, res.feeCC, 0); } logActivity(`[${tag}] ✓ ping-pong #${swaps} sukses (fee ${res.feeCC != null ? res.feeCC + ' CC' : '?'})`, COLOR.green); outcome = 'ok'; }
           else { logActivity(`[${tag}] ping-pong gagal (no ok) — retry`, COLOR.yellow); await sleep(4000); outcome = 'retry'; }
@@ -5155,9 +5399,10 @@ Usage:
   node index.js terminal-hist [idx]            dump settlement terminal (struktur split + consumedAmuletCids)
   node index.js terminal-swap [idx] [buy|sell] [go]   test 1 swap terminal penuh (submitOrder→settle), sizing usdAmount
   node index.js proposals  list settlement aktif (read-only) — cek proposal nyangkut
-  node index.js cleanup    reject semua proposal nyangkut yg 0 dana kelock (sampah)
+  node index.js cleanup [idx|all]  reject proposal nyangkut yg 0 dana kelock (default akun 0)
   node index.js cancel-order <orderId> [idx]   batalin order terminal yg masih nyantol di orderbook (TiF GTC)
-  node index.js pingpong   mode 8 (ping-pong EDELx↔cETH) SEMUA akun tanpa menu — buat headless/pm2
+  node index.js pingpong       mode 8 via CLOB /terminal, SEMUA akun tanpa menu (headless/pm2)
+  node index.js pingpong-rfq   mode 8 via RFQ /swap AtomicDVP (fee ~1.25 CC, anti-CLOB-macet)
   node index.js tif-probe [idx] [GTD|GTC] [ttlSec]  cek server hormatin expiresAt (order jauh dari book, 0 CC)
   node index.js acct-diag [idx]   diagnosa 1 akun (read-only, tanpa OTP): auth/me, KYC, earn-hub task
   node index.js register  cara daftar passkey baru (pakai ekstensi di extension/, atau script Console)
@@ -5511,7 +5756,7 @@ Usage:
       if (!GO) { process.stdout.write(paint(`[DRY] gak submit. Tambah 'go' buat live${VIA_RFQ ? '' : ', atau `rfq` buat lewat jalur /swap'}.\n`, COLOR.yellow)); process.exit(0); }
       const swapCtx = { ...clients, userServiceCid, leg, maxFeeCC: M8.maxFeeCC, minUsd: M8.minUsd, usdPerEdelx, maxDeliverCeth: (side === 'buy' ? ceth : 0), log: (m) => process.stdout.write(paint('  ' + m + '\n', COLOR.gray)), onWalletPicked: (id) => { try { patchAcctSession(a.email, { privyWalletId: id }); } catch (_) { } } };
       const res = VIA_RFQ
-        ? await swapOnce(swapCtx, side, edelxQty)
+        ? await swapOnceAtomic(swapCtx, side, edelxQty)
         : await terminalSwapOnce(swapCtx, side, edelxQty);
       process.stdout.write(paint(`\n✓ hasil: ${JSON.stringify(res)}\n`, COLOR.green));
       await sleep(4000); SWAP.tokenId = 'EDELX'; await refreshBalances(state, identityToken, proxy).catch(() => 0);
@@ -5626,12 +5871,13 @@ Usage:
       process.stdout.write(`  miningRound.contract=${out.getDsoInfo && out.getDsoInfo.latest_mining_round && out.getDsoInfo.latest_mining_round.contract ? 'OK' : 'MISSING'}\n`);
       process.exit(0);
     })().catch(e => { console.error(paint('DIAG FATAL: ' + (e && e.stack || e), COLOR.red)); process.exit(1); });
-  } else if (argv[0] === 'pingpong') {
+  } else if (argv[0] === 'pingpong' || argv[0] === 'pingpong-rfq') {
     // `node index.js pingpong` — mode 8 (ping-pong EDELx↔cETH) SEMUA akun, PERSIS
     // menu 8 tapi tanpa prompt interaktif → bisa jalan headless (pm2/nohup/tee log).
+    PINGPONG_ROUTE = (argv[0] === 'pingpong-rfq' || argv.includes('rfq')) ? 'rfq' : 'clob';
     SESSION_ENGINE = 'pingpong';
     parallelSwapActive = SWAP.parallel;
-    process.stdout.write('\n' + paint(`Engine: PING-PONG EDELx↔cETH — SEMUA akun${parallelSwapActive ? ` · PARALLEL x${SWAP.concurrency}` : ''}`, COLOR.bold + COLOR.cyan) + '\n');
+    process.stdout.write('\n' + paint(`Engine: PING-PONG EDELx↔cETH [${PINGPONG_ROUTE === 'rfq' ? 'RFQ /swap' : 'CLOB /terminal'}] — SEMUA akun${parallelSwapActive ? ` · PARALLEL x${SWAP.concurrency}` : ''}`, COLOR.bold + COLOR.cyan) + '\n');
     runMain().catch(e => { console.error(paint('FATAL: ' + (e && e.stack || e), COLOR.red)); process.exit(1); });
   } else if (argv[0] === 'tif-probe') {
     // `node index.js tif-probe [idx] [GTD|GTC|IOC] [ttlSec]` — buktiin server beneran
@@ -5742,8 +5988,59 @@ Usage:
         const has = v !== undefined && v !== null;
         olog(`     ${has ? '✓' : '·'} ${k.padEnd(26)} ${has ? (typeof v === 'object' ? `(${Array.isArray(v) ? v.length + ' item' : 'object'})` : String(v).slice(0, 60)) : '-'}`, has ? COLOR.green : COLOR.gray);
       }
+      // 3. Konteks transfer/accept per instrument (sumber factoryCid +
+      //    instrument-configuration + sisa disclosed). Bentuk args belum pasti →
+      //    coba beberapa variasi, laporkan mana yg 200.
+      const env = acc.envelope || {};
+      const refs = env.utilityAcceptRefs || [];
+      const ctxOut = {};
+      olog(`\n3) konteks utility (${refs.length} instrument dari utilityAcceptRefs)…`, COLOR.bold);
+      for (const ref of refs) {
+        const admin = ref.instrumentAdmin, iid = ref.instrumentId;
+        olog(`   • ${iid} (admin ${String(admin).slice(0, 22)}…)`);
+        // Args PERSIS seperti yg UI kirim ke getTransferFactoryContextAction (capture
+        // reqid 492): {receiver, amount, instrumentId:{admin,id}, requestedAt,
+        // executeBefore, sender, inputHoldingCids}. inputHoldingCids KOSONG bikin 500
+        // (digest beda) — server butuh holding beneran, jadi diambil dari saldo.
+        const _now = new Date();
+        const _req = _now.toISOString();
+        const _exp = new Date(_now.getTime() + 130_000).toISOString();   // quote hidup ~130s
+        const lpParty = env.lpPartyId || partyId;
+        const q = env.quote || {};
+        // sisi mana yg KITA kirim: side Sell → kita kirim base (EDELx), terima quote (cETH).
+        const weSendBase = String(q.side || '').toLowerCase() === 'sell';
+        const isBase = String(iid).toUpperCase() === 'EDELX';
+        const amount = isBase ? String(q.baseAmount || '0') : String(q.quoteAmount || '0');
+        const weSend = isBase ? weSendBase : !weSendBase;
+        // holding punya kita utk instrument ini (cuma perlu kalau kita yg ngirim)
+        let holds = [];
+        try {
+          const bal = await supaBalances(clients.identityToken, clients.proxy);
+          const tok = ((bal && bal.tokens) || []).find(t => String((t.instrumentId && t.instrumentId.id) || '').toUpperCase() === String(iid).toUpperCase());
+          holds = ((tok && tok.unlockedUtxos) || []).map(u => u.contractId).filter(Boolean);
+        } catch (_) { }
+        olog(`     side=${q.side} · kita ${weSend ? 'KIRIM' : 'TERIMA'} ${iid} ${amount} · ${holds.length} holding`);
+        const base = { receiver: weSend ? lpParty : partyId, amount, instrumentId: { admin, id: iid }, requestedAt: _req, executeBefore: _exp, sender: weSend ? partyId : lpParty, inputHoldingCids: weSend ? holds.slice(0, 5) : [] };
+        const variants = [
+          ['UI-shape (holding asli)', [base]],
+          ['UI-shape + lp holdings', [{ ...base, inputHoldingCids: (env.lpInputHoldingCids || []) }]],
+          ['UI-shape tanpa holding', [{ ...base, inputHoldingCids: [] }]],
+        ];
+        for (const [label, args] of variants) {
+          // _probeAction: raw RSC, gak throw & gak motong → pesan error server kebaca utuh.
+          const p = await sv._probeAction(SWAP.actionIds.utilityTransferFactory, args, 15000);
+          const ok = p && p.status === 200 && p.value && !p.value.error && (p.value.factoryId || p.value.factory || p.value.choiceContext || p.value.choiceContextData);
+          if (ok) {
+            olog(`     ✓ ${label} → keys: ${Object.keys(p.value).join(', ')}`, COLOR.green);
+            ctxOut[iid] = { transferFactory: p.value, argsShape: label };
+            break;
+          }
+          const msg = (p && p.value && (p.value.error || p.value.message)) || (p && p.text ? String(p.text).replace(/\s+/g, ' ').slice(0, 220) : '?');
+          olog(`     · ${label} [${p && p.status}]: ${String(msg).slice(0, 200)}`);
+        }
+      }
       const OUT = process.env.OUT || '/tmp/atomic-probe.json';
-      try { saveJSON(OUT, { rfqId: rfq.rfqId, quote, accept: acc }); olog(`\n   dump lengkap → ${OUT}`, COLOR.cyan); } catch (_) { }
+      try { saveJSON(OUT, { rfqId: rfq.rfqId, quote, accept: acc, utilityCtx: ctxOut }); olog(`\n   dump lengkap → ${OUT}`, COLOR.cyan); } catch (_) { }
       process.exit(0);
     })().catch(e => { console.error(paint('FATAL: ' + ((e && e.stack) || e), COLOR.red)); process.exit(1); });
   } else if (argv[0] === 'privy-otp') {
@@ -5893,13 +6190,19 @@ Usage:
       process.exit(0);
     })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
   } else if (argv[0] === 'cleanup') {
-    // `node index.js cleanup` — cancel proposal nyangkut yg 0 dana kita kekunci
-    // (stage<9, belum settle, alloc kita kosong, umur >90s). Aman: gak ada dana
-    // ke-lock. Cancel via cancelSettlement (V2). NEVER sentuh LOCKED/SETTLED.
+    // `node index.js cleanup [idx|all]` — cancel proposal nyangkut yg 0 dana kita
+    // kekunci (stage<9, belum settle, alloc kita kosong, umur >90s). Aman: gak ada
+    // dana ke-lock. Cancel via cancelSettlement (V2). NEVER sentuh LOCKED/SETTLED.
+    // Dulu hardcode akun ke-0 doang — settlement nyangkut di akun lain gak kesapu.
     (async () => {
-      const a = ACCOUNTS[0];
-      if (!a) { console.error(paint('accounts.json kosong', COLOR.red)); process.exit(1); }
-      const state = makeStates()[0];
+      const arg = String(argv[1] || '0');
+      const idxs = arg === 'all' ? ACCOUNTS.map((_, i) => i) : [Number(arg) || 0];
+      let grand = 0;
+      for (const _i of idxs) {
+      const a = ACCOUNTS[_i];
+      if (!a) { console.error(paint(`akun idx ${_i} gak ada`, COLOR.red)); continue; }
+      if (idxs.length > 1) process.stdout.write('\n' + paint(`▎ ${a.label || a.email}`, COLOR.bold + COLOR.cyan) + '\n');
+      const state = makeStates()[_i];
       const { sv, canton, partyId, privy } = await buildSwapClients(state);
       const n = await cleanupStaleProposals(sv, canton, partyId, (m, c) => process.stdout.write(paint(m, c || COLOR.gray) + '\n'), privy);
       // Sapuan kedua lewat REST: settlement tahap AWAL (stage<5, PENDING) belum jadi
@@ -5924,7 +6227,10 @@ Usage:
         nRest++;
         process.stdout.write(paint(`  cancel PENDING ${String(p.proposalId).slice(0, 16)}… (${p.marketId}, stage ${(st && st.stage) || '?'}, umur ${Math.round(ageSec)}s)\n`, COLOR.yellow));
       }
-      process.stdout.write(paint(`\ncleanup selesai — ${n} DvpProposal (ledger) + ${nRest} PENDING (REST) dibersihin\n`, COLOR.green));
+      process.stdout.write(paint(`cleanup — ${n} DvpProposal (ledger) + ${nRest} PENDING (REST) dibersihin\n`, COLOR.green));
+      grand += n + nRest;
+      }
+      if (idxs.length > 1) process.stdout.write('\n' + paint(`✓ total ${grand} dibersihin dari ${idxs.length} akun\n`, COLOR.bold + COLOR.green));
       process.exit(0);
     })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
   } else if (argv[0] === 'feecheck') {
@@ -5982,9 +6288,10 @@ Usage:
       process.stdout.write(paint('  5) maintenance    — a) cleanup DvpProposal stale  b) reset season (fee + loss → 0)', COLOR.gray) + '\n');
       process.stdout.write(paint('  6) swap back      — dump token (USDCx/cETH/EDELx) → CC, SEMUA akun', COLOR.gray) + '\n');
       process.stdout.write(paint('  7) EDELx manual   — a) CC→EDELx (input CC, multi-akun parallel)  b) dump EDELx→CC (1 akun)', COLOR.gray) + '\n');
-      process.stdout.write(paint('  8) EDELx↔cETH     — ping-pong bolak-balik, SEMUA akun (target earn-hub)', COLOR.gray) + '\n');
+      process.stdout.write(paint('  8) EDELx↔cETH     — ping-pong SEMUA akun via CLOB /terminal (orderbook, fee ~4.3 CC)', COLOR.gray) + '\n');
+      process.stdout.write(paint('  8r) EDELx↔cETH RFQ — ping-pong SEMUA akun via /swap AtomicDVP (fee ~1.25 CC, anti-CLOB-macet)', COLOR.gray) + '\n');
       process.stdout.write(paint('  9) bulk back      — dump ke CC, SEMUA akun (pilih pair: USDCx/cETH/EDELx/semua)', COLOR.gray) + '\n');
-      const ans = (await prompt(paint('pilih [0/1/2/3/4/5/6/7/8/9]: ', COLOR.bold))).trim();
+      const ans = (await prompt(paint('pilih [0/1/2/3/4/5/6/7/8/8r/9]: ', COLOR.bold))).trim();
       if (ans === '2') {
         // Cek balance: tabel + grand total, AUTO-REFRESH tiap N menit (default 15,
         // config.dashboard.balanceRefreshMin). Loop terus — Ctrl+C buat berhenti.
@@ -6242,13 +6549,18 @@ Usage:
         process.stdout.write('\n' + paint(`✓ CC→EDELx selesai — ${idxs.length} akun`, COLOR.bold + COLOR.green) + '\n');
         process.exit(0);
       }
-      if (ans === '8') {
+      if (ans === '8' || ans === '8r') {
         // Ping-pong EDELx↔cETH, SEMUA akun, target-driven dari earn-hub (analog opsi 0/1:
         // dashboard + reschedule harian) via SESSION_ENGINE='pingpong'. Proses swap
         // token↔token (NO CC leg); fee CC terpisah. Parallel per config swap.parallel.
+        // DUA JALUR TERPISAH — sengaja gak dicampur:
+        //   8  = CLOB /terminal (orderbook). Butuh depth book; fee ~4.3 CC.
+        //   8r = RFQ /swap AtomicDVP. LP nge-quote langsung; fee ~1.25 CC; tetap jalan
+        //        waktu settlement CLOB mandek (kejadian 26/07 stage 2 seharian).
+        PINGPONG_ROUTE = (ans === '8r') ? 'rfq' : 'clob';
         SESSION_ENGINE = 'pingpong';
         parallelSwapActive = SWAP.parallel;
-        process.stdout.write('\n' + paint(`Engine: PING-PONG EDELx↔cETH — SEMUA akun${parallelSwapActive ? ` · PARALLEL x${SWAP.concurrency}` : ''}`, COLOR.bold + COLOR.cyan) + '\n');
+        process.stdout.write('\n' + paint(`Engine: PING-PONG EDELx↔cETH [${PINGPONG_ROUTE === 'rfq' ? 'jalur RFQ /swap' : 'jalur CLOB /terminal'}] — SEMUA akun${parallelSwapActive ? ` · PARALLEL x${SWAP.concurrency}` : ''}`, COLOR.bold + COLOR.cyan) + '\n');
         runMain().catch(e => { console.error(paint('FATAL: ' + (e && e.stack || e), COLOR.red)); process.exit(1); });
         return;
       }
