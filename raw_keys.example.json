@@ -1,0 +1,9 @@
+{
+  "_help": "Akun 'wallet kunci-mentah': partyId-nya terikat ke ed25519 key yg KITA pegang (bukan Privy TEE embedded wallet). Terjadi kalau wallet diregister di luar alur onboarding web Silvana (mis. lewat bot register yg generate cantonPrivateKey sendiri). UI Supanova & Privy TEE gak bisa nandatanganin tx-nya (selalu 'BAD SIGNATURE'), jadi bot HARUS sign lokal pakai crypto.sign. File ini yg nyimpen private key-nya, dipisah dari session.json biar jelas. TIDAK di-commit (.gitignore).",
+  "_help_format": "key = email akun (samain dgn accounts.json 'email'). value = string b64-pkcs8 SAJA, atau object { privateKey, publicKey?, note? }. privateKey = ed25519 private key format DER PKCS8 di-base64. publicKey (opsional) = 32-byte raw ed25519 pubkey base64; kalau diisi, bot verifikasi cocok pas load (guard salah-tempel). Token Bearer Supanova TETAP dari login Privy biasa (privyEmail di accounts.json) — kunci mentah ini CUMA buat tanda tangan.",
+  "email-akun@contoh.com": {
+    "privateKey": "MC4CAQAwBQYDK2VwBCIEI...<b64 pkcs8 ed25519>...",
+    "publicKey": "...<b64 32-byte pubkey, opsional>...",
+    "note": "keterangan bebas"
+  }
+}

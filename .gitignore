@@ -1,6 +1,7 @@
 # Sensitive — JANGAN commit
 accounts.json
 session.json
+raw_keys.json
 proxy.txt
 swap-debug.log
 proxy-assignments.json
@@ -9,6 +10,7 @@ proxy-assignments.json
 !accounts.example.json
 !config.example.json
 !proxy.example.txt
+!raw_keys.example.json
 
 # Generated at runtime — cache next-action ID hasil discoverActionIds(), berubah
 # tiap Silvana redeploy. Percuma di-commit, bikin konflik antar mesin.
