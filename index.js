@@ -947,9 +947,52 @@ async function supaBalances(token, proxy) {
   if (r.status >= 400) throw new Error(`balances status=${r.status}`);
   return r.json;
 }
+// ── Gate traffic-credit sequencer Canton ────────────────────────────────────
+// `SEQUENCER_NOT_ENOUGH_TRAFFIC_CREDIT: Member has insufficient traffic credit`
+// itu rate-limit sequencer yg dihitung PER MEMBER (participant node), BUKAN per
+// party — semua akun kita nempel di node Supanova yg sama (partyId hint `supa1`),
+// jadi jatah traffic-nya SATU EMBER buat semua. Kelihatan di log: beberapa akun
+// kena barengan di detik yg persis sama. Jatahnya ngisi ulang sendiri seiring waktu
+// (base rate), gak perlu top-up manual.
+//
+// Konsekuensi: backoff PER-AKUN percuma. Sementara akun A nunggu 10s, akun B–E
+// masih nembak dan embernya gak pernah sempat keisi. Makanya gate-nya GLOBAL:
+// sekali ada yg kena, SEMUA akun ikut nahan sampai waktunya lewat.
+const TRAFFIC = { until: 0, hits: 0 };
+// Backoff naik 30s per kejadian beruntun, cap 5 mnt. Turun lagi tiap swap sukses.
+function trafficPenalize() {
+  TRAFFIC.hits++;
+  const s = Math.min(300, 30 * TRAFFIC.hits);
+  TRAFFIC.until = Math.max(TRAFFIC.until, Date.now() + s * 1000);
+  return s;
+}
+function trafficRelax() { if (TRAFFIC.hits > 0) TRAFFIC.hits--; }
+// Tahan sampai gate kebuka. Jitter di ujung biar akun-akun gak lepas serempak
+// (kalau barengan lagi, embernya langsung kuras lagi = herd).
+async function waitTrafficGate(tag) {
+  let held = false;
+  while (Date.now() < TRAFFIC.until) {
+    if (!held) { held = true; logActivity(`[${tag || '-'}] tahan ${Math.ceil((TRAFFIC.until - Date.now()) / 1000)}s — traffic node abis (gate global)`, COLOR.yellow); }
+    await sleep(Math.min(5000, Math.max(250, TRAFFIC.until - Date.now())));
+  }
+  if (held) await sleep(Math.floor(Math.random() * 5000));
+}
+// Bikin error dari queryCompletion status failed/rejected, sekalian ditandai kalau
+// penyebabnya rate-limit sequencer — bukan salah transaksi kita, jadi rebuild client
+// / rescan action-id (perlakuan default error tak-terklasifikasi) cuma buang waktu.
+function completionErr(status, message) {
+  const msg = String(message || '');
+  const e = new Error(`transaksi ${status}: ${msg}`);
+  // REQUEST_FAILED muncul barengan TRAFFIC_CREDIT tiap kali sequencer kedorong —
+  // diperlakukan sama: tahan, jangan retry cepat.
+  if (/NOT_ENOUGH_TRAFFIC_CREDIT|SEQUENCER_REQUEST_FAILED|ABORTED_DUE_TO_SHUTDOWN/i.test(msg)) e.trafficLimit = true;
+  return e;
+}
+
 class CantonClient {
   // token bisa berupa string statis ATAU fungsi () => token (live dari session).
-  constructor({ token, timeoutMs = REQ.timeoutMs, proxy = null } = {}) { this._token = token; this.timeoutMs = timeoutMs; this.proxy = proxy; }
+  // tag = label akun, cuma dipakai buat log gate traffic (opsional).
+  constructor({ token, timeoutMs = REQ.timeoutMs, proxy = null, tag = null } = {}) { this._token = token; this.timeoutMs = timeoutMs; this.proxy = proxy; this.tag = tag; }
   get token() { return typeof this._token === 'function' ? this._token() : this._token; }
   set token(v) { this._token = v; }
   _opts(extra) { return { headers: supaHeaders(this.token), timeoutMs: this.timeoutMs, proxy: this.proxy, ...extra }; }
@@ -980,6 +1023,9 @@ class CantonClient {
     return list;
   }
   async prepareTransaction(body) {
+    // Gate di sini (bukan di submit) biar prepare+sign gak dikerjain percuma pas
+    // jatah traffic lagi kosong — submit-nya pasti ditolak.
+    await waitTrafficGate(this.tag);
     const r = await request('POST', `${SUPA}/prepare_transaction`, this._opts({ body: JSON.stringify(body) }));
     if (r.status === 401) { const e = new Error('prepare_transaction 401'); e.unauthorized = true; throw e; }
     if (r.status !== 200 && r.status !== 201) {
@@ -2265,7 +2311,7 @@ async function swapOnce(ctx, direction, quantityCC) {
   for (let i = 0; i < SWAP.completionMaxTries; i++) {
     const q = await canton.queryCompletion(sub.submissionId).catch(() => null);
     if (q && q.status === 'completed') { completion = q; break; }
-    if (q && (q.status === 'failed' || q.status === 'rejected')) throw new Error(`transaksi ${q.status}: ${q.message || ''}`);
+    if (q && (q.status === 'failed' || q.status === 'rejected')) throw completionErr(q.status, q.message);
     await sleep(SWAP.completionPollMs);
   }
   // Settlement di-finalize oleh submit_prepared (Canton RPC) di atas — tidak ada
@@ -2777,7 +2823,7 @@ async function swapOnceAtomic(ctx, side, baseQty) {
   for (let i = 0; i < SWAP.completionMaxTries; i++) {
     const c = await canton.queryCompletion(sub.submissionId).catch(() => null);
     if (c && c.status === 'completed') break;
-    if (c && (c.status === 'failed' || c.status === 'rejected')) throw new Error(`transaksi ${c.status}: ${c.message || ''}`);
+    if (c && (c.status === 'failed' || c.status === 'rejected')) throw completionErr(c.status, c.message);
     await sleep(SWAP.completionPollMs);
   }
   return { ok: true, direction: side, quoteId: pick.quoteId, feeCC: Number.isFinite(feeCC) ? feeCC : null, settled: 1, dust: 0, dustEdelx: 0 };
@@ -2939,7 +2985,7 @@ async function settleTerminalProposal(ctx, proposal, consumedSet) {
   for (let i = 0; i < SWAP.completionMaxTries; i++) {
     const q = await canton.queryCompletion(sub.submissionId).catch(() => null);
     if (q && q.status === 'completed') break;
-    if (q && (q.status === 'failed' || q.status === 'rejected')) throw new Error(`transaksi ${q.status}: ${q.message || ''}`);
+    if (q && (q.status === 'failed' || q.status === 'rejected')) throw completionErr(q.status, q.message);
     await sleep(SWAP.completionPollMs);
   }
   return { ok: true, proposalId, feeCC: Number.isFinite(realFeeCC) ? realFeeCC : null, consumed: feeCcCids };
@@ -3600,7 +3646,7 @@ async function buildSwapClients(state) {
   // refresh/expired mid-sesi, string statis bikin canton 401 → active_contracts
   // []→ "DvpProposal lookup failed activeCount:0" walau /swap (pakai sv.bearer
   // live) masih jalan. Samain sumber token dgn sv.bearer.
-  const canton = new CantonClient({ token: () => { try { return acctSession(email).privy.token || identityToken; } catch (_) { return identityToken; } }, timeoutMs: REQ.timeoutMs, proxy });
+  const canton = new CantonClient({ token: () => { try { return acctSession(email).privy.token || identityToken; } catch (_) { return identityToken; } }, timeoutMs: REQ.timeoutMs, proxy, tag: state.label || email });
   return { sv, privy, canton, partyId, identityToken, proxy };
 }
 
@@ -4362,6 +4408,7 @@ async function _accountSwapOnce(i) {
         const label = direction === 'sell' ? `CC→${SWAP.tokenLabel}` : `${SWAP.tokenLabel}→CC`;
         const res = await swapWithRetry(marketDir, rfqQty, label);
         if (res && res.ok) {
+          trafficRelax();
           if (res.feeCC) { recordBurn(res.feeCC, tag); bumpDaily(state, res.feeCC, 0); }
           const realDt = await handleSuccess(label);
           if (realDt && realDt.current > beforeApi) {
@@ -4374,6 +4421,7 @@ async function _accountSwapOnce(i) {
             // (res.ok = settlement settled by waitForSettlement). Verifikasi
             // DAY_TRADER tetap di-log walau gak naik.
             done++;
+            trafficRelax();
             stuck = 0;
             lowFeeStreak = 0;
             logActivity(`[${tag}] ✓ confirmed on-chain overcap ${done}/${need} (DAY_TRADER ${realDt.current}/${realDt.target} saturated)`, COLOR.green);
@@ -4431,6 +4479,14 @@ async function _accountSwapOnce(i) {
           await refreshBalances(state, identityToken, proxy);
           render(global.__states);
           await sleep(waitS * 1000);
+          continue;
+        }
+        // Rate-limit sequencer: jatah traffic member (node Supanova) abis, dan embernya
+        // dipakai BARENGAN semua akun → gate global, bukan backoff per akun.
+        if (e && e.trafficLimit) {
+          const s = trafficPenalize();
+          logActivity(`[${tag}] traffic credit node abis — tahan ${s}s (gate global, semua akun)`, COLOR.yellow);
+          await waitTrafficGate(tag);
           continue;
         }
         // Likuiditas belum ada: bukan error, retry siklus berikutnya
@@ -4639,6 +4695,8 @@ async function swapBackAccountToCC(state, log = () => { }) {
         if (e && e.feeSpike) { const w = Math.max(60, Number(SWAP.feeSpikeWaitSec) || 300); log(`[${tag}] fee spike ${e.feeCC} > ${SWAP.maxFeeCC} CC — tunggu ${Math.round(w / 60)} mnt`, COLOR.yellow); await sleep(w * 1000); outcome = 'retry'; break; }
         if (e && e.insufficientFunds) { log(`[${tag}] CC kurang buat fee — stop (top-up CC)`, COLOR.red); outcome = 'stop'; break; }
         if (e && e.noLiquidity) { log(`[${tag}] likuiditas ${SWAP.tokenLabel}→CC belum ada — retry`, COLOR.gray); outcome = 'retry'; break; }
+        // Rate-limit sequencer (ember traffic dipake bareng semua akun) → gate global.
+        if (e && e.trafficLimit) { const s = trafficPenalize(); log(`[${tag}] traffic credit node abis — tahan ${s}s (gate global)`, COLOR.yellow); await waitTrafficGate(tag); outcome = 'retry'; break; }
         if (e && (e.transient || e.unauthorized)) {
           log(`[${tag}] ${shortSwapReason(e)} — retry`, COLOR.yellow);
           if (e.unauthorized) { try { clients = await buildSwapClients(state); ({ sv, partyId, identityToken, proxy } = clients); } catch (_) { } }
@@ -4860,7 +4918,7 @@ async function runEdelCethAccount(i) {
           const res = useRfq
             ? await swapOnceAtomic(swapCtx, direction, q)
             : await terminalSwapOnce(swapCtx, direction, q);
-          if (res && res.ok) { swaps++; proxyFails = 0; hardErrs = 0; noLiqStreak = 0; lastDustEdelx = Number(res.dustEdelx) || 0; if (res.feeCC) { recordBurn(res.feeCC, tag); bumpDaily(state, res.feeCC, 0); } logActivity(`[${tag}] ✓ ping-pong #${swaps} sukses (fee ${res.feeCC != null ? res.feeCC + ' CC' : '?'})`, COLOR.green); outcome = 'ok'; }
+          if (res && res.ok) { swaps++; proxyFails = 0; hardErrs = 0; noLiqStreak = 0; trafficRelax(); lastDustEdelx = Number(res.dustEdelx) || 0; if (res.feeCC) { recordBurn(res.feeCC, tag); bumpDaily(state, res.feeCC, 0); } logActivity(`[${tag}] ✓ ping-pong #${swaps} sukses (fee ${res.feeCC != null ? res.feeCC + ' CC' : '?'})`, COLOR.green); outcome = 'ok'; }
           else { logActivity(`[${tag}] ping-pong gagal (no ok) — retry`, COLOR.yellow); await sleep(4000); outcome = 'retry'; }
           break;
         } catch (e) {
@@ -4934,6 +4992,14 @@ async function runEdelCethAccount(i) {
           // dvpProposalCid timeout = LP gak majuin proposal (stage 3→5, sering LP outage).
           // Retry INFINITE (while-loop tanpa cap). Cleanup proposal orphan diurus swapOnce cap-200.
           if (e && /dvpProposalCid timeout/i.test((e && e.message) || '')) { logActivity(`[${tag}] proposal gak maju (LP tak preconfirm) — retry [${String((e && e.message) || '').replace(/^.*?timeout\s*/i, '').slice(0, 120)}]`, COLOR.yellow); await sleep(4000); outcome = 'retry'; break; }
+          // Jatah traffic node abis — ember dipake BARENGAN semua akun. Tahan lewat gate
+          // global (semua akun ikut berhenti nembak), JANGAN rebuild client / rescan
+          // action-id: sesi & action-id-nya sehat, cuma sequencer yg lagi nolak.
+          if (e && e.trafficLimit) {
+            const s = trafficPenalize();
+            logActivity(`[${tag}] traffic credit node abis — tahan ${s}s (gate global, semua akun)`, COLOR.yellow);
+            await waitTrafficGate(tag); outcome = 'retry'; break;
+          }
           // Error tak-terklasifikasi: JANGAN stop (goal = penuhi task). Retry dgn backoff naik
           // (cap 5 mnt) → infinite. Rebuild client tiap 5 error (jaga-jaga sesi korup). User Ctrl+C
           // kalau mau berhenti. actionIdsVerified di-reset biar ID ke-refresh kalau penyebabnya stale.

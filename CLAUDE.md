@@ -245,6 +245,30 @@ writes it any more.)
 `maxStuckBeforeStop` halts new swaps after N submissions that don't move the DAY_TRADER counter
 — this prevents locking the entire balance in pending settlements.
 
+### Sequencer traffic is one shared bucket — back off globally, not per account
+
+`SEQUENCER_NOT_ENOUGH_TRAFFIC_CREDIT: Member has insufficient traffic credit` is Canton's
+sequencer rate limit, metered **per member (participant node), not per party**. Every account
+sits on the same Supanova node (`partyId` hint `supa1`), so all of them draw from one bucket —
+several accounts get rejected in the same second while others succeed. It refills on its own
+over time; there is nothing to top up. `SEQUENCER_REQUEST_FAILED: Failed to send command`
+appears alongside it and has the same cause.
+
+Per-account backoff therefore does not work: while account A waits, B–E keep firing and the
+bucket never refills. `completionErr()` tags these as `e.trafficLimit` and both engines route
+them to the **global** gate (`TRAFFIC` / `trafficPenalize` / `waitTrafficGate`), which
+`CantonClient.prepareTransaction` awaits — so every account stops submitting together. Backoff
+is 30 s per consecutive hit (cap 5 min), decayed by `trafficRelax()` on each successful swap,
+with a random 0–5 s jitter on release so the accounts don't resume in lockstep and drain it again.
+
+The tag also keeps these errors out of the generic `hardErrs` path, whose client rebuild and
+action-id rescan are pure waste here — the session and action IDs are fine, only the sequencer
+is refusing.
+
+There is no REST endpoint exposing the remaining credit (`/canton/api/traffic*` all 404); the
+`costEstimation.totalTrafficCostEstimation` field in a `prepare_transaction` response
+(~3900 per swap) is the only visible measure of what a transaction spends.
+
 ## Conventions
 
 - Comments, log lines, and dashboard strings are **Indonesian**. Match that when editing; the
