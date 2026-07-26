@@ -337,6 +337,26 @@ function hoursUntilDailyReset() {
 // sering sepi/cepat habis dan counterparty CLOB kadang gak nyelesaiin settlement,
 // sedangkan RFQ di-quote LANGSUNG sama LP (terbukti tetap jalan pas CLOB mandek total,
 // fee malah lebih murah). Dipakai cuma pas mepet reset & target belum kekejar.
+// Set target swap harian SAAT RUN (nimpa config mode8.allowOvercap/dailySwapCount).
+// Kenapa perlu: allowOvercap=true DOANG gak cukup — kalau dailySwapCount tetap 10
+// sedangkan task udah 10/10, startCount >= dailyCap langsung berhenti. Jadi overcap
+// SELALU butuh target > 10. Balikin deskripsi buat di-log, atau null kalau gak dipakai.
+//   'overcap'  → target = dailySwapCount config (kalau > 10) atau 2x task target
+//   'target=N' / 'overcap N' → target = N
+function applyOvercapArg(argv) {
+  let n = null;
+  for (let i = 0; i < argv.length; i++) {
+    const a = String(argv[i]);
+    const m = a.match(/^(?:target|overcap)=(\d+)$/i);
+    if (m) { n = Number(m[1]); break; }
+    if (/^overcap$/i.test(a)) { const nx = Number(argv[i + 1]); n = Number.isFinite(nx) && nx > 0 ? nx : (M8.dailyCap > 10 ? M8.dailyCap : 20); break; }
+  }
+  if (!n || n <= 0) return null;
+  M8.allowOvercap = true;
+  M8.dailyCap = n;
+  return `overcap ON — target ${n} swap/akun (abaikan task penuh 10/10)`;
+}
+
 // Jalur ping-pong yg dipilih SAAT RUN (bukan config): 'clob' = orderbook /terminal
 // (default, perilaku lama), 'rfq' = jalur /swap AtomicDVP. Di-set menu 8 / 8r atau
 // subcommand pingpong / pingpong-rfq. Dipisah biar dua mode gak campur.
@@ -5441,8 +5461,9 @@ Usage:
   node index.js proposals  list settlement aktif (read-only) — cek proposal nyangkut
   node index.js cleanup [idx|all]  reject proposal nyangkut yg 0 dana kelock (default akun 0)
   node index.js cancel-order <orderId> [idx]   batalin order terminal yg masih nyantol di orderbook (TiF GTC)
-  node index.js pingpong       mode 8 via CLOB /terminal, SEMUA akun tanpa menu (headless/pm2)
-  node index.js pingpong-rfq   mode 8 via RFQ /swap AtomicDVP (fee ~1.25 CC, anti-CLOB-macet)
+  node index.js pingpong [overcap N]      mode 8 via CLOB /terminal, SEMUA akun (headless/pm2)
+  node index.js pingpong-rfq [overcap N]  mode 8 via RFQ /swap AtomicDVP (fee ~1.24 CC, anti-CLOB-macet)
+                              overcap N = lanjut swap walau task 10/10 penuh, sampai N swap/akun
   node index.js tif-probe [idx] [GTD|GTC] [ttlSec]  cek server hormatin expiresAt (order jauh dari book, 0 CC)
   node index.js acct-diag [idx]   diagnosa 1 akun (read-only, tanpa OTP): auth/me, KYC, earn-hub task
   node index.js register  cara daftar passkey baru (pakai ekstensi di extension/, atau script Console)
@@ -5915,6 +5936,8 @@ Usage:
     // `node index.js pingpong` — mode 8 (ping-pong EDELx↔cETH) SEMUA akun, PERSIS
     // menu 8 tapi tanpa prompt interaktif → bisa jalan headless (pm2/nohup/tee log).
     PINGPONG_ROUTE = (argv[0] === 'pingpong-rfq' || argv.includes('rfq')) ? 'rfq' : 'clob';
+    const _oc = applyOvercapArg(argv);
+    if (_oc) process.stdout.write(paint(_oc + '\n', COLOR.yellow));
     SESSION_ENGINE = 'pingpong';
     parallelSwapActive = SWAP.parallel;
     process.stdout.write('\n' + paint(`Engine: PING-PONG EDELx↔cETH [${PINGPONG_ROUTE === 'rfq' ? 'RFQ /swap' : 'CLOB /terminal'}] — SEMUA akun${parallelSwapActive ? ` · PARALLEL x${SWAP.concurrency}` : ''}`, COLOR.bold + COLOR.cyan) + '\n');
@@ -6598,6 +6621,16 @@ Usage:
         //   8r = RFQ /swap AtomicDVP. LP nge-quote langsung; fee ~1.25 CC; tetap jalan
         //        waktu settlement CLOB mandek (kejadian 26/07 stage 2 seharian).
         PINGPONG_ROUTE = (ans === '8r') ? 'rfq' : 'clob';
+        // Target swap per akun. Kosong = ikut task earn-hub (berhenti di 10/10).
+        // Isi angka > 10 = overcap: lanjut swap walau task udah penuh.
+        {
+          const t = (await prompt(paint('target swap per akun [Enter = ikut task 10/10, atau angka mis. 20]: ', COLOR.bold))).trim();
+          const n = Number(t);
+          if (t && Number.isFinite(n) && n > 0) {
+            const msg = applyOvercapArg(['target=' + n]);
+            if (msg) process.stdout.write(paint(msg + '\n', COLOR.yellow));
+          }
+        }
         SESSION_ENGINE = 'pingpong';
         parallelSwapActive = SWAP.parallel;
         process.stdout.write('\n' + paint(`Engine: PING-PONG EDELx↔cETH [${PINGPONG_ROUTE === 'rfq' ? 'jalur RFQ /swap' : 'jalur CLOB /terminal'}] — SEMUA akun${parallelSwapActive ? ` · PARALLEL x${SWAP.concurrency}` : ''}`, COLOR.bold + COLOR.cyan) + '\n');
