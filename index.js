@@ -171,6 +171,13 @@ const SWAP = {
   // Tunggu feeSpikeWaitSec lalu cek ulang, retry SAMPAI fee turun (infinity).
   // Fee naik biasanya karena network Canton lagi sibuk → transient.
   maxFeeCC: Number((CONFIG.swap || {}).maxFeeCC) || 3.5,
+  // PLAFON MUTLAK — beda sama maxFeeCC. maxFeeCC itu gate "tunggu sampai fee turun"
+  // yang SENGAJA di-bypass di dua tempat: mode 8 malam (trabas biar task kelar sebelum
+  // reset 07:00) dan opsi 7 (force dump). Di situ batasnya jadi Infinity = gak ada
+  // batas sama sekali, satu spike bisa ngebakar CC sebanyak apa pun. hardMaxFeeCC
+  // berlaku di SEMUA jalur, gak bisa di-bypass ctx.maxFeeCC. Fee normal 1.23 CC (RFQ)
+  // / 4.3 CC (terminal), jadi 15 itu ~3x skenario terburuk. 0 = matikan (gak disaranin).
+  hardMaxFeeCC: Number((CONFIG.swap || {}).hardMaxFeeCC) || 15,
   feeSpikeWaitSec: Number((CONFIG.swap || {}).feeSpikeWaitSec) || 300,
   // 2 swap submit tapi DAY_TRADER gak naik → STOP submit swap baru (cegah balance
   // ke-lock SEMUA di settlement pending). Poll DAY_TRADER tiap stuckPollSec sampai
@@ -250,7 +257,8 @@ const SWAP = {
 
 // ── Mode 8 (ping-pong EDELx↔cETH) config — SEMUA knob opsi 8 di config.json "mode8" ──────────
 // Fallback ke swap.edelCeth* / swap.maxFeeCC / schedule.timezone lama biar config lama tetap jalan.
-// Siang (dayStartHour..dayEndHour WIB): net gate (minNetUsd) + fee gate (maxFeeCC). Malam: trabas.
+// Siang (dayStartHour..dayEndHour WIB): net gate (minNetUsd) + fee gate (maxFeeCC). Malam: trabas
+// — TAPI cuma maxFeeCC yg ditrabas; swap.hardMaxFeeCC tetap nempel (lihat effFeeCap).
 const _m8 = CONFIG.mode8 || {};
 const _m8sw = CONFIG.swap || {};
 const _m8num = (v, d) => (v === '' || v == null || Number.isNaN(Number(v))) ? d : Number(v);
@@ -947,6 +955,15 @@ async function supaBalances(token, proxy) {
   if (r.status >= 400) throw new Error(`balances status=${r.status}`);
   return r.json;
 }
+// Plafon fee efektif buat SATU swap = min(batas per-call, plafon mutlak).
+// ctx.maxFeeCC dipakai mode 8 buat override per-call (malam = Infinity). Plafon
+// mutlak SWAP.hardMaxFeeCC tetap nempel biar override itu gak jadi "tanpa batas".
+function effFeeCap(ctxCap) {
+  const soft = ctxCap != null ? Number(ctxCap) : Number(SWAP.maxFeeCC);
+  const hard = Number(SWAP.hardMaxFeeCC);
+  return hard > 0 ? Math.min(soft, hard) : soft;
+}
+
 // ── Gate traffic-credit sequencer Canton ────────────────────────────────────
 // `SEQUENCER_NOT_ENOUGH_TRAFFIC_CREDIT: Member has insufficient traffic credit`
 // itu rate-limit sequencer yg dihitung PER MEMBER (participant node), BUKAN per
@@ -1942,7 +1959,7 @@ async function swapOnce(ctx, direction, quantityCC) {
   const A = SWAP.actionIds, amount = String(quantityCC), dso = SWAP.dsoPartyId;
   // Batas fee per-call: ctx.maxFeeCC override (mode 8 malam → Infinity buat trabas). Mode
   // lain gak pass → fallback SWAP.maxFeeCC (perilaku lama, gak berubah).
-  const feeCap = ctx.maxFeeCC != null ? Number(ctx.maxFeeCC) : Number(SWAP.maxFeeCC);
+  const feeCap = effFeeCap(ctx.maxFeeCC);
   const market = L.market || SWAP.market;
   const legBaseIsCC = L.baseIsCC != null ? L.baseIsCC : SWAP.baseIsCC;
   const legTokenToToken = L.tokenToToken != null ? L.tokenToToken : SWAP.tokenToToken;
@@ -2666,7 +2683,7 @@ async function swapOnceAtomic(ctx, side, baseQty) {
   const L = ctx.leg || {};
   const market = L.market || 'EDELx-cETH';
   const [baseId, quoteId2] = String(market).split('-');     // EDELx, cETH
-  const feeCap = ctx.maxFeeCC != null ? Number(ctx.maxFeeCC) : Number(SWAP.maxFeeCC);
+  const feeCap = effFeeCap(ctx.maxFeeCC);
 
   // 1. Quote v2 (rfqId dari /api/rfq/stream v1 DITOLAK acceptQuoteAtomic).
   const rq = await sv.swapAction(SWAP.actionIds.requestQuotesV2, [{ partyId, marketId: market, direction: side, quantity: String(baseQty) }]);
@@ -2843,7 +2860,7 @@ async function settleTerminalProposal(ctx, proposal, consumedSet) {
   const legTokenId = L.tokenId || SWAP.tokenId;
   const legTokenLabel = L.tokenLabel || SWAP.tokenLabel;
   const legTokenAdmin = L.tokenAdmin || SWAP.tokenAdmin;
-  const feeCap = ctx.maxFeeCC != null ? Number(ctx.maxFeeCC) : Number(SWAP.maxFeeCC);
+  const feeCap = effFeeCap(ctx.maxFeeCC);
 
   // 1. Preconfirm terminal: submitPreconfirmation + recordEvent(preconfirmation_role,
   //    holdingsByToken {CC,token}) → LP/orderbook majuin proposal → dvpProposalCid.

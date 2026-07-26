@@ -47,6 +47,8 @@
     "minAmount": "5",
     "maxAmount": "5.1",
     "maxFeeCC": 5,
+    "_help_hardMaxFeeCC": "PLAFON MUTLAK fee per swap (CC). Beda dari maxFeeCC: maxFeeCC itu gate 'tunggu sampai fee turun' yang SENGAJA dibypass di mode8 malam (trabas biar task kelar sebelum reset 07:00) dan opsi 7 (force dump) -> di situ batasnya jadi tanpa batas. hardMaxFeeCC berlaku di SEMUA jalur dan TIDAK bisa dibypass, jadi satu fee spike gak bisa ngebakar CC sebanyak apa pun. Fee normal 1.23 CC (RFQ) / 4.3 CC (terminal). 0 = matikan (gak disaranin).",
+    "hardMaxFeeCC": 15,
     "feeSpikeWaitSec": 300,
     "maxStuckBeforeStop": 2,
     "stuckPollSec": 300,
