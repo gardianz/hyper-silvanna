@@ -2937,6 +2937,10 @@ async function settleTerminalProposal(ctx, proposal, consumedSet) {
     const st = await sv.swapAction(A.pollProposal, [{ settlementId: proposalId, partyId }]).catch(e => ({ _err: e && e.message }));
     lastPoll = st;
     if (st && typeof st.dvpProposalCid === 'string' && st.dvpProposalCid.startsWith('00')) { dvpCid = st.dvpProposalCid; break; }
+    // stage >= 9 tanpa dvpProposalCid = settlement-nya UDAH DITUTUP (terpantau live:
+    // stage 13 + status SETTLEMENT_STATUS_CANCELLED). Gak akan ada DvpProposal lagi,
+    // jadi nunggu sisa waktunya percuma — dulu tetap dijagain sampai 82s tiap percobaan.
+    if (st && Number(st.stage) >= 9) break;
     if (Date.now() - tPoll > baseMs) {
       const mine = st ? (weAreBuyer ? st.buyerNextAction : st.sellerNextAction) : undefined;
       if (mine != null && mine !== WAIT_ACTION) break;   // giliran kita → jangan tunggu lama
@@ -2946,8 +2950,22 @@ async function settleTerminalProposal(ctx, proposal, consumedSet) {
   }
   if (!dvpCid) {
     const mine = lastPoll ? (weAreBuyer ? lastPoll.buyerNextAction : lastPoll.sellerNextAction) : undefined;
-    const e = new Error(`dvpProposalCid timeout setelah ${Math.round((Date.now() - tPoll) / 1000)}s${mine === WAIT_ACTION ? ' — sisi kita SELESAI, counterparty yg gak lanjut' : ''} (last=${JSON.stringify(lastPoll).slice(0, 160)})`);
-    if (mine === WAIT_ACTION) e.counterpartyStalled = true;   // bukan salah kita → jangan hitung hardErr
+    // Payload poll UTUH ke swap-debug.log — pesan error-nya kepotong 160 char, padahal
+    // justru field di ekornya (status/stage/alasan) yg nerangin kenapa settlement mati.
+    logDebug(`pollProposal timeout proposalId=${proposalId} stage=${lastPoll && lastPoll.stage} weAreBuyer=${weAreBuyer}`, lastPoll);
+    // Sinyal "sisi kita udah kelar" TIDAK cukup diambil dari nextAction. Begitu settlement
+    // ditutup, API balikin nextAction 0 buat KEDUA sisi (bukan 7=WAIT), jadi patokan lama
+    // salah baca kasus ini sebagai "giliran kita" alias bug sisi kita. Yang bener dibaca
+    // dari flag preconfirm: kita true & lawan false = lawan yg gak pernah gerak.
+    const ourPre = lastPoll ? (weAreBuyer ? lastPoll.buyerPreconfirmed : lastPoll.sellerPreconfirmed) : undefined;
+    const theirPre = lastPoll ? (weAreBuyer ? lastPoll.sellerPreconfirmed : lastPoll.buyerPreconfirmed) : undefined;
+    const theirRej = lastPoll ? (weAreBuyer ? lastPoll.sellerRejected : lastPoll.buyerRejected) : undefined;
+    const stalled = mine === WAIT_ACTION || (ourPre === true && theirPre === false);
+    const why = theirRej ? ' — counterparty NOLAK'
+      : stalled ? ` — sisi kita SELESAI (preconfirmed), counterparty gak pernah preconfirm${Number(lastPoll && lastPoll.stage) >= 9 ? `, settlement ditutup di stage ${lastPoll.stage}` : ''}`
+        : '';
+    const e = new Error(`dvpProposalCid timeout setelah ${Math.round((Date.now() - tPoll) / 1000)}s${why} (last=${JSON.stringify(lastPoll).slice(0, 200)})`);
+    if (stalled) e.counterpartyStalled = true;   // bukan salah kita → jangan hitung hardErr
     throw e;
   }
 
@@ -6014,25 +6032,34 @@ Usage:
     process.stdout.write(paint(`pair: ${SWAP.market} (CC↔${SWAP.tokenLabel})\n`, COLOR.cyan));
     (async () => { global.__states = makeStates(); render(global.__states); await runDayTraderSession('manual'); process.exit(0); })().catch(e => { console.error(paint('FATAL: ' + e.message, COLOR.red)); process.exit(1); });
   } else if (argv[0] === 'proposals') {
-    // `node index.js proposals` — list settlement/DvpProposal aktif (read-only).
-    // Buat ngecek apakah feecheck/skip-spike ninggalin proposal nyangkut.
+    // `node index.js proposals [idx|all]` — list settlement/DvpProposal aktif (read-only).
+    // Buat ngecek apakah feecheck/skip-spike ninggalin proposal nyangkut. Dulu hardcode
+    // akun 0 doang — proposal nyangkut di akun lain gak kelihatan (sama kayak `cleanup`).
+    // nextAction dicetak juga: itu yg ngebedain "kita yg belum gerak" vs "LP yg diem".
     (async () => {
-      const a = ACCOUNTS[0];
-      if (!a) { console.error(paint('accounts.json kosong', COLOR.red)); process.exit(1); }
-      const state = makeStates()[0];
-      const { sv, partyId } = await buildSwapClients(state);
-      const allRaw = await sv.listSettlementProposals(partyId).catch(() => []);
-      const all = allRaw.filter(p => p.buyer === partyId || p.seller === partyId);
-      process.stdout.write(paint(`\nparty ${partyId.slice(0, 24)}… — total proposals: ${all.length}\n`, COLOR.cyan));
-      for (const p of all) {
-        const st = await sv.swapAction(SWAP.actionIds.pollProposal, [{ settlementId: p.proposalId, partyId }]).catch(() => null);
-        const stage = (st && st.stage) || 0;
-        const isBuyer = p.buyer === partyId;
-        const ourAlloc = st ? (isBuyer ? st.allocationBuyerCid : st.allocationSellerCid) : null;
-        const locked = ourAlloc && ourAlloc !== '$undefined';
-        const rej = st && (st.buyerRejected || st.sellerRejected);
-        const tag = stage >= 9 ? 'SETTLED' : rej ? 'REJECTED' : locked ? 'LOCKED(dana kita kekunci)' : 'pending(0 dana kita)';
-        process.stdout.write(`  - ${p.proposalId.slice(0, 16)}… stage ${stage} ${isBuyer ? 'BUY' : 'SELL'} ${p.baseQuantity} CC → ${paint(tag, locked ? COLOR.red : stage >= 9 ? COLOR.green : COLOR.gray)}\n`);
+      const arg = String(argv[1] || '0');
+      const idxs = arg === 'all' ? ACCOUNTS.map((_, i) => i) : [Number(arg) || 0];
+      for (const _i of idxs) {
+        const a = ACCOUNTS[_i];
+        if (!a) { console.error(paint(`akun idx ${_i} gak ada`, COLOR.red)); continue; }
+        const state = makeStates()[_i];
+        const { sv, partyId } = await buildSwapClients(state);
+        const allRaw = await sv.listSettlementProposals(partyId, { includeClosed: true }).catch(() => []);
+        const all = allRaw.filter(p => p.buyer === partyId || p.seller === partyId);
+        process.stdout.write(paint(`\n▎ ${a.label || a.email} — party ${partyId.slice(0, 20)}… — ${all.length} proposal\n`, COLOR.bold + COLOR.cyan));
+        for (const p of all) {
+          const st = await sv.swapAction(SWAP.actionIds.pollProposal, [{ settlementId: p.proposalId, partyId }]).catch(() => null);
+          const stage = (st && st.stage) || 0;
+          const isBuyer = p.buyer === partyId;
+          const ourAlloc = st ? (isBuyer ? st.allocationBuyerCid : st.allocationSellerCid) : null;
+          const locked = ourAlloc && ourAlloc !== '$undefined';
+          const rej = st && (st.buyerRejected || st.sellerRejected);
+          const tag = stage >= 9 ? 'SETTLED' : rej ? 'REJECTED' : locked ? 'LOCKED(dana kita kekunci)' : 'pending(0 dana kita)';
+          // nextAction: 1=preconfirm 2/5=pay_fee 3/4/8=sign_contract 6=allocate 7=WAIT.
+          // 7 di sisi kita = giliran lawan; lawan bukan 7 = lawan yg belum gerak.
+          const na = st ? `buyerNext=${st.buyerNextAction} sellerNext=${st.sellerNextAction}` : 'nextAction=?';
+          process.stdout.write(`  - ${p.proposalId.slice(0, 16)}… stage ${stage} ${isBuyer ? 'BUY' : 'SELL'} ${p.baseQuantity} · ${na} · status ${p.status || '-'} → ${paint(tag, locked ? COLOR.red : stage >= 9 ? COLOR.green : COLOR.gray)}\n`);
+        }
       }
       process.exit(0);
     })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
