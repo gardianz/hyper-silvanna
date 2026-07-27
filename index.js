@@ -179,6 +179,20 @@ const SWAP = {
   // / 4.3 CC (terminal), jadi 15 itu ~3x skenario terburuk. 0 = matikan (gak disaranin).
   hardMaxFeeCC: Number((CONFIG.swap || {}).hardMaxFeeCC) || 15,
   feeSpikeWaitSec: Number((CONFIG.swap || {}).feeSpikeWaitSec) || 300,
+  // === ANTI-DEADLOCK ===
+  // Loop sync (tunggu counter earn-hub naik) dulu default 0 = TANPA batas. Fatal pas
+  // reset harian lewat: count balik ke 0 sedangkan pembanding masih 10, jadi syarat
+  // "count naik" gak akan pernah kepenuhi lagi → loop abadi, sesi gak pernah kelar.
+  settleWaitMaxMin: Number((CONFIG.swap || {}).settleWaitMaxMin) || 15,
+  // Batas satu akun boleh jalan dalam satu sesi. Tanpa ini, satu akun yg nyangkut di
+  // await yg gak pernah balik nyandera mapLimit → seluruh sesi gak pernah selesai.
+  accountMaxMin: Number((CONFIG.swap || {}).accountMaxMin) || 180,
+  // Umur maksimum flag dtSessionRunning. Lewat ini flag dianggap basi dan dipaksa
+  // lepas — kalau nggak, cron harian dilewati terus ("Sesi masih berjalan").
+  sessionMaxHours: Number((CONFIG.swap || {}).sessionMaxHours) || 8,
+  // Selagi sesi jalan, tetap segarin angka task tiap sekian menit. Dulu tickAll
+  // di-gate total sama dtSessionRunning → dashboard beku nampilin angka kemarin.
+  tickWhileSessionMin: Number((CONFIG.swap || {}).tickWhileSessionMin) || 10,
   // 2 swap submit tapi DAY_TRADER gak naik → STOP submit swap baru (cegah balance
   // ke-lock SEMUA di settlement pending). Poll DAY_TRADER tiap stuckPollSec sampai
   // naik (pending akhirnya settle & unlock), baru lanjut swap lagi.
@@ -3556,6 +3570,46 @@ async function refreshExpiringTokens(states) {
 //  DAY_TRADER engine — API-driven, anti-overcap (no local count file)
 // ============================================================================
 let dtSessionRunning = false;
+let dtSessionStartMs = 0;
+
+// Gerbang masuk sesi — balik false berarti "lewati". Dulu cek-nya cuma
+// `if (dtSessionRunning) return`, dan itu bikin satu kegagalan jadi permanen:
+// kalau ada akun nyangkut, mapLimit gak pernah resolve → `finally` gak jalan →
+// flag true SELAMANYA. Akibatnya cron harian dilewati terus DAN tickAll ikut
+// ke-gate, jadi dashboard beku nampilin angka kemarin (kejadian 27/07: sesi
+// mulai, senyap 5 jam, cron 07:00 WIB cuma nulis "Sesi masih berjalan").
+// Sekarang flag yg lebih tua dari sessionMaxHours dianggap basi dan dipaksa lepas.
+function claimSession(reason) {
+  if (dtSessionRunning) {
+    const ageMs = dtSessionStartMs ? Date.now() - dtSessionStartMs : 0;
+    const capMs = Math.max(1, Number(SWAP.sessionMaxHours) || 8) * 3600000;
+    if (!(dtSessionStartMs && ageMs > capMs)) {
+      logActivity(`Sesi masih berjalan ${Math.round(ageMs / 60000)} mnt, lewati (${reason || ''})`, COLOR.gray);
+      return false;
+    }
+    logActivity(`Sesi sebelumnya nyangkut ${Math.round(ageMs / 60000)} mnt (> ${Math.round(capMs / 3600000)} jam) — flag dipaksa lepas, lanjut (${reason || ''})`, COLOR.yellow);
+  }
+  dtSessionRunning = true;
+  dtSessionStartMs = Date.now();
+  return true;
+}
+
+// Jalanin kerjaan satu akun dengan batas waktu. Promise-nya gak bisa dibatalin —
+// yg nyangkut tetap nyangkut di background — tapi mapLimit lanjut, jadi sesi tetap
+// kelar dan flag sesi kelepas. Itu bedanya antara "satu akun gagal" dan "bot mati".
+function withAccountDeadline(fn, label) {
+  const capMs = Math.max(0, Number(SWAP.accountMaxMin) || 0) * 60000;
+  if (!capMs) return fn();
+  // JANGAN unref timer ini. Kalau di-unref dan kebetulan gak ada handle lain yg
+  // idup, Node keluar sebelum timernya nyala — deadline-nya jadi gak pernah kejadian.
+  // Timernya di-clearTimeout begitu fn beres, jadi gak nahan proses lebih lama.
+  let t = null;
+  const guard = new Promise((res) => {
+    t = setTimeout(() => { logActivity(`[${label}] nyangkut > ${Math.round(capMs / 60000)} mnt — dilepas, sesi lanjut tanpa akun ini`, COLOR.red); res(null); }, capMs);
+  });
+  return Promise.race([Promise.resolve().then(fn).finally(() => { if (t) clearTimeout(t); }), guard]);
+}
+
 // Sekali per-proses: true setelah action IDs diverifikasi/di-discover valid.
 // Reset jadi false otomatis saat swapAction kena 404 (redeploy mid-run) →
 // ensureActionIds di loop swap re-discover otomatis (self-heal mid-run).
@@ -4349,7 +4403,14 @@ async function _accountSwapOnce(i) {
           render(global.__states);
           if (realDt && realDt.current > baseCount) break;                          // ✓ settle ke-register on-chain
           if (SWAP.allowOvercap && realDt && realDt.current >= realDt.target) break; // saturated — count gak bakal naik
-          if (MAX_WAIT_MS && Date.now() - tStart > MAX_WAIT_MS) {                    // cap opsional (default OFF)
+          // Reset harian (07:00 WIB) lewat di tengah nunggu: count balik ke 0 sedangkan
+          // baseCount masih angka kemarin → syarat "count > baseCount" mustahil kepenuhi
+          // selamanya. Tanpa ini loop-nya abadi walau settle-nya sendiri sukses.
+          if (realDt && realDt.current < baseCount) {
+            logActivity(`[${tag}] task ke-reset harian (${baseCount}→${realDt.current}) — sync distop, lanjut`, COLOR.yellow);
+            break;
+          }
+          if (MAX_WAIT_MS && Date.now() - tStart > MAX_WAIT_MS) {                    // cap waktu (settleWaitMaxMin)
             logActivity(`[${tag}] settle belum ke-register ${Math.round(MAX_WAIT_MS / 60000)} mnt — lanjut (cap settleWaitMaxMin)`, COLOR.yellow);
             break;
           }
@@ -4608,15 +4669,15 @@ async function runAccountSwapSession(i) {
 // Orkestrasi sesi swap semua akun. parallel (config swap.parallel, cuma opsi 0/1)
 // vs sequential 1-per-1. OTP mutex global + token watcher bikin parallel aman.
 async function runDayTraderSession(reason) {
-  if (dtSessionRunning) { logActivity(`Sesi masih berjalan, lewati (${reason || ''})`, COLOR.gray); return; }
-  dtSessionRunning = true;
+  if (!claimSession(reason)) return;
   const conc = Math.max(1, Number(SWAP.concurrency) || 1);
+  const lbl = (i) => (ACCOUNTS[i] && (ACCOUNTS[i].label || ACCOUNTS[i].email)) || `akun ${i}`;
   logActivity(`Mulai cek & auto-swap (${reason || 'manual'})${parallelSwapActive ? ` [parallel x${conc}]` : ''}`, COLOR.cyan);
   try {
     if (parallelSwapActive) {
-      await mapLimit(ACCOUNTS.map((_, i) => i), conc, runAccountSwapSession);
+      await mapLimit(ACCOUNTS.map((_, i) => i), conc, (i) => withAccountDeadline(() => runAccountSwapSession(i), lbl(i)));
     } else {
-      for (let i = 0; i < ACCOUNTS.length; i++) await runAccountSwapSession(i);
+      for (let i = 0; i < ACCOUNTS.length; i++) await withAccountDeadline(() => runAccountSwapSession(i), lbl(i));
     }
     logActivity('Sesi selesai — berhenti sampai jadwal berikutnya.', COLOR.cyan);
   } finally { dtSessionRunning = false; }
@@ -5055,6 +5116,13 @@ async function runEdelCethAccount(i) {
           if (recvNow > recvBefore + Math.max(recvBefore * 0.25, 1e-7)) recvOk = true; // token recv udah kebayar
           if (countUp && recvOk) { logActivity(`[${tag}] ✓ confirmed (EDELx-cETH ${dt.current}/${dt.target}, ${recvId === 'CETH' ? 'cETH' : 'EDELx'} ${floor6(recvNow)} kebayar)`, COLOR.green); break; }
           if (chk.dt && chk.dt.current >= chk.dt.target && recvOk) break;        // target penuh & saldo masuk
+          // Reset harian lewat pas nunggu → count jatuh ke 0, countBefore masih angka
+          // kemarin, jadi countUp gak akan pernah true lagi. Ini persis yg bikin sesi
+          // 27/07 nyangkut. Keluar, biarin ronde berikutnya baca angka yg udah reset.
+          if (chk.dt && chk.dt.current < countBefore) {
+            logActivity(`[${tag}] task ke-reset harian (${countBefore}→${chk.dt.current}) — sync distop, lanjut`, COLOR.yellow);
+            break;
+          }
           if (MAX_WAIT_MS && Date.now() - tStart > MAX_WAIT_MS) { logActivity(`[${tag}] settle/saldo belum kebaca ${Math.round(MAX_WAIT_MS / 60000)} mnt — lanjut (cap settleWaitMaxMin)`, COLOR.yellow); break; }
         }
         // Refresh POIN tiap sync selesai; STREAK cuma swap PERTAMA daily (date-gate streakSyncDate).
@@ -5112,13 +5180,13 @@ async function runEdelCethAccount(i) {
   }
 }
 async function runEdelCethSession(reason) {
-  if (dtSessionRunning) { logActivity(`Sesi masih berjalan, lewati (${reason || ''})`, COLOR.gray); return; }
-  dtSessionRunning = true;
+  if (!claimSession(reason)) return;
   const conc = Math.max(1, Number(SWAP.concurrency) || 1);
+  const lbl = (i) => (ACCOUNTS[i] && (ACCOUNTS[i].label || ACCOUNTS[i].email)) || `akun ${i}`;
   logActivity(`Mulai ping-pong EDELx↔cETH (${reason || 'manual'})${parallelSwapActive ? ` [parallel x${conc}]` : ''}`, COLOR.cyan);
   try {
-    if (parallelSwapActive) await mapLimit(ACCOUNTS.map((_, i) => i), conc, runEdelCethAccount);
-    else for (let i = 0; i < ACCOUNTS.length; i++) await runEdelCethAccount(i);
+    if (parallelSwapActive) await mapLimit(ACCOUNTS.map((_, i) => i), conc, (i) => withAccountDeadline(() => runEdelCethAccount(i), lbl(i)));
+    else for (let i = 0; i < ACCOUNTS.length; i++) await withAccountDeadline(() => runEdelCethAccount(i), lbl(i));
     logActivity('Sesi ping-pong selesai — berhenti sampai jadwal berikutnya.', COLOR.cyan);
   } finally { dtSessionRunning = false; }
 }
@@ -5403,9 +5471,17 @@ async function runMain() {
 
   runSwapSession('startup').then(() => tickAll(states).catch(() => { })).catch(e => logActivity('sesi startup error: ' + e.message, COLOR.red));
 
+  // Dulu tickAll ke-gate TOTAL sama dtSessionRunning, jadi selagi sesi jalan angka
+  // task gak pernah dibaca ulang. Pas sesi nyangkut, dashboard beku nampilin angka
+  // kemarin — kelihatan "10/10 selesai" padahal task-nya udah reset berjam-jam lalu.
+  // Sekarang tetap disegarkan tiap tickWhileSessionMin walau sesi aktif.
+  let lastTickMs = Date.now();
   while (true) {
     await sleep(REFRESH_SEC * 1000);
-    if (dtSessionRunning) render(states); else await tickAll(states);
+    if (!dtSessionRunning) { await tickAll(states); lastTickMs = Date.now(); continue; }
+    render(states);
+    const gap = Math.max(0, Number(SWAP.tickWhileSessionMin) || 0) * 60000;
+    if (gap && Date.now() - lastTickMs > gap) { lastTickMs = Date.now(); await tickAll(states).catch(() => { }); }
   }
 }
 
