@@ -2645,6 +2645,19 @@ async function cancelInflight(log = () => { }) {
 const UTIL_NS = 'utility.digitalasset.com/';
 // Konteks transfer utk 1 instrument. inputHoldingCids WAJIB punya SISI PENGIRIM —
 // kosong / salah sisi = 500 (terverifikasi: digest 4118613165 / 1034054957).
+// Respons "context" dari server pernah DATAR ({factoryId, disclosedContracts, …}) dan
+// sejak salah satu redeploy DIBUNGKUS ({ok:true, context:{factoryId, …}}). Semua cek di
+// bawah (facOf / pickInstrumentConfigCid / disclosedContracts / choiceContextData) baca
+// dari level atas, jadi begitu servernya membungkus, respons SUKSES kebaca sebagai GAGAL
+// — persis kejadian "utilityTransferFactory(EDELx) gagal — holding kita(2) → {"ok":true,
+// "context":{"factoryId":…}}". Buka bungkusnya di satu tempat, terima dua-duanya biar
+// gak pecah lagi kalau servernya balik ke bentuk lama.
+function unwrapCtx(r) {
+  if (!r || typeof r !== 'object') return r;
+  const c = r.context;
+  if (c && typeof c === 'object' && (c.factoryId || c.factory || c.choiceContextData || c.choiceContext || c.disclosedContracts || c.disclosed)) return c;
+  return r;
+}
 async function utilityTransferCtx(sv, { admin, id, amount, sender, receiver, holdingCids, altHoldingCids }) {
   const now = new Date();
   const mk = (hold) => [{
@@ -2664,9 +2677,10 @@ async function utilityTransferCtx(sv, { admin, id, amount, sender, receiver, hol
   // are invalid" dst) kebuang. Bikin kejadian nyata di lapangan gak bisa didiagnosa.
   const errs = [];
   for (const [what, hold] of tries) {
-    const r = await sv.swapAction(SWAP.actionIds.utilityTransferFactory, mk(hold)).catch(e => ({ _err: (e && e.message) || String(e) }));
+    const raw = await sv.swapAction(SWAP.actionIds.utilityTransferFactory, mk(hold)).catch(e => ({ _err: (e && e.message) || String(e) }));
+    const r = raw && raw._err ? raw : unwrapCtx(raw);
     if (r && !r._err && (r.factoryId || (r.factory && r.factory.factoryId))) return r;
-    const why = (r && (r._err || r.error || r.message)) || JSON.stringify(r || null);
+    const why = (r && (r._err || r.error || r.message)) || JSON.stringify(raw || null);
     errs.push(`${what}(${(hold || []).length}) → ${String(why).replace(/\s+/g, ' ').slice(0, 140)}`);
   }
   throw new Error(`utilityTransferFactory(${id}) gagal — ${errs.join(' | ')}`);
@@ -2775,13 +2789,16 @@ async function swapOnceAtomic(ctx, side, baseQty) {
     // registry: EDELx/cETH). UI pakai getTransferFactoryContextAction = SWAP.actionIds
     // .prepareTransfer — bentuk args-nya sama persis (capture UI reqid 492).
     const now = new Date();
-    const fc = await sv.swapAction(SWAP.actionIds.prepareTransfer, [{
+    const fcRaw = await sv.swapAction(SWAP.actionIds.prepareTransfer, [{
       receiver: fee0.receiver, amount: String(fee0.amount),
       instrumentId: { admin: fee0.instrumentAdmin, id: fee0.instrumentId },
       requestedAt: now.toISOString(),
       executeBefore: new Date(now.getTime() + 130_000).toISOString(),
       sender: partyId, inputHoldingCids: ccHoldings.slice(0, 8),
     }]);
+    // Jalur Amulet kena bungkus `context` yg sama. Di sini lebih berbahaya: hasilnya
+    // `|| null`, jadi kalau kelewat dia gagal DIAM-DIAM, bukan melempar.
+    const fc = unwrapCtx(fcRaw);
     feeFactoryCid = (fc && (fc.factoryId || (fc.factory && fc.factory.factoryId))) || null;
     feeDisclosed = (fc && (fc.disclosedContracts || fc.disclosed)) || [];
     // fees[].extraArgs WAJIB = choiceContextData dari factory Amulet (transfer-preapproval,
@@ -6256,10 +6273,11 @@ Usage:
         for (const [label, args] of variants) {
           // _probeAction: raw RSC, gak throw & gak motong → pesan error server kebaca utuh.
           const p = await sv._probeAction(SWAP.actionIds.utilityTransferFactory, args, 15000);
-          const ok = p && p.status === 200 && p.value && !p.value.error && (p.value.factoryId || p.value.factory || p.value.choiceContext || p.value.choiceContextData);
+          const pv = unwrapCtx(p && p.value);   // bentuk baru: {ok:true, context:{…}}
+          const ok = p && p.status === 200 && pv && !pv.error && (pv.factoryId || pv.factory || pv.choiceContext || pv.choiceContextData);
           if (ok) {
-            olog(`     ✓ ${label} → keys: ${Object.keys(p.value).join(', ')}`, COLOR.green);
-            ctxOut[iid] = { transferFactory: p.value, argsShape: label };
+            olog(`     ✓ ${label} → keys: ${Object.keys(pv).join(', ')}`, COLOR.green);
+            ctxOut[iid] = { transferFactory: pv, argsShape: label };
             break;
           }
           const msg = (p && p.value && (p.value.error || p.value.message)) || (p && p.text ? String(p.text).replace(/\s+/g, ' ').slice(0, 220) : '?');
