@@ -2655,16 +2655,21 @@ async function utilityTransferCtx(sv, { admin, id, amount, sender, receiver, hol
   }];
   // Server nolak (500, pesan disembunyiin Next.js) kalau inputHoldingCids bukan milik
   // sisi pengirim. Aturan pastinya beda-beda per arah, jadi coba beberapa bentuk.
-  const tries = [holdingCids || []];
-  if (altHoldingCids && altHoldingCids.length) tries.push(altHoldingCids);
-  tries.push([]);
-  let last = null;
-  for (const hold of tries) {
+  const tries = [['holding kita', holdingCids || []]];
+  if (altHoldingCids && altHoldingCids.length) tries.push(['holding LP', altHoldingCids]);
+  tries.push(['tanpa holding', []]);
+  // Kumpulin SEMUA kegagalan, jangan cuma yg terakhir. Dulu yg dilempar cuma percobaan
+  // pamungkas (inputHoldingCids: []) yg SELALU balik "No holdings provided" — pesan yg
+  // gak bisa ditindaklanjuti, sementara alasan asli percobaan pertama ("Given holdings
+  // are invalid" dst) kebuang. Bikin kejadian nyata di lapangan gak bisa didiagnosa.
+  const errs = [];
+  for (const [what, hold] of tries) {
     const r = await sv.swapAction(SWAP.actionIds.utilityTransferFactory, mk(hold)).catch(e => ({ _err: (e && e.message) || String(e) }));
     if (r && !r._err && (r.factoryId || (r.factory && r.factory.factoryId))) return r;
-    last = r;
+    const why = (r && (r._err || r.error || r.message)) || JSON.stringify(r || null);
+    errs.push(`${what}(${(hold || []).length}) → ${String(why).replace(/\s+/g, ' ').slice(0, 140)}`);
   }
-  throw new Error(`utilityTransferFactory(${id}) gagal: ${JSON.stringify(last).slice(0, 200)}`);
+  throw new Error(`utilityTransferFactory(${id}) gagal — ${errs.join(' | ')}`);
 }
 // Ambil cid InstrumentConfiguration dari disclosedContracts hasil context.
 function pickInstrumentConfigCid(ctx) {
