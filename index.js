@@ -3130,7 +3130,11 @@ function renderHeader() {
 // Status akun → [teks, warna]. Dipakai sel STATUS di table.
 function statusInfo(state) {
   const d = state.dayTrader;
+  const o = state.overcap;
   if (state.status === 'error') return ['● Error', COLOR.red];
+  // Pas overcap, task penuh 10/10 BUKAN berarti kelar — patokannya target overcap.
+  // Tanpa ini semua baris nampilin "Selesai" padahal masih nge-swap.
+  if (o && Number(o.target) > 0 && Number(o.done) < Number(o.target)) return ['● Swap', COLOR.yellow];
   if (d && d.count >= d.target) return ['● Selesai', COLOR.green];
   if (dtSessionRunning) return ['● Swap', COLOR.yellow];
   if (state.status === 'login') return ['● Login', COLOR.yellow];
@@ -3168,10 +3172,24 @@ function renderAccountsTable(states) {
   const tokenCols = SESSION_ENGINE === 'pingpong'
     ? [{ title: 'cETH', prio: 1, cap: 12, cell: tokCell('CETH', fmtCeth) }, { title: 'EDELx', prio: 1, cap: 12, cell: tokCell('EDELX', fmtEdelx) }]
     : [{ title: SWAP.tokenLabel, prio: 1, cap: 12, cell: tokCell(SWAP.tokenId, fmtForToken(SWAP.tokenId)) }];
+  // Kolom OVERCAP cuma muncul kalau overcap emang lagi jalan — kolom SWAP mentok di
+  // task earn-hub (10/10) jadi pas overcap progres sebenernya (mis. 22/50) gak keliatan
+  // sama sekali. prio 0 = jangan didrop pas terminal sempit; percuma nyalain overcap
+  // kalau angkanya justru ilang duluan.
+  const overcapCols = (Array.isArray(states) && states.some(s => s && s.overcap && Number(s.overcap.target) > 0))
+    ? [{
+      title: 'OVERCAP', prio: 0, cap: 9, cell: s => {
+        const o = s && s.overcap;
+        if (!o || !(Number(o.target) > 0)) return ['-', COLOR.gray];
+        return [`${o.done}/${o.target}`, Number(o.done) >= Number(o.target) ? COLOR.green : COLOR.cyan];
+      }
+    }]
+    : [];
   const COLS = [
     { title: 'AKUN', prio: 0, cap: 16, align: 'l', cell: s => [truncVis(s.label || '-', 16), COLOR.bold] },
     { title: 'STATUS', prio: 1, cap: 10, cell: s => statusInfo(s) },
     { title: 'SWAP', prio: 0, cap: 7, cell: s => [s.dayTrader ? `${s.dayTrader.count}/${s.dayTrader.target}` : '-', s.dayTrader && s.dayTrader.count >= s.dayTrader.target ? COLOR.green : COLOR.white] },
+    ...overcapCols,
     { title: 'CC', prio: 1, cap: 12, cell: s => { const b = balOf(s, 'AMULET'); return [b ? fmtCC(b.unlocked) + (b.locked > 1e-8 ? '+' + fmtCC(b.locked) : '') : '-', COLOR.green]; } },
     ...tokenCols,
     { title: 'POIN', prio: 3, cap: 9, cell: s => [s.points != null ? fmtThousand(s.points) : '-', COLOR.mag] },
@@ -3690,7 +3708,7 @@ async function ensureActionIds(sv, partyId, tag) {
 function makeStates() {
   return ACCOUNTS.map((a, i) => {
     const d = loadDaily(a.email);
-    return { label: a.label || `akun-${i + 1}`, email: a.email, privyEmail: a.privyEmail || null, status: 'idle', message: '', balances: null, dayTrader: null, points: null, pointsDiff: d.pointsDiff, volume: null, activity: null, streak: null, log: [], feeToday: d.feeToday, spreadToday: d.spreadToday, feeSeason: d.feeSeason, spreadSeason: d.spreadSeason, statDate: d.statDate };
+    return { label: a.label || `akun-${i + 1}`, email: a.email, privyEmail: a.privyEmail || null, status: 'idle', message: '', balances: null, dayTrader: null, overcap: null, points: null, pointsDiff: d.pointsDiff, volume: null, activity: null, streak: null, log: [], feeToday: d.feeToday, spreadToday: d.spreadToday, feeSeason: d.feeSeason, spreadSeason: d.spreadSeason, statDate: d.statDate };
   });
 }
 
@@ -4244,6 +4262,10 @@ async function _accountSwapOnce(i) {
     let stuck = 0;
     let lowFeeStreak = 0;
     let done = 0;
+    // Progres overcap buat kolom OVERCAP (engine daytrader). Alasannya sama kayak mode 8:
+    // kolom SWAP mentok di target task, jadi swap ke-11 dst gak keliatan progresnya.
+    state.overcap = (SWAP.allowOvercap && dailyCap > apiCap) ? { done: startApi, target: effective } : null;
+    const bumpOvercap = () => { if (state.overcap) state.overcap.done = startApi + done; };
     while (done < need) {
       // Refresh token Privy/Silvana kalau mendekati expired (session bisa berjam-jam)
       try {
@@ -4539,6 +4561,7 @@ async function _accountSwapOnce(i) {
           const realDt = await handleSuccess(label);
           if (realDt && realDt.current > beforeApi) {
             done = Math.max(done + 1, realDt.current - startApi);
+            bumpOvercap();
             stuck = 0;
             lowFeeStreak = 0;
             logActivity(`[${tag}] ✓ confirmed on-chain (DAY_TRADER ${realDt.current}/${realDt.target})`, COLOR.green);
@@ -4547,6 +4570,7 @@ async function _accountSwapOnce(i) {
             // (res.ok = settlement settled by waitForSettlement). Verifikasi
             // DAY_TRADER tetap di-log walau gak naik.
             done++;
+            bumpOvercap();
             trafficRelax();
             stuck = 0;
             lowFeeStreak = 0;
@@ -4655,7 +4679,7 @@ async function _accountSwapOnce(i) {
                 if (res2 && res2.ok) {
                   if (res2.feeCC) { recordBurn(res2.feeCC, tag); bumpDaily(state, res2.feeCC, 0); }
                   await handleSuccess(closeLabel);
-                  done++; stuck = 0; lowFeeStreak = 0;
+                  done++; bumpOvercap(); stuck = 0; lowFeeStreak = 0;
                   retried = true;
                 }
               } catch (e2) {
@@ -4902,6 +4926,10 @@ async function runEdelCethAccount(i) {
     logActivity(`[${tag}] EDELx-cETH ${dt.current}/${dt.target} (task ${dt.code})${overcap ? ` — overcap → target ${dailyCap} swap` : ''} — mulai ping-pong`, COLOR.cyan);
 
     let swaps = 0;
+    // Progres overcap buat kolom OVERCAP di dashboard. Kolom SWAP mentok di task
+    // earn-hub (10/10), jadi tanpa ini progres sebenernya gak keliatan sama sekali.
+    state.overcap = overcap ? { done: startCount, target: dailyCap } : null;
+    const bumpOvercap = () => { if (state.overcap) { state.overcap.done = startCount + swaps; } };
     // Target tercapai: overcap → total swap sesi (startCount+swaps) ≥ dailyCap; else → task penuh.
     const targetReached = () => overcap ? (startCount + swaps >= dailyCap) : (dt && dt.current >= dt.target);
     let priceChecks = 0;  // counter cek-harga → tiap M8.cleanupEveryChecks: drain DvpProposal stale (kayak opsi 5)
@@ -5044,7 +5072,7 @@ async function runEdelCethAccount(i) {
           const res = useRfq
             ? await swapOnceAtomic(swapCtx, direction, q)
             : await terminalSwapOnce(swapCtx, direction, q);
-          if (res && res.ok) { swaps++; proxyFails = 0; hardErrs = 0; noLiqStreak = 0; trafficRelax(); lastDustEdelx = Number(res.dustEdelx) || 0; if (res.feeCC) { recordBurn(res.feeCC, tag); bumpDaily(state, res.feeCC, 0); } logActivity(`[${tag}] ✓ ping-pong #${swaps} sukses (fee ${res.feeCC != null ? res.feeCC + ' CC' : '?'})`, COLOR.green); outcome = 'ok'; }
+          if (res && res.ok) { swaps++; bumpOvercap(); proxyFails = 0; hardErrs = 0; noLiqStreak = 0; trafficRelax(); lastDustEdelx = Number(res.dustEdelx) || 0; if (res.feeCC) { recordBurn(res.feeCC, tag); bumpDaily(state, res.feeCC, 0); } logActivity(`[${tag}] ✓ ping-pong #${swaps} sukses (fee ${res.feeCC != null ? res.feeCC + ' CC' : '?'})`, COLOR.green); outcome = 'ok'; }
           else { logActivity(`[${tag}] ping-pong gagal (no ok) — retry`, COLOR.yellow); await sleep(4000); outcome = 'retry'; }
           break;
         } catch (e) {
@@ -5374,6 +5402,9 @@ function buildDashboardItems(states) {
     status: s.status || 'idle',
     message: s.message || '',
     dayTrader: s.dayTrader ? { count: Number(s.dayTrader.count) || 0, target: Number(s.dayTrader.target) || 0 } : null,
+    // Progres overcap ikut dikirim — kolom SWAP mentok di target task, jadi tanpa ini
+    // dashboard web sama butanya kayak dashboard terminal sebelum ada kolom OVERCAP.
+    overcap: s.overcap ? { done: Number(s.overcap.done) || 0, target: Number(s.overcap.target) || 0 } : null,
     points: (s.points != null && Number.isFinite(Number(s.points))) ? Number(s.points) : null,
     cc: balanceOf(s, 'amulet'),
     usdcx: balanceOf(s, 'usdcx'),
