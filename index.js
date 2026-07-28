@@ -1341,8 +1341,16 @@ class SilvanaClient {
     if (r.status === 401 || r.status === 403) { const e = new Error(`swapAction ${actionId} status=${r.status}`); e.unauthorized = true; logDebug(`swapAction ${actionId} ${r.status}`, r.text || ''); throw e; }
     if (r.status !== 200) {
       if (r.status === 404) actionIdsVerified = false;
-      logDebug(`swapAction ${actionId} ${r.status}`, r.text || '');
-      const e = new Error(`swapAction ${actionId} status=${r.status} body=${(r.text || '').slice(0, 160)}`);
+      // Cetak NAMA action, bukan hash mentahnya. Hash-nya build-specific dan berubah tiap
+      // redeploy, jadi kalau muncul di dashboard sama sekali gak kebaca — mesti di-scrape
+      // dari bundle dulu buat tau action mana yg jebol.
+      const nm = Object.keys(SWAP.actionIds).find(n => SWAP.actionIds[n] === actionId);
+      logDebug(`swapAction ${nm || '?'} (${actionId}) ${r.status}`, r.text || '');
+      // Next.js NYEMBUNYIIN pesan asli error server action di produksi — yg kekirim cuma
+      // amplop flight ("0:{...}") plus digest. Digest itu satu-satunya pegangan yg nyambung
+      // ke log server mereka, jadi diangkat ke pesan error kalau ada.
+      const dg = (String(r.text || '').match(/"digest"\s*:\s*"([^"]+)"/) || [])[1];
+      const e = new Error(`swapAction ${nm || actionId.slice(0, 12)} status=${r.status}${dg ? ` digest=${dg}` : ''} body=${(r.text || '').replace(/\s+/g, ' ').slice(0, 130)}`);
       // 404 = action ID stale (Silvana redeploy) → self-heal udah reset actionIdsVerified; tandain
       // RETRYABLE biar loop swap re-discover + ulang, JANGAN stop. 5xx = server sementara → retry juga.
       if (r.status === 404) { e.staleAction = true; e.transient = true; }
