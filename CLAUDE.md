@@ -24,6 +24,8 @@ node index.js register        # one-time: print browser Console script to enrol 
 node index.js paste           # resume `register` if the paste step was interrupted
 node index.js wallets         # list Privy wallets per account, flag which matches partyId
 node index.js pin <walletId>  # pin a privyWalletId into session.json
+node index.js balance [idx|all]                        # read-only: every instrument, unlocked/locked/UTXO count
+node index.js transfer <idx> CC <amt> <dest> [go]      # send CC; omit `go` for a dry run
 node index.js help            # full subcommand list
 ```
 
@@ -157,6 +159,27 @@ Both fee gates before `acceptQuote` exist so a fee spike aborts **without** leav
 
 Supanova rejects `limit`/`pageSize` on `active_contracts` (returns empty) and caps results at
 200 — hence the periodic proposal draining rather than pagination.
+
+### Standalone transfers are CC-only, and that is a protocol limit not an omission
+
+Silvana has no wallet UI at all (`/wallet` and `/portfolio` are 404) and the bundle exposes no
+send/withdraw server action — only the fee-transfer helpers. Supanova has no transfer endpoint
+either (`/canton/api/transfer*`, `/send`, `/transfer_offer*` all 404 on both GET and POST). So a
+transfer has to be assembled as a raw Canton command, the same way the swap fee payment already is.
+
+That works for **CC (Amulet)** because `getTransferFactoryContextAction` returns a self-contained
+context — `factoryId`, `choiceContextData`, and `disclosedContracts` in one call. `transfer` builds
+an `ExerciseCommand` on `TRANSFER_FACTORY_IFACE` / `TransferFactory_Transfer` from exactly that.
+
+It does **not** work for EDELx/cETH. Those live in the Utility registry, whose `extraArgs` requires
+a `transfer-rule` contract id (`utilArgs`), and the only source of that cid anywhere in this codebase
+is `env.utilityAcceptRefs[]` — a field of the RFQ accept envelope, which exists only mid-swap. Adding
+token transfers means capturing a real transfer from a UI that has one; do not guess the rule cid.
+
+`TRANSFER_FACTORY_IFACE` is named after the two interface constants already proven here
+(`ALLOCATION_IFACE`, the Holding interface in `diag`) but has not itself been exercised live. If
+`prepare_transaction` rejects with an unknown template, suspect that constant first — the real value
+can be read from the factory's `templateId` in the context response's `disclosedContracts`.
 
 ### Pairs and the `SWAP` global
 

@@ -3855,6 +3855,13 @@ async function fetchActiveSettlements(sv, partyId, { staleMaxSec = 300, statusBu
 }
 // Interface templateId Allocation (Splice token standard).
 const ALLOCATION_IFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
+// Interface TransferFactory (Canton Network Token Standard) — dipakai subcommand `transfer`.
+// Penamaannya ngikutin pola dua interface lain yg SUDAH terbukti jalan di sini
+// (ALLOCATION_IFACE di atas & '#splice-api-token-holding-v1:…:Holding' di diag).
+// BELUM diverifikasi live: kalau prepare_transaction nolak dgn template gak dikenal,
+// ini baris pertama yg dicurigai. Gantinya bisa dibaca dari templateId factory di
+// disclosedContracts respons getTransferFactoryContextAction.
+const TRANSFER_FACTORY_IFACE = '#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferFactory';
 // contractId dari row active_contracts (flat {contractId} / wrapped contractEntry).
 function _acContractId(c) {
   if (!c) return null;
@@ -5706,13 +5713,179 @@ Usage:
   node index.js acct-diag [idx]   diagnosa 1 akun (read-only, tanpa OTP): auth/me, KYC, earn-hub task
   node index.js register  cara daftar passkey baru (pakai ekstensi di extension/, atau script Console)
   node index.js paste [file.json]  simpan JSON passkey → session.json (tanpa arg = tempel manual)
+  node index.js balance [idx|all]  saldo unlocked+locked semua instrument per akun (read-only)
+  node index.js transfer <idx> CC <jumlah> <tujuan> [go]   kirim CC ke party lain
+                              tujuan = partyId (hint::sidikjari) ATAU #N / label akun sendiri
+                              TANPA 'go' = dry-run (cuma nampilin rencana, gak ngirim apa-apa)
   node index.js wallets   list Privy wallets per akun + tandai mana yg cached/match partyId
   node index.js pin <id>  pin privyWalletId ke session.json (utk akun pertama)
   node index.js help      tampilkan bantuan
 `);
     process.exit(0);
   }
-  if (argv[0] === 'wallets') {
+  if (argv[0] === 'balance') {
+    // `node index.js balance [idx|all]` — READ-ONLY. Dashboard cuma nampilin CC/cETH/EDELx;
+    // ini nampilin SEMUA instrument apa adanya dari /canton/api/balances, plus jumlah UTXO
+    // (fragmentasi holding itu yg bikin transfer/fee kadang nolak) dan porsi yg ke-lock.
+    (async () => {
+      const arg = String(argv[1] || 'all');
+      const idxs = arg === 'all' ? ACCOUNTS.map((_, i) => i) : [Number(arg) || 0];
+      for (const i of idxs) {
+        const a = ACCOUNTS[i];
+        if (!a) { console.error(paint(`akun idx ${i} gak ada`, COLOR.red)); continue; }
+        const state = makeStates()[i];
+        let bal = null, partyId = '?';
+        try {
+          const idTok = await ensurePrivyToken(state);
+          partyId = (await supaMe(idTok, getProxy(a.email))).partyId || '?';
+          bal = await supaBalances(idTok, getProxy(a.email));
+        } catch (e) {
+          process.stdout.write(paint(`▎ ${a.label || a.email} — GAGAL: ${(e && e.message) || e}\n`, COLOR.red));
+          continue;
+        }
+        process.stdout.write('\n' + paint(`▎ ${a.label || a.email}`, COLOR.bold + COLOR.cyan)
+          + paint(`  party ${String(partyId).slice(0, 28)}…\n`, COLOR.gray));
+        const toks = (bal && bal.tokens) || [];
+        if (!toks.length) { process.stdout.write(paint('  (tidak ada instrument)\n', COLOR.gray)); continue; }
+        process.stdout.write(paint('  INSTRUMENT   UNLOCKED            LOCKED           UTXO  ADMIN\n', COLOR.gray));
+        for (const t of toks) {
+          const id = (t.instrumentId && t.instrumentId.id) || '?';
+          const admin = (t.instrumentId && t.instrumentId.admin) || '?';
+          const un = (t.unlockedUtxos || []).reduce((s, u) => s + (Number(u.amount) || 0), 0);
+          const lo = (t.lockedUtxos || []).reduce((s, u) => s + (Number(u.amount) || 0), 0);
+          const nUn = (t.unlockedUtxos || []).length, nLo = (t.lockedUtxos || []).length;
+          process.stdout.write('  ' + String(id).padEnd(12)
+            + paint(un.toFixed(10).padEnd(20), COLOR.green)
+            + paint((lo > 0 ? lo.toFixed(10) : '-').padEnd(17), lo > 0 ? COLOR.yellow : COLOR.gray)
+            + paint(String(nUn + (nLo ? '+' + nLo : '')).padEnd(6), COLOR.gray)
+            + paint(String(admin).slice(0, 26) + '…', COLOR.gray) + '\n');
+        }
+      }
+      process.exit(0);
+    })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
+  } else if (argv[0] === 'transfer') {
+    // `node index.js transfer <idx> CC <jumlah> <tujuan> [go]`
+    //
+    // CUMA CC (Amulet). Alasannya bukan males: konteks factory Amulet BERDIRI SENDIRI
+    // (getTransferFactoryContextAction balikin factoryId + choiceContextData + disclosed
+    // sekaligus). EDELx/cETH lewat Utility registry yg butuh `transfer-rule` cid, dan
+    // satu-satunya sumber cid itu di kode ini adalah env.utilityAcceptRefs — isi envelope
+    // RFQ, cuma ada DI TENGAH swap. Jadi transfer berdiri sendiri buat token itu belum
+    // bisa diturunkan tanpa capture UI transfer beneran. Jangan dikarang.
+    //
+    // DRY-RUN default. Tanpa argumen `go` cuma nampilin rencana — gak ada yg dikirim.
+    (async () => {
+      const idx = Number(argv[1]);
+      const tokenArg = String(argv[2] || '').toUpperCase();
+      const amountArg = String(argv[3] || '');
+      const toArg = String(argv[4] || '');
+      const go = argv.includes('go');
+      const die = (m) => { console.error(paint(m, COLOR.red)); process.exit(1); };
+      const a = ACCOUNTS[idx];
+      if (!a) die(`akun idx ${argv[1]} gak ada. Lihat: node index.js balance all`);
+      if (tokenArg !== 'CC' && tokenArg !== 'AMULET') die(`token '${argv[2]}' belum didukung — baru CC (Amulet). Alasannya ada di komentar kode.`);
+      const amt = Number(amountArg);
+      if (!Number.isFinite(amt) || amt <= 0) die(`jumlah '${amountArg}' gak valid`);
+      if (!toArg) die('tujuan kosong. Isi partyId (hint::sidikjari) atau #N / label akun sendiri');
+
+      // Resolusi tujuan. `#N` atau label akun sendiri → partyId dari session.json (transfer
+      // internal). Selain itu dianggap partyId mentah dan divalidasi bentuknya.
+      let receiver = toArg, receiverNote = 'EKSTERNAL';
+      const byIdx = toArg.startsWith('#') ? Number(toArg.slice(1)) : NaN;
+      const byLabel = ACCOUNTS.findIndex(x => (x.label || '') === toArg || x.email === toArg);
+      const internalIdx = Number.isFinite(byIdx) ? byIdx : (byLabel >= 0 ? byLabel : -1);
+      if (internalIdx >= 0) {
+        const tgt = ACCOUNTS[internalIdx];
+        if (!tgt) die(`akun tujuan idx ${internalIdx} gak ada`);
+        const pid = (acctSession(tgt.email) || {}).partyId;
+        if (!pid) die(`akun ${tgt.label || tgt.email} belum punya partyId di session.json — login dulu`);
+        receiver = pid; receiverNote = `INTERNAL (${tgt.label || tgt.email})`;
+      }
+      if (!/^[^:]+::[0-9a-f]{16,}$/i.test(receiver)) die(`partyId tujuan bentuknya gak wajar: ${receiver}\nHarusnya 'hint::sidikjari-hex'.`);
+
+      const state = makeStates()[idx];
+      const { sv, privy, canton, partyId } = await buildSwapClients(state);
+      if (receiver === partyId) die('tujuan sama dengan pengirim — dibatalkan');
+
+      const bal = await supaBalances(state.identityToken || canton.token, getProxy(a.email));
+      const tok = ((bal && bal.tokens) || []).find(t => String((t.instrumentId && t.instrumentId.id) || '').toUpperCase() === 'AMULET');
+      if (!tok) die('instrument Amulet (CC) gak ketemu di balances');
+      const admin = tok.instrumentId.admin;
+      const utxos = (tok.unlockedUtxos || []).filter(u => u.contractId);
+      const unlocked = utxos.reduce((s, u) => s + (Number(u.amount) || 0), 0);
+      if (amt > unlocked) die(`jumlah ${amt} CC > saldo unlocked ${unlocked.toFixed(10)} CC`);
+
+      const P = (m, c) => process.stdout.write(paint(m + '\n', c || COLOR.gray));
+      P(`\n▎ TRANSFER ${go ? '[LIVE]' : '[DRY-RUN]'}`, COLOR.bold + (go ? COLOR.red : COLOR.cyan));
+      P(`  dari    : ${a.label || a.email}`);
+      P(`  party   : ${partyId}`);
+      P(`  ke      : ${receiver}`);
+      P(`  sifat   : ${receiverNote}`, receiverNote === 'EKSTERNAL' ? COLOR.yellow : COLOR.gray);
+      P(`  jumlah  : ${fmt10(String(amt))} CC  (unlocked ${unlocked.toFixed(4)}, ${utxos.length} UTXO)`);
+      if (!go) { P('\n  dry-run — gak ada yg dikirim. Tambah `go` di akhir buat eksekusi.', COLOR.cyan); process.exit(0); }
+
+      // Konteks factory Amulet — action yg sama persis dipakai jalur pembayaran fee swap.
+      const now = new Date();
+      const raw = await sv.swapAction(SWAP.actionIds.prepareTransfer, [{
+        receiver, amount: fmt10(String(amt)),
+        instrumentId: { admin, id: 'Amulet' },
+        requestedAt: now.toISOString(),
+        executeBefore: new Date(now.getTime() + 130_000).toISOString(),
+        sender: partyId, inputHoldingCids: utxos.slice(0, 8).map(u => u.contractId),
+      }]);
+      const fc = unwrapCtx(raw);
+      const factoryCid = fc && (fc.factoryId || (fc.factory && fc.factory.factoryId));
+      const ctxVals = (fc && fc.choiceContextData && fc.choiceContextData.values)
+        || (fc && fc.choiceContext && fc.choiceContext.choiceContextData && fc.choiceContext.choiceContextData.values);
+      if (!factoryCid || !ctxVals) die(`konteks transfer factory gagal: ${JSON.stringify(fc).slice(0, 250)}`);
+      const disclosed = (fc.disclosedContracts || fc.disclosed || [])
+        .filter(d => d && d.contractId && d.createdEventBlob)
+        .map(d => ({ templateId: d.templateId, contractId: d.contractId, createdEventBlob: d.createdEventBlob, synchronizerId: d.synchronizerId || SWAP.synchronizerId }));
+      P(`  factory : ${String(factoryCid).slice(0, 20)}… · ${disclosed.length} disclosed`);
+
+      const body = {
+        commands: [{
+          ExerciseCommand: {
+            templateId: TRANSFER_FACTORY_IFACE,
+            contractId: factoryCid,
+            choice: 'TransferFactory_Transfer',
+            choiceArgument: {
+              expectedAdmin: admin,
+              transfer: {
+                sender: partyId, receiver, amount: fmt10(String(amt)),
+                instrumentId: { admin, id: 'Amulet' },
+                requestedAt: now.toISOString(),
+                executeBefore: new Date(now.getTime() + 130_000).toISOString(),
+                inputHoldingCids: utxos.slice(0, 8).map(u => u.contractId),
+                meta: { values: {} },
+              },
+              extraArgs: { context: { values: ctxVals }, meta: { values: {} } },
+            },
+          },
+        }],
+        disclosedContracts: disclosed,
+      };
+      const prep = await canton.prepareTransaction(body);
+      if (!prep || !prep.hash) die('prepare_transaction gak balikin hash');
+      const hashHex = b64HashToHex(prep.hash);
+      let sub = null;
+      const tries = Math.max(1, (privy.walletCandidates && privy.walletCandidates.length) || 1) + 1;
+      for (let st = 1; st <= tries; st++) {
+        const sigRaw = await privy.rawSign(hashHex);
+        try { sub = await canton.submitPrepared({ hash: prep.hash, signature: sigToB64(sigRaw) }); break; }
+        catch (e) { if (/bad signature/i.test((e && e.message) || '')) { const nxt = privy.nextWallet(); if (nxt) continue; } throw e; }
+      }
+      if (!sub || !sub.submissionId) die('submit_prepared gagal');
+      for (let i = 0; i < SWAP.completionMaxTries; i++) {
+        const c = await canton.queryCompletion(sub.submissionId).catch(() => null);
+        if (c && c.status === 'completed') { P(`\n✓ terkirim — ${fmt10(String(amt))} CC → ${receiver.slice(0, 24)}…`, COLOR.green); process.exit(0); }
+        if (c && (c.status === 'failed' || c.status === 'rejected')) throw completionErr(c.status, c.message);
+        await sleep(SWAP.completionPollMs);
+      }
+      P('\n⚠ submit OK tapi completion belum kebaca — cek saldo manual.', COLOR.yellow);
+      process.exit(0);
+    })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
+  } else if (argv[0] === 'wallets') {
     (async () => {
       for (const a of ACCOUNTS) {
         const state = { email: a.email, privyEmail: a.privyEmail || null, label: a.label, status: 'idle', message: '' };
