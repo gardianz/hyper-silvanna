@@ -3862,6 +3862,117 @@ const ALLOCATION_IFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.Alloc
 // ini baris pertama yg dicurigai. Gantinya bisa dibaca dari templateId factory di
 // disclosedContracts respons getTransferFactoryContextAction.
 const TRANSFER_FACTORY_IFACE = '#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferFactory';
+
+// Kirim CC (Amulet) ke party lain. Dipakai subcommand `transfer` DAN menu interaktif
+// opsi t — sengaja satu fungsi biar validasinya gak kembar lalu beda diam-diam.
+//
+// CUMA CC. Konteks factory Amulet berdiri sendiri (getTransferFactoryContextAction
+// balikin factoryId + choiceContextData + disclosed sekaligus). EDELx/cETH lewat
+// Utility registry yg butuh cid `transfer-rule`, dan satu-satunya sumber cid itu di
+// kode ini adalah env.utilityAcceptRefs — isi envelope RFQ, cuma ada DI TENGAH swap.
+// Transfer berdiri sendiri buat token itu gak bisa diturunkan tanpa capture UI
+// transfer beneran. Jangan dikarang.
+//
+// go=false (default) = DRY-RUN: nampilin rencana, gak ngirim apa-apa.
+async function transferCC({ idx, amountArg, toArg, go = false, out = null }) {
+  const P = out || ((m, c) => process.stdout.write(paint(m + '\n', c || COLOR.gray)));
+  const bad = (m) => { throw new Error(m); };
+  const a = ACCOUNTS[idx];
+  if (!a) bad(`akun idx ${idx} gak ada. Lihat: node index.js balance all`);
+  const amt = Number(amountArg);
+  if (!Number.isFinite(amt) || amt <= 0) bad(`jumlah '${amountArg}' gak valid`);
+  if (!toArg) bad('tujuan kosong. Isi partyId (hint::sidikjari) atau #N / label akun sendiri');
+
+  // Resolusi tujuan. `#N` atau label/email akun sendiri → partyId dari session.json
+  // (transfer internal). Selain itu dianggap partyId mentah, bentuknya divalidasi.
+  let receiver = String(toArg), receiverNote = 'EKSTERNAL';
+  const byIdx = receiver.startsWith('#') ? Number(receiver.slice(1)) : NaN;
+  const byLabel = ACCOUNTS.findIndex(x => (x.label || '') === receiver || x.email === receiver);
+  const internalIdx = Number.isFinite(byIdx) ? byIdx : (byLabel >= 0 ? byLabel : -1);
+  if (internalIdx >= 0) {
+    const tgt = ACCOUNTS[internalIdx];
+    if (!tgt) bad(`akun tujuan idx ${internalIdx} gak ada`);
+    const pid = (acctSession(tgt.email) || {}).partyId;
+    if (!pid) bad(`akun ${tgt.label || tgt.email} belum punya partyId di session.json — login dulu`);
+    receiver = pid; receiverNote = `INTERNAL (${tgt.label || tgt.email})`;
+  }
+  if (!/^[^:]+::[0-9a-f]{16,}$/i.test(receiver)) bad(`partyId tujuan bentuknya gak wajar: ${receiver}\nHarusnya 'hint::sidikjari-hex'.`);
+
+  const state = makeStates()[idx];
+  const { sv, privy, canton, partyId } = await buildSwapClients(state);
+  if (receiver === partyId) bad('tujuan sama dengan pengirim — dibatalkan');
+
+  const bal = await supaBalances(state.identityToken || canton.token, getProxy(a.email));
+  const tok = ((bal && bal.tokens) || []).find(t => String((t.instrumentId && t.instrumentId.id) || '').toUpperCase() === 'AMULET');
+  if (!tok) bad('instrument Amulet (CC) gak ketemu di balances');
+  const admin = tok.instrumentId.admin;
+  const utxos = (tok.unlockedUtxos || []).filter(u => u.contractId);
+  const unlocked = utxos.reduce((s, u) => s + (Number(u.amount) || 0), 0);
+  if (amt > unlocked) bad(`jumlah ${amt} CC > saldo unlocked ${unlocked.toFixed(10)} CC`);
+
+  P(`\n▎ TRANSFER ${go ? '[LIVE]' : '[DRY-RUN]'}`, COLOR.bold + (go ? COLOR.red : COLOR.cyan));
+  P(`  dari    : ${a.label || a.email}`);
+  P(`  party   : ${partyId}`);
+  P(`  ke      : ${receiver}`);
+  P(`  sifat   : ${receiverNote}`, receiverNote === 'EKSTERNAL' ? COLOR.yellow : COLOR.gray);
+  P(`  jumlah  : ${fmt10(String(amt))} CC  (unlocked ${unlocked.toFixed(4)}, ${utxos.length} UTXO)`);
+  if (!go) { P('\n  dry-run — gak ada yg dikirim.', COLOR.cyan); return { dryRun: true, receiver, amount: amt, unlocked }; }
+
+  // Konteks factory Amulet — action yg sama persis dipakai jalur pembayaran fee swap.
+  const now = new Date();
+  const inputHoldingCids = utxos.slice(0, 8).map(u => u.contractId);
+  const requestedAt = now.toISOString();
+  const executeBefore = new Date(now.getTime() + 130_000).toISOString();
+  const transfer = {
+    sender: partyId, receiver, amount: fmt10(String(amt)),
+    instrumentId: { admin, id: 'Amulet' },
+    requestedAt, executeBefore, inputHoldingCids, meta: { values: {} },
+  };
+  const raw = await sv.swapAction(SWAP.actionIds.prepareTransfer, [{
+    receiver, amount: fmt10(String(amt)), instrumentId: { admin, id: 'Amulet' },
+    requestedAt, executeBefore, sender: partyId, inputHoldingCids,
+  }]);
+  const fc = unwrapCtx(raw);
+  const factoryCid = fc && (fc.factoryId || (fc.factory && fc.factory.factoryId));
+  const ctxVals = (fc && fc.choiceContextData && fc.choiceContextData.values)
+    || (fc && fc.choiceContext && fc.choiceContext.choiceContextData && fc.choiceContext.choiceContextData.values);
+  if (!factoryCid || !ctxVals) bad(`konteks transfer factory gagal: ${JSON.stringify(fc).slice(0, 250)}`);
+  const disclosed = (fc.disclosedContracts || fc.disclosed || [])
+    .filter(d => d && d.contractId && d.createdEventBlob)
+    .map(d => ({ templateId: d.templateId, contractId: d.contractId, createdEventBlob: d.createdEventBlob, synchronizerId: d.synchronizerId || SWAP.synchronizerId }));
+  P(`  factory : ${String(factoryCid).slice(0, 20)}… · ${disclosed.length} disclosed`);
+
+  const body = {
+    commands: [{
+      ExerciseCommand: {
+        templateId: TRANSFER_FACTORY_IFACE,
+        contractId: factoryCid,
+        choice: 'TransferFactory_Transfer',
+        choiceArgument: { expectedAdmin: admin, transfer, extraArgs: { context: { values: ctxVals }, meta: { values: {} } } },
+      },
+    }],
+    disclosedContracts: disclosed,
+  };
+  const prep = await canton.prepareTransaction(body);
+  if (!prep || !prep.hash) bad('prepare_transaction gak balikin hash');
+  const hashHex = b64HashToHex(prep.hash);
+  let sub = null;
+  const tries = Math.max(1, (privy.walletCandidates && privy.walletCandidates.length) || 1) + 1;
+  for (let st = 1; st <= tries; st++) {
+    const sigRaw = await privy.rawSign(hashHex);
+    try { sub = await canton.submitPrepared({ hash: prep.hash, signature: sigToB64(sigRaw) }); break; }
+    catch (e) { if (/bad signature/i.test((e && e.message) || '')) { const nxt = privy.nextWallet(); if (nxt) continue; } throw e; }
+  }
+  if (!sub || !sub.submissionId) bad('submit_prepared gagal');
+  for (let i = 0; i < SWAP.completionMaxTries; i++) {
+    const c = await canton.queryCompletion(sub.submissionId).catch(() => null);
+    if (c && c.status === 'completed') { P(`\n✓ terkirim — ${fmt10(String(amt))} CC → ${receiver.slice(0, 28)}…`, COLOR.green); return { ok: true, receiver, amount: amt, submissionId: sub.submissionId }; }
+    if (c && (c.status === 'failed' || c.status === 'rejected')) throw completionErr(c.status, c.message);
+    await sleep(SWAP.completionPollMs);
+  }
+  P('\n⚠ submit OK tapi completion belum kebaca — cek saldo manual.', COLOR.yellow);
+  return { ok: null, receiver, amount: amt, submissionId: sub.submissionId };
+}
 // contractId dari row active_contracts (flat {contractId} / wrapped contractEntry).
 function _acContractId(c) {
   if (!c) return null;
@@ -5737,7 +5848,8 @@ Usage:
         let bal = null, partyId = '?';
         try {
           const idTok = await ensurePrivyToken(state);
-          partyId = (await supaMe(idTok, getProxy(a.email))).partyId || '?';
+          // supaMe balik {status, data} — partyId-nya di .data, bukan di level atas.
+          partyId = ((await supaMe(idTok, getProxy(a.email))).data || {}).partyId || '?';
           bal = await supaBalances(idTok, getProxy(a.email));
         } catch (e) {
           process.stdout.write(paint(`▎ ${a.label || a.email} — GAGAL: ${(e && e.message) || e}\n`, COLOR.red));
@@ -5765,125 +5877,15 @@ Usage:
     })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
   } else if (argv[0] === 'transfer') {
     // `node index.js transfer <idx> CC <jumlah> <tujuan> [go]`
-    //
-    // CUMA CC (Amulet). Alasannya bukan males: konteks factory Amulet BERDIRI SENDIRI
-    // (getTransferFactoryContextAction balikin factoryId + choiceContextData + disclosed
-    // sekaligus). EDELx/cETH lewat Utility registry yg butuh `transfer-rule` cid, dan
-    // satu-satunya sumber cid itu di kode ini adalah env.utilityAcceptRefs — isi envelope
-    // RFQ, cuma ada DI TENGAH swap. Jadi transfer berdiri sendiri buat token itu belum
-    // bisa diturunkan tanpa capture UI transfer beneran. Jangan dikarang.
-    //
-    // DRY-RUN default. Tanpa argumen `go` cuma nampilin rencana — gak ada yg dikirim.
+    // Inti kerjanya ada di transferCC() — dipakai bareng sama menu interaktif (opsi t).
     (async () => {
-      const idx = Number(argv[1]);
-      const tokenArg = String(argv[2] || '').toUpperCase();
-      const amountArg = String(argv[3] || '');
-      const toArg = String(argv[4] || '');
-      const go = argv.includes('go');
       const die = (m) => { console.error(paint(m, COLOR.red)); process.exit(1); };
-      const a = ACCOUNTS[idx];
-      if (!a) die(`akun idx ${argv[1]} gak ada. Lihat: node index.js balance all`);
-      if (tokenArg !== 'CC' && tokenArg !== 'AMULET') die(`token '${argv[2]}' belum didukung — baru CC (Amulet). Alasannya ada di komentar kode.`);
-      const amt = Number(amountArg);
-      if (!Number.isFinite(amt) || amt <= 0) die(`jumlah '${amountArg}' gak valid`);
-      if (!toArg) die('tujuan kosong. Isi partyId (hint::sidikjari) atau #N / label akun sendiri');
-
-      // Resolusi tujuan. `#N` atau label akun sendiri → partyId dari session.json (transfer
-      // internal). Selain itu dianggap partyId mentah dan divalidasi bentuknya.
-      let receiver = toArg, receiverNote = 'EKSTERNAL';
-      const byIdx = toArg.startsWith('#') ? Number(toArg.slice(1)) : NaN;
-      const byLabel = ACCOUNTS.findIndex(x => (x.label || '') === toArg || x.email === toArg);
-      const internalIdx = Number.isFinite(byIdx) ? byIdx : (byLabel >= 0 ? byLabel : -1);
-      if (internalIdx >= 0) {
-        const tgt = ACCOUNTS[internalIdx];
-        if (!tgt) die(`akun tujuan idx ${internalIdx} gak ada`);
-        const pid = (acctSession(tgt.email) || {}).partyId;
-        if (!pid) die(`akun ${tgt.label || tgt.email} belum punya partyId di session.json — login dulu`);
-        receiver = pid; receiverNote = `INTERNAL (${tgt.label || tgt.email})`;
-      }
-      if (!/^[^:]+::[0-9a-f]{16,}$/i.test(receiver)) die(`partyId tujuan bentuknya gak wajar: ${receiver}\nHarusnya 'hint::sidikjari-hex'.`);
-
-      const state = makeStates()[idx];
-      const { sv, privy, canton, partyId } = await buildSwapClients(state);
-      if (receiver === partyId) die('tujuan sama dengan pengirim — dibatalkan');
-
-      const bal = await supaBalances(state.identityToken || canton.token, getProxy(a.email));
-      const tok = ((bal && bal.tokens) || []).find(t => String((t.instrumentId && t.instrumentId.id) || '').toUpperCase() === 'AMULET');
-      if (!tok) die('instrument Amulet (CC) gak ketemu di balances');
-      const admin = tok.instrumentId.admin;
-      const utxos = (tok.unlockedUtxos || []).filter(u => u.contractId);
-      const unlocked = utxos.reduce((s, u) => s + (Number(u.amount) || 0), 0);
-      if (amt > unlocked) die(`jumlah ${amt} CC > saldo unlocked ${unlocked.toFixed(10)} CC`);
-
-      const P = (m, c) => process.stdout.write(paint(m + '\n', c || COLOR.gray));
-      P(`\n▎ TRANSFER ${go ? '[LIVE]' : '[DRY-RUN]'}`, COLOR.bold + (go ? COLOR.red : COLOR.cyan));
-      P(`  dari    : ${a.label || a.email}`);
-      P(`  party   : ${partyId}`);
-      P(`  ke      : ${receiver}`);
-      P(`  sifat   : ${receiverNote}`, receiverNote === 'EKSTERNAL' ? COLOR.yellow : COLOR.gray);
-      P(`  jumlah  : ${fmt10(String(amt))} CC  (unlocked ${unlocked.toFixed(4)}, ${utxos.length} UTXO)`);
-      if (!go) { P('\n  dry-run — gak ada yg dikirim. Tambah `go` di akhir buat eksekusi.', COLOR.cyan); process.exit(0); }
-
-      // Konteks factory Amulet — action yg sama persis dipakai jalur pembayaran fee swap.
-      const now = new Date();
-      const raw = await sv.swapAction(SWAP.actionIds.prepareTransfer, [{
-        receiver, amount: fmt10(String(amt)),
-        instrumentId: { admin, id: 'Amulet' },
-        requestedAt: now.toISOString(),
-        executeBefore: new Date(now.getTime() + 130_000).toISOString(),
-        sender: partyId, inputHoldingCids: utxos.slice(0, 8).map(u => u.contractId),
-      }]);
-      const fc = unwrapCtx(raw);
-      const factoryCid = fc && (fc.factoryId || (fc.factory && fc.factory.factoryId));
-      const ctxVals = (fc && fc.choiceContextData && fc.choiceContextData.values)
-        || (fc && fc.choiceContext && fc.choiceContext.choiceContextData && fc.choiceContext.choiceContextData.values);
-      if (!factoryCid || !ctxVals) die(`konteks transfer factory gagal: ${JSON.stringify(fc).slice(0, 250)}`);
-      const disclosed = (fc.disclosedContracts || fc.disclosed || [])
-        .filter(d => d && d.contractId && d.createdEventBlob)
-        .map(d => ({ templateId: d.templateId, contractId: d.contractId, createdEventBlob: d.createdEventBlob, synchronizerId: d.synchronizerId || SWAP.synchronizerId }));
-      P(`  factory : ${String(factoryCid).slice(0, 20)}… · ${disclosed.length} disclosed`);
-
-      const body = {
-        commands: [{
-          ExerciseCommand: {
-            templateId: TRANSFER_FACTORY_IFACE,
-            contractId: factoryCid,
-            choice: 'TransferFactory_Transfer',
-            choiceArgument: {
-              expectedAdmin: admin,
-              transfer: {
-                sender: partyId, receiver, amount: fmt10(String(amt)),
-                instrumentId: { admin, id: 'Amulet' },
-                requestedAt: now.toISOString(),
-                executeBefore: new Date(now.getTime() + 130_000).toISOString(),
-                inputHoldingCids: utxos.slice(0, 8).map(u => u.contractId),
-                meta: { values: {} },
-              },
-              extraArgs: { context: { values: ctxVals }, meta: { values: {} } },
-            },
-          },
-        }],
-        disclosedContracts: disclosed,
-      };
-      const prep = await canton.prepareTransaction(body);
-      if (!prep || !prep.hash) die('prepare_transaction gak balikin hash');
-      const hashHex = b64HashToHex(prep.hash);
-      let sub = null;
-      const tries = Math.max(1, (privy.walletCandidates && privy.walletCandidates.length) || 1) + 1;
-      for (let st = 1; st <= tries; st++) {
-        const sigRaw = await privy.rawSign(hashHex);
-        try { sub = await canton.submitPrepared({ hash: prep.hash, signature: sigToB64(sigRaw) }); break; }
-        catch (e) { if (/bad signature/i.test((e && e.message) || '')) { const nxt = privy.nextWallet(); if (nxt) continue; } throw e; }
-      }
-      if (!sub || !sub.submissionId) die('submit_prepared gagal');
-      for (let i = 0; i < SWAP.completionMaxTries; i++) {
-        const c = await canton.queryCompletion(sub.submissionId).catch(() => null);
-        if (c && c.status === 'completed') { P(`\n✓ terkirim — ${fmt10(String(amt))} CC → ${receiver.slice(0, 24)}…`, COLOR.green); process.exit(0); }
-        if (c && (c.status === 'failed' || c.status === 'rejected')) throw completionErr(c.status, c.message);
-        await sleep(SWAP.completionPollMs);
-      }
-      P('\n⚠ submit OK tapi completion belum kebaca — cek saldo manual.', COLOR.yellow);
-      process.exit(0);
+      const tokenArg = String(argv[2] || '').toUpperCase();
+      if (tokenArg !== 'CC' && tokenArg !== 'AMULET') die(`token '${argv[2]}' belum didukung — baru CC (Amulet). Alasannya ada di komentar transferCC().`);
+      try {
+        await transferCC({ idx: Number(argv[1]), amountArg: String(argv[3] || ''), toArg: String(argv[4] || ''), go: argv.includes('go') });
+        process.exit(0);
+      } catch (e) { die(((e && e.message) || String(e))); }
     })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
   } else if (argv[0] === 'wallets') {
     (async () => {
@@ -6775,7 +6777,30 @@ Usage:
       process.stdout.write(paint('  8) EDELx↔cETH     — ping-pong SEMUA akun via CLOB /terminal (orderbook, fee ~4.3 CC)', COLOR.gray) + '\n');
       process.stdout.write(paint('  8r) EDELx↔cETH RFQ — ping-pong SEMUA akun via /swap AtomicDVP (fee ~1.25 CC, anti-CLOB-macet)', COLOR.gray) + '\n');
       process.stdout.write(paint('  9) bulk back      — dump ke CC, SEMUA akun (pilih pair: USDCx/cETH/EDELx/semua)', COLOR.gray) + '\n');
-      const ans = (await prompt(paint('pilih [0/1/2/3/4/5/6/7/8/8r/9]: ', COLOR.bold))).trim();
+      process.stdout.write(paint('  t) transfer CC    — kirim CC ke akun sendiri / party luar (konfirmasi dulu)', COLOR.gray) + '\n');
+      const ans = (await prompt(paint('pilih [0/1/2/3/4/5/6/7/8/8r/9/t]: ', COLOR.bold))).trim().toLowerCase();
+      if (ans === 't') {
+        // Transfer CC lewat menu. Alurnya sengaja: rencana dulu (dry-run) → baru minta
+        // konfirmasi ketik ulang jumlah. Transfer keluar itu gak bisa dibatalin, jadi
+        // jangan cuma y/n yg gampang ke-enter.
+        process.stdout.write('\n' + paint('Transfer CC — pilih akun PENGIRIM:', COLOR.bold + COLOR.cyan) + '\n');
+        ACCOUNTS.forEach((a, i) => process.stdout.write(paint(`  ${i}) ${a.label || a.email}`, COLOR.gray) + '\n'));
+        const fromIdx = Number((await prompt(paint(`pilih akun [0-${ACCOUNTS.length - 1}]: `, COLOR.bold))).trim());
+        if (!ACCOUNTS[fromIdx]) { console.error(paint('akun gak valid', COLOR.red)); process.exit(1); }
+        process.stdout.write(paint('\ntujuan: partyId lengkap (hint::sidikjari), atau #N / label akun sendiri', COLOR.gray) + '\n');
+        const to = (await prompt(paint('tujuan: ', COLOR.bold))).trim();
+        const amount = (await prompt(paint('jumlah CC: ', COLOR.bold))).trim();
+        // Tahap 1: dry-run. Nampilin sifat tujuan (INTERNAL/EKSTERNAL) + saldo.
+        try {
+          await transferCC({ idx: fromIdx, amountArg: amount, toArg: to, go: false });
+        } catch (e) { console.error(paint((e && e.message) || String(e), COLOR.red)); process.exit(1); }
+        const conf = (await prompt(paint(`\nKetik ULANG jumlahnya buat konfirmasi (atau Enter buat batal): `, COLOR.bold + COLOR.yellow))).trim();
+        if (conf !== amount) { process.stdout.write(paint('dibatalin — gak ada yg dikirim.\n', COLOR.gray)); process.exit(0); }
+        try {
+          await transferCC({ idx: fromIdx, amountArg: amount, toArg: to, go: true });
+          process.exit(0);
+        } catch (e) { console.error(paint('GAGAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); }
+      }
       if (ans === '2') {
         // Cek balance: tabel + grand total, AUTO-REFRESH tiap N menit (default 15,
         // config.dashboard.balanceRefreshMin). Loop terus — Ctrl+C buat berhenti.
