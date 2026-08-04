@@ -42,6 +42,13 @@ const SESS_PATH = path.join(ROOT, 'session.json');
 // { "email": { "privateKey": "<b64 pkcs8>", "publicKey": "<b64 32B>", "note": "…" } }.
 // TIDAK di-commit (.gitignore) — berisi private key.
 const RAWKEYS_PATH = path.join(ROOT, 'raw_keys.json');
+// Wallet Walley (walley.cc) — alternatif Supanova. Filenya SENGAJA di luar repo
+// (defaultnya folder bot Walley) karena isinya mnemonic; jangan pernah disalin ke sini.
+const WALLEY_WALLETS_PATH = process.env.WALLEY_WALLETS
+  || path.join(path.dirname(path.dirname(ROOT)), 'walley', 'wallets.jsonl');
+const WALLEY_API = 'https://api.walley.cc';
+// Interface Holding standar token Canton — dipakai buat baca saldo dari ledger API.
+const HOLDING_IFACE = '#splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:Holding';
 
 function loadJSON(p, fallback) {
   try { return JSON.parse(fs.readFileSync(p, 'utf8')); }
@@ -71,6 +78,97 @@ function loadRawKey(email) {
     if (want && want !== pub) throw new Error(`pubkey gak cocok (file ${want} vs turunan ${pub})`);
     return { key, pub };
   } catch (e) { try { logActivity(`raw key ${email} gagal: ${(e && e.message) || e}`, COLOR.red); } catch (_) { } return null; }
+}
+
+// ── Wallet Walley (walley.cc) ────────────────────────────────────────────────
+// Alternatif Supanova. Bedanya mendasar: kunci ada DI SINI (seed 32 byte dari
+// mnemonic → Ed25519), jadi tanda tangan lokal — gak ada TEE, gak ada Privy.
+// Silvana emang dukung Walley (bundle-nya punya WALLET.WALLEY / connectWalley),
+// tapi jalur webnya lewat popup + localStorage. Yang dipakai bot ini API server
+// Walley langsung, sama kayak yang dipakai bot Python di folder walley/.
+//
+// Auth: POST /v1/auth/challenge → tanda tangani challenge → POST /v1/auth/verify
+//       → {access_token, expires_at}. Token di-cache per party sampai mepet expiry.
+const _walleyTok = new Map();   // partyId → {token, expMs}
+
+// seed 32 byte → private key Ed25519. PKCS8 buat Ed25519 = prefix tetap + seed.
+function walleyKeyFromSeed(seedHex) {
+  const seed = Buffer.from(String(seedHex).replace(/^0x/, ''), 'hex');
+  if (seed.length !== 32) throw new Error(`seed harus 32 byte, dapat ${seed.length}`);
+  const pkcs8 = Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), seed]);
+  const key = crypto.createPrivateKey({ key: pkcs8, format: 'der', type: 'pkcs8' });
+  const spki = crypto.createPublicKey(key).export({ format: 'der', type: 'spki' });
+  return { key, pubRaw: spki.slice(spki.length - 32), pubDerB64: spki.toString('base64') };
+}
+
+// wallets.jsonl dari bot Walley: satu JSON per baris.
+function loadWalleyWallets() {
+  let raw; try { raw = fs.readFileSync(WALLEY_WALLETS_PATH, 'utf8'); } catch (_) { return []; }
+  const out = [];
+  for (const line of raw.split('\n')) {
+    const s = line.trim(); if (!s) continue;
+    try {
+      const w = JSON.parse(s);
+      if (w && w.party_id && (w.seed_hex || w.mnemonic)) out.push(w);
+    } catch (_) { }
+  }
+  return out;
+}
+
+async function walleyReq(method, path_, { body = null, token = null, proxy = null } = {}) {
+  const headers = { 'User-Agent': 'Mozilla/5.0', Accept: 'application/json', Origin: 'https://walley.cc', Referer: 'https://walley.cc/' };
+  if (token) headers.Authorization = 'Bearer ' + token;
+  if (body) headers['Content-Type'] = 'application/json';
+  const r = await request(method, `${WALLEY_API}${path_}`, { headers, body: body ? JSON.stringify(body) : null, timeoutMs: REQ.timeoutMs, proxy });
+  if (r.status === 401 || r.status === 403) { const e = new Error(`walley ${path_} ${r.status}`); e.unauthorized = true; throw e; }
+  if (r.status < 200 || r.status >= 300) throw new Error(`walley ${path_} status=${r.status} body=${(r.text || '').slice(0, 200)}`);
+  return r.json != null ? r.json : (() => { try { return JSON.parse(r.text); } catch (_) { return null; } })();
+}
+
+async function walleyToken(w, proxy = null) {
+  const hit = _walleyTok.get(w.party_id);
+  if (hit && hit.expMs - 30000 > Date.now()) return hit.token;
+  const { key, pubDerB64 } = walleyKeyFromSeed(w.seed_hex);
+  const ch = await walleyReq('POST', '/v1/auth/challenge', { body: {}, proxy });
+  const challenge = ch && ch.challenge;
+  if (!challenge) throw new Error('walley challenge kosong');
+  const signature = crypto.sign(null, Buffer.from(challenge, 'utf8'), key).toString('base64');
+  const res = await walleyReq('POST', '/v1/auth/verify', {
+    body: { party_id: w.party_id, public_key: pubDerB64, challenge, signature }, proxy,
+  });
+  if (!res || !res.access_token) throw new Error(`walley verify gagal: ${JSON.stringify(res).slice(0, 150)}`);
+  const expMs = Number(res.expires_at) ? Number(res.expires_at) * 1000 : Date.now() + 10 * 60000;
+  _walleyTok.set(w.party_id, { token: res.access_token, expMs });
+  return res.access_token;
+}
+
+// Holding party (semua instrument) lewat ledger API proxy Walley.
+async function walleyHoldings(w, proxy = null) {
+  const token = await walleyToken(w, proxy);
+  const end = await walleyReq('GET', '/v1/proxy/v2/state/ledger-end', { token, proxy });
+  const body = {
+    filter: { filtersByParty: { [w.party_id]: { cumulative: [{ identifierFilter: { InterfaceFilter: { value: { interfaceId: HOLDING_IFACE, includeInterfaceView: true } } } }] } } },
+    verbose: false, activeAtOffset: (end && end.offset) || 0,
+  };
+  const rows = await walleyReq('POST', '/v1/proxy/v2/state/active-contracts', { body, token, proxy });
+  const bal = {};
+  for (const row of (Array.isArray(rows) ? rows : [])) {
+    // Bentuk row bisa dibungkus beberapa lapis; cari view Holding-nya apa adanya.
+    const ev = (row && (row.contractEntry || row)) || {};
+    const created = ev.activeContract && ev.activeContract.createdEvent ? ev.activeContract.createdEvent : (ev.createdEvent || ev);
+    const views = (created && created.interfaceViews) || [];
+    for (const v of views) {
+      const val = (v && (v.viewValue || v.value)) || null;
+      if (!val) continue;
+      const id = (val.instrumentId && (val.instrumentId.id || val.instrumentId)) || val.instrument || '?';
+      const amt = Number(val.amount || 0);
+      const locked = val.lock != null && val.lock !== '$undefined' && val.lock !== null;
+      if (!bal[id]) bal[id] = { unlocked: 0, locked: 0, utxo: 0 };
+      bal[id][locked ? 'locked' : 'unlocked'] += amt;
+      bal[id].utxo++;
+    }
+  }
+  return bal;
 }
 
 // ── Persist action IDs (auto-fetch) ──────────────────────────────────────────
@@ -5929,6 +6027,7 @@ Usage:
                               jumlah = angka, atau 'max' buat kirim semua (CC disisain buat fee)
                               tujuan = partyId (hint::sidikjari) ATAU #N / label akun sendiri
                               TANPA go = dry-run (cuma nampilin rencana + fee, gak ngirim)
+  node index.js walley [n]   cek wallet Walley (auth + holding) — read-only
   node index.js wallets   list Privy wallets per akun + tandai mana yg cached/match partyId
   node index.js pin <id>  pin privyWalletId ke session.json (utk akun pertama)
   node index.js help      tampilkan bantuan
@@ -5986,6 +6085,35 @@ Usage:
         await transferToken({ idx: Number(argv[1]), tokenArg: String(argv[2] || 'CC'), amountArg: String(argv[3] || ''), toArg: String(argv[4] || ''), go: argv.includes('go') });
         process.exit(0);
       } catch (e) { die(((e && e.message) || String(e))); }
+    })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
+  } else if (argv[0] === 'walley') {
+    // `node index.js walley [n]` — READ-ONLY. Cek klien Walley: auth challenge/verify
+    // pakai kunci lokal, lalu baca holding tiap party. Dipakai buat mastiin lapisan
+    // Walley jalan sebelum apa pun disambungin ke Silvana.
+    (async () => {
+      const ws = loadWalleyWallets();
+      if (!ws.length) { console.error(paint(`wallets.jsonl gak kebaca di ${WALLEY_WALLETS_PATH}\n(atur lewat env WALLEY_WALLETS)`, COLOR.red)); process.exit(1); }
+      const n = Math.max(1, Math.min(ws.length, Number(argv[1]) || 5));
+      process.stdout.write(paint(`\n${ws.length} wallet Walley di ${WALLEY_WALLETS_PATH}\ncek ${n} pertama:\n`, COLOR.cyan));
+      let ok = 0, kosong = 0;
+      for (const w of ws.slice(0, n)) {
+        try {
+          const bal = await walleyHoldings(w);
+          const ids = Object.keys(bal);
+          const ringkas = ids.length
+            ? ids.map(k => `${k}=${bal[k].unlocked}${bal[k].locked ? '+' + bal[k].locked + ' lock' : ''}`).join(' · ')
+            : paint('(kosong — belum ada holding)', COLOR.yellow);
+          if (!ids.length) kosong++;
+          ok++;
+          process.stdout.write('  ' + paint(String(w.party_hint || '-').padEnd(24), COLOR.bold)
+            + paint(String(w.party_id).slice(0, 26) + '…  ', COLOR.gray) + ringkas + '\n');
+        } catch (e) {
+          process.stdout.write('  ' + paint(String(w.party_hint || '-').padEnd(24), COLOR.bold)
+            + paint('GAGAL: ' + ((e && e.message) || e), COLOR.red) + '\n');
+        }
+      }
+      process.stdout.write(paint(`\n${ok}/${n} party kebaca · ${kosong} masih kosong (butuh CC sebelum bisa dipakai)\n`, COLOR.cyan));
+      process.exit(0);
     })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
   } else if (argv[0] === 'wallets') {
     (async () => {
