@@ -47,6 +47,15 @@
     "minAmount": "5",
     "maxAmount": "5.1",
     "maxFeeCC": 5,
+    "_help_transfer": "Setelan subcommand/menu transfer. dustMin: saldo di bawah angka ini dianggap DUST -> akun tetap DITAMPILKAN di picker (biar kelihatan kenapa dilewati) tapi TIDAK ikut dikirim. Untuk CC ambangnya otomatis dinaikkan ke fee transfer kalau fee lebih besar, karena mengirim CC di bawah ongkos kirimnya sendiri itu rugi/gagal. Angka default dipatok setara fee 16 CC (~$1.9) pada harga saat disetel: cETH 0.001 (~$1.9), EDELx 200 (~$2.1), USDCx 2. Sesuaikan kalau harga bergerak jauh.",
+    "transfer": {
+      "dustMin": {
+        "Amulet": 16,
+        "EDELx": 200,
+        "cETH": 0.001,
+        "USDCx": 2
+      }
+    },
     "_help_hardMaxFeeCC": "PLAFON MUTLAK fee per swap (CC). Beda dari maxFeeCC: maxFeeCC itu gate 'tunggu sampai fee turun' yang SENGAJA dibypass di mode8 malam (trabas biar task kelar sebelum reset 07:00) dan opsi 7 (force dump) -> di situ batasnya jadi tanpa batas. hardMaxFeeCC berlaku di SEMUA jalur dan TIDAK bisa dibypass, jadi satu fee spike gak bisa ngebakar CC sebanyak apa pun. Fee normal 1.23 CC (RFQ) / 4.3 CC (terminal). 0 = matikan (gak disaranin).",
     "hardMaxFeeCC": 15,
     "feeSpikeWaitSec": 300,

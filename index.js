@@ -1779,6 +1779,92 @@ function prompt(question) {
   });
 }
 
+// ── Picker interaktif (panah ↑/↓, spasi centang, Enter konfirmasi) ───────────
+// Dipakai menu transfer buat milih akun & token tanpa ngetik indeks. Item bisa
+// di-`disabled` (mis. saldo dust) — tetep KELIHATAN biar user tau kenapa akun itu
+// gak ikut, tapi gak bisa dicentang.
+// Kalau stdin bukan TTY (dipipe/CI) otomatis balik ke mode ketik, biar skrip tetep jalan.
+//
+// items: [{ label, detail?, disabled?, note? }]
+// balik: array index terpilih (multi) atau [index] (single). [] = dibatalin.
+async function pickList({ title, items, multi = false, hint = '' }) {
+  const N = items.length;
+  if (!N) return [];
+  const enabled = items.map((it, i) => (it && !it.disabled) ? i : -1).filter(i => i >= 0);
+  if (!enabled.length) return [];
+
+  if (!process.stdin.isTTY) {
+    // Fallback ketik: "all" | "0,2,5" | "0-4" | campuran.
+    process.stdout.write('\n' + paint(title, COLOR.bold + COLOR.cyan) + '\n');
+    items.forEach((it, i) => process.stdout.write(paint(`  ${i}) ${it.label}${it.detail ? '  ' + it.detail : ''}${it.disabled ? '  [' + (it.note || 'dilewati') + ']' : ''}`, it.disabled ? COLOR.gray : COLOR.white) + '\n'));
+    const raw = (await prompt(paint(multi ? `pilih [0-${N - 1} / all]: ` : `pilih [0-${N - 1}]: `, COLOR.bold))).trim();
+    const out = [];
+    if (/^(all|semua|\*)$/i.test(raw)) enabled.forEach(i => out.push(i));
+    else for (const part of raw.split(',').map(x => x.trim()).filter(Boolean)) {
+      const m = part.match(/^(\d+)\s*-\s*(\d+)$/);
+      if (m) { const lo = Number(m[1]), hi = Number(m[2]); for (let i = Math.min(lo, hi); i <= Math.max(lo, hi); i++) out.push(i); }
+      else if (/^\d+$/.test(part)) out.push(Number(part));
+    }
+    return [...new Set(out)].filter(i => enabled.includes(i)).slice(0, multi ? undefined : 1);
+  }
+
+  // Readline bareng ditutup dulu — kalau nggak dia ikut nyedot stdin dan panahnya
+  // ketelen. getRL() bikin ulang sendiri pas prompt() berikutnya dipanggil.
+  try { if (_rl) { _rl.close(); _rl = null; } } catch (_) { }
+  const sel = new Set();
+  let cur = enabled[0];
+  const head = paint(title, COLOR.bold + COLOR.cyan)
+    + '\n' + paint(hint || (multi ? '↑/↓ pindah · SPASI centang · a semua · Enter lanjut · q batal'
+      : '↑/↓ pindah · Enter pilih · q batal'), COLOR.gray);
+  process.stdout.write('\n' + head + '\n');
+  const draw = (first) => {
+    if (!first) process.stdout.write(`\x1b[${N}A`);
+    for (let i = 0; i < N; i++) {
+      const it = items[i];
+      const mark = multi ? (sel.has(i) ? '[x] ' : '[ ] ') : '';
+      const arrow = i === cur ? '❯ ' : '  ';
+      const body = `${arrow}${mark}${it.label}${it.detail ? '  ' + it.detail : ''}${it.disabled ? '  ' + (it.note || 'dilewati') : ''}`;
+      const col = it.disabled ? COLOR.gray : (i === cur ? COLOR.bold + COLOR.cyan : COLOR.white);
+      process.stdout.write('\x1b[2K' + paint(body, col) + '\n');
+    }
+  };
+  draw(true);
+
+  return await new Promise((resolve) => {
+    const done = (val) => {
+      try { process.stdin.setRawMode(false); } catch (_) { }
+      process.stdin.removeListener('keypress', onKey);
+      process.stdin.pause();
+      if (useColor) process.stdout.write('\x1b[?25h');
+      resolve(val);
+    };
+    const onKey = (str, key) => {
+      if (!key) return;
+      if (key.ctrl && key.name === 'c') { done([]); process.stdout.write('\n' + paint('bye 👋', COLOR.gray) + '\n'); process.exit(0); }
+      const step = (d) => {
+        const at = enabled.indexOf(cur);
+        cur = enabled[(at + d + enabled.length) % enabled.length];
+      };
+      if (key.name === 'up' || key.name === 'k') step(-1);
+      else if (key.name === 'down' || key.name === 'j') step(1);
+      else if (multi && (key.name === 'space')) { sel.has(cur) ? sel.delete(cur) : sel.add(cur); }
+      else if (multi && (str === 'a' || str === 'A')) { if (sel.size === enabled.length) sel.clear(); else enabled.forEach(i => sel.add(i)); }
+      else if (key.name === 'return' || key.name === 'enter') {
+        const out = multi ? (sel.size ? [...sel].sort((x, y) => x - y) : [cur]) : [cur];
+        draw(false); process.stdout.write('\n');
+        return done(out);
+      } else if (str === 'q' || key.name === 'escape') { draw(false); process.stdout.write('\n'); return done([]); }
+      else return;
+      draw(false);
+    };
+    readline.emitKeypressEvents(process.stdin);
+    try { process.stdin.setRawMode(true); } catch (_) { }
+    process.stdin.resume();
+    if (useColor) process.stdout.write('\x1b[?25l');
+    process.stdin.on('keypress', onKey);
+  });
+}
+
 // ── Navigasi keyboard dashboard (panah ↑/↓ pindah view log per-akun) ──────────
 // Raw mode stdin → tangkap keypress tanpa Enter. selView 0=SYSTEM, 1..N=akun.
 // Ctrl+C di raw mode TIDAK jadi SIGINT → handle manual di sini.
@@ -5813,7 +5899,7 @@ async function runRegister() {
 const argv = process.argv.slice(2);
 // buildSwapClients/SWAP/transferCC ikut diekspor biar bisa diprobe dari skrip luar
 // tanpa nyalain bot (require aman: runMain kegate `require.main === module`).
-module.exports = { render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
+module.exports = { render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
 
 if (require.main === module) {
   if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
@@ -6794,35 +6880,66 @@ Usage:
       process.stdout.write(paint('  t) transfer      — kirim token (CC/EDELx/cETH) ke akun sendiri / party luar', COLOR.gray) + '\n');
       const ans = (await prompt(paint('pilih [0/1/2/3/4/5/6/7/8/8r/9/t]: ', COLOR.bold))).trim().toLowerCase();
       if (ans === 't') {
-        // Transfer lewat menu. Alurnya sengaja bertahap: pilih akun (boleh banyak) ->
-        // token -> tujuan -> jumlah -> DRY-RUN tiap akun -> baru konfirmasi ketik ulang.
-        // Transfer keluar gak bisa dibatalin, jadi konfirmasinya bukan y/n yg gampang
-        // ke-Enter. Fee-nya FLAT 16 CC per transfer (diukur live) — mahal, jadi jumlah
-        // dan ongkos totalnya ditampilin dulu sebelum eksekusi.
-        process.stdout.write('\n' + paint('Transfer — pilih akun PENGIRIM:', COLOR.bold + COLOR.cyan) + '\n');
-        ACCOUNTS.forEach((a, i) => process.stdout.write(paint(`  ${i}) ${a.label || a.email}`, COLOR.gray) + '\n'));
-        process.stdout.write(paint('  bisa: satu angka (3) · beberapa (0,2,5) · rentang (0-4) · semua (all)', COLOR.gray) + '\n');
-        const pick = (await prompt(paint(`pilih akun [0-${ACCOUNTS.length - 1} / all]: `, COLOR.bold))).trim();
-        // Parser pilihan akun: "all" | "0,2,5" | "0-4" | campuran "0,3-5"
-        const idxs = [];
-        if (/^(all|semua|\*)$/i.test(pick)) { ACCOUNTS.forEach((_, i) => idxs.push(i)); }
-        else for (const part of pick.split(',').map(x => x.trim()).filter(Boolean)) {
-          const m = part.match(/^(\d+)\s*-\s*(\d+)$/);
-          if (m) { const lo = Number(m[1]), hi = Number(m[2]); for (let i = Math.min(lo, hi); i <= Math.max(lo, hi); i++) idxs.push(i); }
-          else if (/^\d+$/.test(part)) idxs.push(Number(part));
-        }
-        const uniq = [...new Set(idxs)].filter(i => ACCOUNTS[i]);
-        if (!uniq.length) { console.error(paint('pilihan akun gak valid', COLOR.red)); process.exit(1); }
-        process.stdout.write(paint(`\n${uniq.length} akun: ${uniq.map(i => ACCOUNTS[i].label || ACCOUNTS[i].email).join(', ')}`, COLOR.cyan) + '\n');
-        const token = ((await prompt(paint('token [CC/EDELx/cETH, Enter = CC]: ', COLOR.bold))).trim() || 'CC');
-        process.stdout.write(paint('\ntujuan: partyId lengkap (hint::sidikjari), atau #N / label akun sendiri', COLOR.gray) + '\n');
-        const to = (await prompt(paint('tujuan: ', COLOR.bold))).trim();
-        const amount = (await prompt(paint(`jumlah ${token} (angka, atau 'max' buat kirim semua): `, COLOR.bold))).trim();
+        // Transfer lewat menu, semuanya pakai picker panah (pickList) — gak ada ngetik
+        // indeks lagi. Saldo tiap akun diambil DULUAN biar kelihatan pas milih pengirim;
+        // tanpa itu user milih buta lalu baru ketahuan saldonya kosong.
+        process.stdout.write('\n' + paint('Ambil saldo semua akun…', COLOR.gray) + '\n');
+        const states = makeStates();
+        const balOf = new Array(ACCOUNTS.length).fill(null);
+        await mapLimit(ACCOUNTS.map((_, i) => i), 5, async (i) => {
+          try {
+            const tk = await ensurePrivyToken(states[i]);
+            const b = await supaBalances(tk, getProxy(ACCOUNTS[i].email));
+            const m = {};
+            for (const t of (b && b.tokens) || []) {
+              m[t.instrumentId.id] = (t.unlockedUtxos || []).reduce((x, u) => x + (Number(u.amount) || 0), 0);
+            }
+            balOf[i] = m;
+          } catch (e) { balOf[i] = { _err: (e && e.message) || String(e) }; }
+        });
 
-        // Tahap 1: dry-run SEMUA akun dulu. Yang gagal validasi dibuang di sini, jadi
-        // gak ada akun yg baru ketahuan error setelah akun lain terlanjur kekirim.
+        // 1) Token dulu — ambang dust & saldo yg ditampilin tergantung token.
+        const TOKENS = ['CC', 'EDELx', 'cETH', 'USDCx'];
+        const idOf = (t) => (/^cc$/i.test(t) ? 'Amulet' : t);
+        const totalOf = (t) => balOf.reduce((s, m) => s + ((m && Number(m[idOf(t)])) || 0), 0);
+        const tokPick = await pickList({
+          title: 'Transfer — pilih TOKEN:',
+          items: TOKENS.map(t => ({ label: t.padEnd(6), detail: paint(`total ${totalOf(t).toFixed(6)}`, COLOR.gray) })),
+        });
+        if (!tokPick.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); process.exit(0); }
+        const token = TOKENS[tokPick[0]];
+        const instId = idOf(token);
+
+        // Ambang dust dari config. Buat CC ambangnya minimal = fee transfer: ngirim CC
+        // di bawah ongkos kirimnya sendiri itu rugi, dan `max` malah bikin saldo kurang.
+        const dustCfg = ((CONFIG.swap || {}).transfer || {}).dustMin || {};
+        let dustMin = Number(dustCfg[instId]) || 0;
+        if (instId === 'Amulet') dustMin = Math.max(dustMin, 16);
+
+        // 2) Akun pengirim — multi-select, saldo tampil, dust ditandai & gak bisa dicentang.
+        const items = ACCOUNTS.map((a, i) => {
+          const m = balOf[i] || {};
+          if (m._err) return { label: (a.label || a.email).padEnd(20), detail: paint('gagal baca saldo', COLOR.red), disabled: true, note: paint('[dilewati]', COLOR.red) };
+          const v = Number(m[instId]) || 0;
+          // Kolom CC cuma ditempel kalau token yg dikirim BUKAN CC — fee dibayar pakai CC,
+          // jadi perlu kelihatan. Kalau tokennya CC sendiri, nempel lagi cuma bikin kembar.
+          const detail = paint(`${token} ${v.toFixed(6).padStart(14)}`, COLOR.green)
+            + (instId === 'Amulet' ? '' : paint(`   CC ${(Number(m.Amulet) || 0).toFixed(2).padStart(9)}`, COLOR.gray));
+          const dust = v <= dustMin;
+          return { label: (a.label || a.email).padEnd(20), detail, disabled: dust, note: paint(`[dust ≤ ${dustMin} — dilewati]`, COLOR.yellow) };
+        });
+        const chosen = await pickList({ title: `Transfer ${token} — pilih akun PENGIRIM:`, items, multi: true });
+        if (!chosen.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); process.exit(0); }
+
+        // 3) Tujuan + jumlah.
+        process.stdout.write(paint('tujuan: partyId lengkap (hint::sidikjari), atau #N / label akun sendiri', COLOR.gray) + '\n');
+        const to = (await prompt(paint('tujuan: ', COLOR.bold))).trim();
+        const amount = (await prompt(paint(`jumlah ${token} (angka, atau ketik max buat kirim semua): `, COLOR.bold))).trim();
+
+        // 4) Dry-run SEMUA akun dulu. Yang gagal validasi dibuang di sini, jadi gak ada
+        //    akun yg baru ketahuan error setelah akun lain terlanjur kekirim.
         const okIdx = [];
-        for (const i of uniq) {
+        for (const i of chosen) {
           try { await transferToken({ idx: i, tokenArg: token, amountArg: amount, toArg: to, go: false }); okIdx.push(i); }
           catch (e) { process.stdout.write(paint(`  [${ACCOUNTS[i].label || ACCOUNTS[i].email}] DILEWATI: ${(e && e.message) || e}`, COLOR.red) + '\n'); }
         }
