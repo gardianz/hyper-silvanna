@@ -370,6 +370,9 @@ const SWAP = {
   // Tunggu feeSpikeWaitSec lalu cek ulang, retry SAMPAI fee turun (infinity).
   // Fee naik biasanya karena network Canton lagi sibuk → transient.
   maxFeeCC: Number((CONFIG.swap || {}).maxFeeCC) || 3.5,
+  // Token pembayar settlement fee RFQ. [] = CC (Amulet). ["USDCx"] = bayar USDCx.
+  feeTokens: Array.isArray((CONFIG.swap || {}).feeTokens) ? (CONFIG.swap || {}).feeTokens : [],
+
   // PLAFON MUTLAK — beda sama maxFeeCC. maxFeeCC itu gate "tunggu sampai fee turun"
   // yang SENGAJA di-bypass di dua tempat: mode 8 malam (trabas biar task kelar sebelum
   // reset 07:00) dan opsi 7 (force dump). Di situ batasnya jadi Infinity = gak ada
@@ -3040,7 +3043,15 @@ async function swapOnceAtomic(ctx, side, baseQty) {
   const feeCap = effFeeCap(ctx.maxFeeCC);
 
   // 1. Quote v2 (rfqId dari /api/rfq/stream v1 DITOLAK acceptQuoteAtomic).
-  const rq = await sv.swapAction(SWAP.actionIds.requestQuotesV2, [{ partyId, marketId: market, direction: side, quantity: String(baseQty) }]);
+  // feeTokens = token buat bayar settlement fee. [] / dihilangkan = CC (Amulet).
+  // ["USDCx"] bikin LP ngasih quote dgn fee dalam USDCx. Namanya JAMAK dan berupa
+  // array — ini yg bikin tebakan feeInstrumentId/feeInstrument/feeToken semuanya
+  // meleset; ketahuan dari capture request UI (tools/inspect.js).
+  const feeTokens = (ctx.feeTokens != null ? ctx.feeTokens : SWAP.feeTokens) || [];
+  const rq = await sv.swapAction(SWAP.actionIds.requestQuotesV2, [{
+    partyId, marketId: market, direction: side, quantity: String(baseQty),
+    ...(feeTokens.length ? { feeTokens } : {}),
+  }]);
   const quotes = (rq && rq.quotes) || [];
   if (!rq || rq.success === false || !quotes.length) {
     const e = new Error(`requestQuotesV2: ${(rq && (rq.error || rq.message)) || 'gak ada quote'}`); e.noLiquidity = true; throw e;
@@ -3102,20 +3113,28 @@ async function swapOnceAtomic(ctx, side, baseQty) {
   const baseCtx = await mkCtx(baseId, String(q.baseAmount), weSendBase);
   const quoteCtx = await mkCtx(quoteId2, String(q.quoteAmount), !weSendBase);
 
-  // 5. Konteks fee (Amulet) — factoryCid utk `fees`.
+  // 5. Konteks fee — factoryCid utk `fees`. Instrumennya ikut quote (lihat feeTokens).
   const fee0 = (q.lpFees && q.lpFees[0]) || null;
   let feeFactoryCid = null, feeDisclosed = [], feeExtraArgs = null;
   if (fee0) {
-    // Amulet TIDAK lewat getUtilityTransferFactoryContext (itu buat instrument Utility
-    // registry: EDELx/cETH). UI pakai getTransferFactoryContextAction = SWAP.actionIds
-    // .prepareTransfer — bentuk args-nya sama persis (capture UI reqid 492).
+    // Factory mana yg dipakai TERGANTUNG instrument fee-nya:
+    //   Amulet (CC)  → getTransferFactoryContextAction (SWAP.actionIds.prepareTransfer)
+    //   USDCx dst    → getUtilityTransferFactoryContextAction (Utility registry)
+    // Terlihat di capture UI: waktu fee dibayar USDCx, panggilan fee-nya ke
+    // utility factory dgn instrumentId {admin:"decentralized-usdc-interchain-rep::…",
+    // id:"USDCx"} — bukan ke factory Amulet.
+    const feeIsAmulet = String(fee0.instrumentId).toUpperCase() === 'AMULET';
+    const feeAction = feeIsAmulet ? SWAP.actionIds.prepareTransfer : SWAP.actionIds.utilityTransferFactory;
+    // Holding buat bayar fee: CC kalau Amulet, holding instrument fee-nya kalau bukan.
+    const feeHold = feeIsAmulet ? ccHoldings.slice(0, 8) : holdOf(fee0.instrumentId).slice(0, 8);
+    if (!feeHold.length) { const e = new Error(`gak ada holding ${fee0.instrumentId} buat bayar fee`); e.insufficientFunds = true; throw e; }
     const now = new Date();
-    const fcRaw = await sv.swapAction(SWAP.actionIds.prepareTransfer, [{
+    const fcRaw = await sv.swapAction(feeAction, [{
       receiver: fee0.receiver, amount: String(fee0.amount),
       instrumentId: { admin: fee0.instrumentAdmin, id: fee0.instrumentId },
       requestedAt: now.toISOString(),
       executeBefore: new Date(now.getTime() + 130_000).toISOString(),
-      sender: partyId, inputHoldingCids: ccHoldings.slice(0, 8),
+      sender: partyId, inputHoldingCids: feeHold,
     }]);
     // Jalur Amulet kena bungkus `context` yg sama. Di sini lebih berbahaya: hasilnya
     // `|| null`, jadi kalau kelewat dia gagal DIAM-DIAM, bukan melempar.
@@ -3128,9 +3147,9 @@ async function swapOnceAtomic(ctx, side, baseQty) {
     const fcv = (fc && fc.choiceContextData && fc.choiceContextData.values)
       || (fc && fc.choiceContext && fc.choiceContext.choiceContextData && fc.choiceContext.choiceContextData.values)
       || null;
-    if (!fcv) throw new Error(`fee choiceContext (Amulet) kosong: ${JSON.stringify(fc).slice(0, 200)}`);
+    if (!fcv) throw new Error(`fee choiceContext (${fee0.instrumentId}) kosong: ${JSON.stringify(fc).slice(0, 200)}`);
     feeExtraArgs = { context: { values: fcv }, meta: { values: {} } };
-    if (!feeFactoryCid) throw new Error(`fee factory (Amulet) gagal: ${JSON.stringify(fc).slice(0, 160)}`);
+    if (!feeFactoryCid) throw new Error(`fee factory (${fee0.instrumentId}) gagal: ${JSON.stringify(fc).slice(0, 160)}`);
   }
 
   // 6. Rakit AtomicDVP_Settle.
