@@ -4040,7 +4040,7 @@ async function transferToken({ idx, tokenArg, amountArg, toArg, go = false, out 
   P(`  token   : ${instrumentId}`);
   P(`  jumlah  : ${fmt10(String(amt))}  (unlocked ${unlocked.toFixed(6)} dari ${utxos.length} UTXO)`);
   P(`  fee     : ${Number.isFinite(feeCC) ? feeCC + ' CC' : '(server gak kasih angka)'}`);
-  if (!go) { P('\n  dry-run — gak ada yg dikirim.', COLOR.cyan); return { dryRun: true, receiver, amount: amt, instrumentId, feeCC, unlocked }; }
+  if (!go) { P('  dry-run — belum ada yg dikirim (CLI: tambah `go` di akhir · menu: lanjut ke konfirmasi)', COLOR.cyan); return { dryRun: true, receiver, amount: amt, instrumentId, feeCC, unlocked }; }
 
   const body = { receiverPartyId: receiver, amount: fmt10(String(amt)), instrumentId, instrumentAdmin };
   const r = await request('POST', `${SUPA_ROOT}/canton/transfers/prepare_transfer`, { headers: { ...supaHeaders(idTok), 'Content-Type': 'application/json' }, body: JSON.stringify(body), timeoutMs: REQ.timeoutMs, proxy });
@@ -6939,13 +6939,20 @@ Usage:
         // 4) Dry-run SEMUA akun dulu. Yang gagal validasi dibuang di sini, jadi gak ada
         //    akun yg baru ketahuan error setelah akun lain terlanjur kekirim.
         const okIdx = [];
-        for (const i of chosen) {
+        process.stdout.write('\n' + paint(`TAHAP 1/2 — PRATINJAU ${chosen.length} akun. Belum ada yang dikirim; konfirmasi diminta setelah ini.`, COLOR.bold + COLOR.cyan) + '\n');
+        for (let k = 0; k < chosen.length; k++) {
+          const i = chosen[k];
+          process.stdout.write(paint(`\n[${k + 1}/${chosen.length}] ${ACCOUNTS[i].label || ACCOUNTS[i].email}`, COLOR.gray) + '\n');
           try { await transferToken({ idx: i, tokenArg: token, amountArg: amount, toArg: to, go: false }); okIdx.push(i); }
-          catch (e) { process.stdout.write(paint(`  [${ACCOUNTS[i].label || ACCOUNTS[i].email}] DILEWATI: ${(e && e.message) || e}`, COLOR.red) + '\n'); }
+          catch (e) { process.stdout.write(paint(`  DILEWATI: ${(e && e.message) || e}`, COLOR.red) + '\n'); }
         }
         if (!okIdx.length) { console.error(paint('\ngak ada akun yg lolos cek — batal.', COLOR.red)); process.exit(1); }
-        process.stdout.write('\n' + paint(`${okIdx.length} akun siap kirim · fee 16 CC per akun ≈ ${okIdx.length * 16} CC total`, COLOR.bold + COLOR.yellow) + '\n');
-        const conf = (await prompt(paint(`Ketik ULANG jumlahnya ("${amount}") buat konfirmasi, Enter buat batal: `, COLOR.bold + COLOR.yellow))).trim();
+        process.stdout.write('\n' + paint('─'.repeat(64), COLOR.yellow) + '\n');
+        process.stdout.write(paint(`TAHAP 2/2 — KIRIM BENERAN (bukan dry-run lagi)`, COLOR.bold + COLOR.red) + '\n');
+        process.stdout.write(paint(`  ${okIdx.length} akun · ${amount} ${token} per akun · tujuan ${to}`, COLOR.yellow) + '\n');
+        process.stdout.write(paint(`  fee 16 CC per akun ≈ ${okIdx.length * 16} CC total`, COLOR.yellow) + '\n');
+        process.stdout.write(paint('─'.repeat(64), COLOR.yellow) + '\n');
+        const conf = (await prompt(paint(`Ketik ULANG jumlahnya ("${amount}") buat KIRIM, Enter buat batal: `, COLOR.bold + COLOR.yellow))).trim();
         if (conf !== amount) { process.stdout.write(paint('dibatalin — gak ada yg dikirim.\n', COLOR.gray)); process.exit(0); }
 
         let sukses = 0, gagal = 0;
