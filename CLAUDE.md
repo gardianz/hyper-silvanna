@@ -167,19 +167,36 @@ send/withdraw server action — only the fee-transfer helpers. Supanova has no t
 either (`/canton/api/transfer*`, `/send`, `/transfer_offer*` all 404 on both GET and POST). So a
 transfer has to be assembled as a raw Canton command, the same way the swap fee payment already is.
 
-That works for **CC (Amulet)** because `getTransferFactoryContextAction` returns a self-contained
-context — `factoryId`, `choiceContextData`, and `disclosedContracts` in one call. `transfer` builds
-an `ExerciseCommand` on `TRANSFER_FACTORY_IFACE` / `TransferFactory_Transfer` from exactly that.
+**It does not work yet, for any token.** `transfer` is wired end to end and fails at
+`prepare_transaction`, so nothing is ever signed or submitted and a failed attempt costs 0 CC.
+Three distinct walls were found live, in order:
+
+1. Passing every unlocked Amulet UTXO as `inputHoldingCids` leaves the server's fee service with
+   nothing: `Not enough balance for batch transfer: need 17.32, have 0.0000000000 across 0 UTXOs`.
+   Fixed — `transferCC` now picks the smallest set of UTXOs covering the amount and refuses to
+   proceed unless at least one UTXO is left over for the fee.
+2. A bare `ExerciseCommand` on the transfer factory makes the server append its own fee command,
+   and Canton rejects that: `Preparing multiple commands is currently not supported`.
+3. Wrapping the transfer in `Execute_MultiCall` (one command, `Op_BatchTransfer` shaped exactly
+   like the `feeBatch` in `buildMultiCallAccept`) hits the same error, because our MultiCall does
+   not itself pay the fee — so the server still appends one. Paying it inside needs a fee context,
+   and `buildFeeTransferDataAction` returns `null` for every non-DvP `feeType` probed
+   (`transfer`, `traffic`, `batch_transfer`, `token_transfer`, `amulet_transfer`, `send`); it only
+   answers for `dvp_contract` with a real `proposalId`.
+
+So the missing piece is the fee context for a non-DvP transfer, and nothing reachable exposes it —
+consistent with Silvana having no transfer UI at all. Unblocking this needs a capture of a real
+transfer from a client that can do one; `app.supanova.app` is a different product (Cosmos/IOTA
+endpoints) and is not that client.
 
 It does **not** work for EDELx/cETH. Those live in the Utility registry, whose `extraArgs` requires
 a `transfer-rule` contract id (`utilArgs`), and the only source of that cid anywhere in this codebase
 is `env.utilityAcceptRefs[]` — a field of the RFQ accept envelope, which exists only mid-swap. Adding
 token transfers means capturing a real transfer from a UI that has one; do not guess the rule cid.
 
-`TRANSFER_FACTORY_IFACE` is named after the two interface constants already proven here
-(`ALLOCATION_IFACE`, the Holding interface in `diag`) but has not itself been exercised live. If
-`prepare_transaction` rejects with an unknown template, suspect that constant first — the real value
-can be read from the factory's `templateId` in the context response's `disclosedContracts`.
+`TRANSFER_FACTORY_IFACE` is no longer on the failing path (the command is a MultiCall now) and has
+never been validated; treat it as unverified if the code is ever reverted to a bare
+`TransferFactory_Transfer`.
 
 ### Pairs and the `SWAP` global
 

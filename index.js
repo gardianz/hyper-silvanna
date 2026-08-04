@@ -3910,17 +3910,35 @@ async function transferCC({ idx, amountArg, toArg, go = false, out = null }) {
   const unlocked = utxos.reduce((s, u) => s + (Number(u.amount) || 0), 0);
   if (amt > unlocked) bad(`jumlah ${amt} CC > saldo unlocked ${unlocked.toFixed(10)} CC`);
 
+  // Pilih UTXO SESEDIKIT MUNGKIN buat nutup jumlah transfer, dan WAJIB nyisain minimal
+  // satu UTXO buat fee. Fee transfer dibayar server dari UTXO CC yg BELUM kepakai jadi
+  // input — kalau semuanya dikirim, prepare_transaction nolak:
+  //   "Not enough balance for batch transfer: need 17.32, have 0.0000000000 across 0 UTXOs"
+  // (terpantau live: 2 UTXO, dua-duanya dijadiin input, fee gak kebagian apa-apa).
+  // Urut MENAIK biar yg kepakai paling sedikit dan sisa buat fee paling gede.
+  const sorted = utxos.slice().sort((x, y) => (Number(x.amount) || 0) - (Number(y.amount) || 0));
+  const picked = [];
+  let acc = 0;
+  for (const u of sorted) { if (acc >= amt) break; picked.push(u); acc += Number(u.amount) || 0; }
+  const restCC = sorted.slice(picked.length).reduce((s, u) => s + (Number(u.amount) || 0), 0);
+  if (picked.length >= sorted.length) {
+    bad(`semua ${sorted.length} UTXO CC kepakai buat jumlah segini — fee gak kebagian UTXO.\n`
+      + `Sisain ruang: kirim maksimal ${(unlocked - (Number(sorted[sorted.length - 1].amount) || 0)).toFixed(4)} CC, `
+      + `atau pecah UTXO dulu lewat swap kecil.`);
+  }
+
   P(`\n▎ TRANSFER ${go ? '[LIVE]' : '[DRY-RUN]'}`, COLOR.bold + (go ? COLOR.red : COLOR.cyan));
   P(`  dari    : ${a.label || a.email}`);
   P(`  party   : ${partyId}`);
   P(`  ke      : ${receiver}`);
   P(`  sifat   : ${receiverNote}`, receiverNote === 'EKSTERNAL' ? COLOR.yellow : COLOR.gray);
-  P(`  jumlah  : ${fmt10(String(amt))} CC  (unlocked ${unlocked.toFixed(4)}, ${utxos.length} UTXO)`);
+  P(`  jumlah  : ${fmt10(String(amt))} CC  (unlocked ${unlocked.toFixed(4)} dari ${utxos.length} UTXO)`);
+  P(`  UTXO    : ${picked.length} kepakai jadi input · sisa ${sorted.length - picked.length} UTXO (${restCC.toFixed(4)} CC) buat fee`);
   if (!go) { P('\n  dry-run — gak ada yg dikirim.', COLOR.cyan); return { dryRun: true, receiver, amount: amt, unlocked }; }
 
   // Konteks factory Amulet — action yg sama persis dipakai jalur pembayaran fee swap.
   const now = new Date();
-  const inputHoldingCids = utxos.slice(0, 8).map(u => u.contractId);
+  const inputHoldingCids = picked.map(u => u.contractId);
   const requestedAt = now.toISOString();
   const executeBefore = new Date(now.getTime() + 130_000).toISOString();
   const transfer = {
@@ -3942,16 +3960,46 @@ async function transferCC({ idx, amountArg, toArg, go = false, out = null }) {
     .map(d => ({ templateId: d.templateId, contractId: d.contractId, createdEventBlob: d.createdEventBlob, synchronizerId: d.synchronizerId || SWAP.synchronizerId }));
   P(`  factory : ${String(factoryCid).slice(0, 20)}… · ${disclosed.length} disclosed`);
 
+  // Canton cuma nerima SATU command per prepare_transaction, dan server nempelin
+  // command fee-nya sendiri kalau kita kirim ExerciseCommand transfer polos:
+  //   "Preparing multiple commands is currently not supported"
+  // Jalur swap lolos karena fee-nya jadi OPERATION di dalam satu Execute_MultiCall.
+  // Jadi transfer biasa juga dibungkus MultiCall, operasinya Op_BatchTransfer —
+  // bentuknya sama persis kayak feeBatch di buildMultiCallAccept, cuma factory +
+  // context-nya punya kita dan transferTargets-nya tujuan kita.
+  //
+  // BELUM JALAN. Bentuk ini pun masih ditolak dgn error yg sama, karena MultiCall kita
+  // gak MBAYAR fee-nya sendiri jadi server tetep nempelin command fee. Buat mbayar di
+  // dalem, butuh fee context non-DvP — dan buildFeeTransferDataAction balik null buat
+  // SEMUA feeType yg udah dicoba (transfer/traffic/batch_transfer/token_transfer/
+  // amulet_transfer/send); dia cuma jawab buat 'dvp_contract' + proposalId asli.
+  // Gagalnya di prepare_transaction, jadi 0 CC kebakar dan gak ada yg ketandatangani.
+  const multiCall = await sv.swapAction(SWAP.actionIds.getMultiCall, ['supa']);
+  if (!multiCall || !multiCall.contractId) bad('getMultiCall gagal — gak dapet config MultiCall');
+  const op = {
+    tag: 'Op_BatchTransfer',
+    value: {
+      transferFactoryCid: factoryCid,
+      expectedAdmin: admin,
+      instrumentId: { admin, id: 'Amulet' },
+      requestedAt, executeBefore,
+      extraArgs: { context: { values: ctxVals }, meta: { values: {} } },
+      transferTargets: [{ receiver, amount: fmt10(String(amt)), description: `transfer ${fmt10(String(amt))} CC` }],
+    },
+  };
+  const mcDisclosed = { contractId: multiCall.contractId, createdEventBlob: multiCall.blob, templateId: multiCall.templateId, synchronizerId: multiCall.synchronizerId };
+  const allDisclosed = []; const seenD = new Set();
+  for (const d of [mcDisclosed, ...disclosed]) { if (!d || !d.contractId || seenD.has(d.contractId)) continue; seenD.add(d.contractId); allDisclosed.push(d); }
   const body = {
     commands: [{
       ExerciseCommand: {
-        templateId: TRANSFER_FACTORY_IFACE,
-        contractId: factoryCid,
-        choice: 'TransferFactory_Transfer',
-        choiceArgument: { expectedAdmin: admin, transfer, extraArgs: { context: { values: ctxVals }, meta: { values: {} } } },
+        templateId: multiCall.templateId,
+        contractId: multiCall.contractId,
+        choice: 'Execute_MultiCall',
+        choiceArgument: { sender: partyId, inputHoldings: inputHoldingCids, operations: [op] },
       },
     }],
-    disclosedContracts: disclosed,
+    disclosedContracts: allDisclosed,
   };
   const prep = await canton.prepareTransaction(body);
   if (!prep || !prep.hash) bad('prepare_transaction gak balikin hash');
@@ -5800,7 +5848,9 @@ async function runRegister() {
 //  CLI
 // ============================================================================
 const argv = process.argv.slice(2);
-module.exports = { render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, getProxy, patchAcctSession, ACCOUNTS, M8, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
+// buildSwapClients/SWAP/transferCC ikut diekspor biar bisa diprobe dari skrip luar
+// tanpa nyalain bot (require aman: runMain kegate `require.main === module`).
+module.exports = { render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferCC, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
 
 if (require.main === module) {
   if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
