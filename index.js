@@ -3798,6 +3798,11 @@ function renderAccountsTable(states) {
     // SEASON = total fee CC kebakar seumur season (gak roll harian). Persist di
     // session.json → survive re-run. Reset cuma manual: menu 5 → b) reset season.
     { title: 'FEE/SN', prio: 2, cap: 11, cell: s => [fmtSeason(s.feeSeason), COLOR.mag] },
+    // Kolom fee token NON-CC cuma nongol kalau emang ada — biar layout lama gak
+    // berubah buat akun yg fee-nya masih CC.
+    ...((Array.isArray(states) && states.some(x => Number(x && x.feeTokSeason) > 0))
+      ? [{ title: 'FEE-TOK', prio: 2, cap: 12, cell: s => [Number(s.feeTokSeason) > 0 ? `${fmtSeason(s.feeTokSeason)} ${s.feeTokUnit || ''}`.trim() : '-', Number(s.feeTokSeason) > 0 ? COLOR.cyan : COLOR.gray] }]
+      : []),
     { title: 'LOSS$/hr', prio: 3, cap: 9, cell: s => [Number(s.spreadToday) > 0 ? '$' + Number(s.spreadToday).toFixed(2) : '$0', COLOR.red] },
     // LOSS SEASON = total spread loss USD seumur season (mirror SEASON fee). Reset barengan.
     { title: 'LOSS/SN', prio: 2, cap: 11, cell: s => [Number(s.spreadSeason) > 0 ? '$' + fmtSeason(s.spreadSeason) : '$0', COLOR.red] },
@@ -3849,10 +3854,13 @@ function renderFooter(states) {
   // Total season = agregat feeSeason (fee CC) + spreadSeason (loss USD) SEMUA akun.
   const st = Array.isArray(states) ? states : [];
   const seasonFee = st.reduce((a, s) => a + (Number(s.feeSeason) || 0), 0);
+  const seasonFeeTok = (states || []).reduce((n, x) => n + (Number(x && x.feeTokSeason) || 0), 0);
+  const seasonFeeTokUnit = ((states || []).find(x => x && x.feeTokUnit) || {}).feeTokUnit || '';
   const seasonLoss = st.reduce((a, s) => a + (Number(s.spreadSeason) || 0), 0);
   return [
     sep(),
     row(paint('Season fee total ', COLOR.gray) + paint(fmtSeason(seasonFee) + ' CC', COLOR.bold + COLOR.mag)
+      + (seasonFeeTok > 0 ? paint(' + ' + fmtSeason(seasonFeeTok) + ' ' + (seasonFeeTokUnit || ''), COLOR.bold + COLOR.cyan) : '')
       + paint('   ·   loss ', COLOR.gray) + paint('$' + fmtSeason(seasonLoss), COLOR.bold + COLOR.red)
       + paint('   ·   reset: menu 5 → b', COLOR.gray)),
     row(paint('Jadwal harian ', COLOR.gray) + paint(jam + ' WIB', COLOR.cyan) + paint('   ·   Ctrl+C berhenti', COLOR.gray)),
@@ -3879,12 +3887,16 @@ const DASH_ACTIVITY = []; const DASH_ACTIVITY_MAX = 200;
 // Burn events — fee CC kebakar tiap swap sukses submit. Dashboard akumulasi
 // jadi total All Time + Today (dedupe by ts server-side).
 const BURN_EVENTS = []; const BURN_EVENTS_MAX = 200;
-function recordBurn(feeCC, label) {
-  const f = Number(feeCC);
+// Satuan fee IKUT instrumentnya. Sejak fee bisa dibayar USDCx, menjumlahkan
+// semuanya sebagai "CC" bikin angka season campur aduk dan gak ada artinya.
+function feeUnitNow() { return (SWAP.feeTokens && SWAP.feeTokens[0]) || 'CC'; }
+function recordBurn(feeAmt, label, unit) {
+  const f = Number(feeAmt);
   if (!Number.isFinite(f) || f <= 0) return;
-  BURN_EVENTS.push({ ts: Date.now(), feeCC: f, label: String(label || '') });
+  const u = unit || feeUnitNow();
+  BURN_EVENTS.push({ ts: Date.now(), feeCC: f, unit: u, label: String(label || '') });
   if (BURN_EVENTS.length > BURN_EVENTS_MAX) BURN_EVENTS.splice(0, BURN_EVENTS.length - BURN_EVENTS_MAX);
-  logActivity(`[${label || 'swap'}] fee ${f.toFixed(4)} CC kebakar`, COLOR.yellow);
+  logActivity(`[${label || 'swap'}] fee ${f.toFixed(4)} ${u} kebakar`, COLOR.yellow);
 }
 // ── Statistik harian per-akun (fee CC + spread loss USD). Persist ke session.json
 // (survive re-run), reset otomatis tiap ganti hari. Boundary = tanggal UTC → roll di
@@ -3901,19 +3913,31 @@ function persistDaily(email, feeCC, spreadUsd) {
   const today = todayStr();
   const s = acctSession(email);
   const same = s.statDate === today;
-  const feeToday = (same ? Number(s.feeToday) || 0 : 0) + (Number(feeCC) || 0);
   const spreadToday = (same ? Number(s.spreadToday) || 0 : 0) + (Number(spreadUsd) || 0);
-  const feeSeason = (Number(s.feeSeason) || 0) + (Number(feeCC) || 0);
   const spreadSeason = (Number(s.spreadSeason) || 0) + (Number(spreadUsd) || 0);
-  patchAcctSession(email, { statDate: today, feeToday, spreadToday, feeSeason, spreadSeason });
-  return { feeToday, spreadToday, feeSeason, spreadSeason };
+  // Fee CC tetap di feeToday/feeSeason (kompatibel sama data lama). Fee token lain
+  // masuk ember terpisah feeTokToday/feeTokSeason + feeTokUnit, jadi angkanya gak
+  // ketimbun jadi satu dengan CC.
+  const unit = (arguments.length > 3 && arguments[3]) ? String(arguments[3]) : 'CC';
+  const amt = Number(feeCC) || 0;
+  const isCC = String(unit).toUpperCase() === 'CC' || String(unit).toUpperCase() === 'AMULET';
+  const feeToday = (same ? Number(s.feeToday) || 0 : 0) + (isCC ? amt : 0);
+  const feeSeason = (Number(s.feeSeason) || 0) + (isCC ? amt : 0);
+  const sameUnit = String(s.feeTokUnit || unit) === String(unit);
+  const feeTokToday = (same && sameUnit ? Number(s.feeTokToday) || 0 : 0) + (isCC ? 0 : amt);
+  const feeTokSeason = (sameUnit ? Number(s.feeTokSeason) || 0 : 0) + (isCC ? 0 : amt);
+  const patch = { statDate: today, feeToday, spreadToday, feeSeason, spreadSeason, feeTokToday, feeTokSeason };
+  if (!isCC) patch.feeTokUnit = unit;
+  patchAcctSession(email, patch);
+  return { feeToday, spreadToday, feeSeason, spreadSeason, feeTokToday, feeTokSeason, feeTokUnit: isCC ? (s.feeTokUnit || null) : unit };
 }
 // Wrapper: persist + update state buat dashboard live.
-function bumpDaily(state, feeCC, spreadUsd) {
+function bumpDaily(state, feeCC, spreadUsd, unit) {
   if (!state || !state.email) return;
-  const r = persistDaily(state.email, feeCC, spreadUsd);
+  const r = persistDaily(state.email, feeCC, spreadUsd, unit || feeUnitNow());
   state.feeToday = r.feeToday; state.spreadToday = r.spreadToday;
   state.feeSeason = r.feeSeason; state.spreadSeason = r.spreadSeason; state.statDate = todayStr();
+  state.feeTokToday = r.feeTokToday; state.feeTokSeason = r.feeTokSeason; state.feeTokUnit = r.feeTokUnit;
 }
 // Reset akumulator season 1 akun → 0 (session.json + state live kalau ada). Nol-in
 // FEE dan LOSS season sekaligus (satu season = satu window). Balikin {fee, spread} lama.
