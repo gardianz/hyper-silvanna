@@ -7231,7 +7231,84 @@ Usage:
       process.stdout.write(paint('  8r) EDELx↔cETH RFQ — ping-pong SEMUA akun via /swap AtomicDVP (fee ~1.25 CC, anti-CLOB-macet)', COLOR.gray) + '\n');
       process.stdout.write(paint('  9) bulk back      — dump ke CC, SEMUA akun (pilih pair: USDCx/cETH/EDELx/semua)', COLOR.gray) + '\n');
       process.stdout.write(paint('  t) transfer      — kirim token (CC/EDELx/cETH) ke akun sendiri / party luar', COLOR.gray) + '\n');
-      const ans = (await prompt(paint('pilih [0/1/2/3/4/5/6/7/8/8r/9/t]: ', COLOR.bold))).trim().toLowerCase();
+      process.stdout.write(paint('  w) wallet Walley  — tautkan wallet Walley ke akun Silvana (dukung Supanova + Walley)', COLOR.gray) + '\n');
+      const ans = (await prompt(paint('pilih [0/1/2/3/4/5/6/7/8/8r/9/t/w]: ', COLOR.bold))).trim().toLowerCase();
+      if (ans === 'w') {
+        // Tautkan wallet Walley ke akun Silvana. Silvana nyimpen BANYAK wallet per akun
+        // (kartu "Connected Wallets"), jadi Supanova lama TETAP nempel — ini nambah,
+        // bukan ngeganti. Yang nentuin party mana yg dipakai bot itu session.json.
+        const ws = loadWalleyWallets();
+        if (!ws.length) { console.error(paint(`wallets.jsonl gak kebaca di ${WALLEY_WALLETS_PATH}`, COLOR.red)); process.exit(1); }
+        process.stdout.write('\n' + paint('Baca wallet yg udah ke-link tiap akun…', COLOR.gray) + '\n');
+        const states = makeStates();
+        const linked = new Array(ACCOUNTS.length).fill(null);
+        await mapLimit(ACCOUNTS.map((_, i) => i), 4, async (i) => {
+          try { const { sv } = await buildSwapClients(states[i]); linked[i] = await sv.listWallets(); }
+          catch (e) { linked[i] = { _err: (e && e.message) || String(e) }; }
+        });
+        // Party Walley yg udah kepakai di akun mana pun — jangan ditawarin lagi.
+        const dipakai = new Set();
+        for (const l of linked) if (Array.isArray(l)) for (const x of l) dipakai.add(x.partyId);
+
+        const items = ACCOUNTS.map((a, i) => {
+          const l = linked[i];
+          if (!Array.isArray(l)) return { label: (a.label || a.email).padEnd(20), detail: paint('gagal baca wallet', COLOR.red), disabled: true, note: paint('[dilewati]', COLOR.red) };
+          const sudah = l.find(x => String(x.partyId || '').startsWith('walley-'));
+          const detail = paint(`${l.length} wallet`, COLOR.gray) + (sudah ? paint(`  Walley: ${String(sudah.partyId).split('::')[0]}`, COLOR.green) : paint('  Walley: —', COLOR.yellow));
+          return { label: (a.label || a.email).padEnd(20), detail, disabled: !!sudah, note: paint('[udah punya Walley]', COLOR.green) };
+        });
+        const pilih = await pickList({ title: 'Tautkan Walley — pilih akun (yg udah punya dilewati):', items, multi: true });
+        if (!pilih.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); process.exit(0); }
+
+        // Wallet Walley yg masih bebas.
+        const bebas = ws.filter(w => !dipakai.has(w.party_id));
+        if (bebas.length < pilih.length) { console.error(paint(`wallet Walley bebas cuma ${bebas.length}, butuh ${pilih.length}`, COLOR.red)); process.exit(1); }
+        const mode = await pickList({
+          title: 'Cara memilih wallet Walley:',
+          items: [
+            { label: 'Otomatis', detail: paint(`ambil ${pilih.length} wallet bebas pertama (dari ${bebas.length})`, COLOR.gray) },
+            { label: 'Manual', detail: paint('pilih sendiri satu per satu', COLOR.gray) },
+          ],
+        });
+        if (!mode.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); process.exit(0); }
+
+        const pasang = [];
+        if (mode[0] === 0) {
+          pilih.forEach((ai, k) => pasang.push([ai, bebas[k]]));
+        } else {
+          const sisa = bebas.slice();
+          for (const ai of pilih) {
+            const w = await pickList({
+              title: `Wallet Walley buat ${ACCOUNTS[ai].label || ACCOUNTS[ai].email}:`,
+              items: sisa.map(x => ({ label: String(x.party_hint || '-').padEnd(22), detail: paint(String(x.party_id).slice(0, 30) + '…', COLOR.gray) })),
+            });
+            if (!w.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); process.exit(0); }
+            pasang.push([ai, sisa[w[0]]]);
+            sisa.splice(w[0], 1);
+          }
+        }
+
+        process.stdout.write('\n' + paint('─'.repeat(70), COLOR.yellow) + '\n');
+        process.stdout.write(paint('RENCANA PENAUTAN (Supanova lama TETAP nempel, ini nambah wallet)', COLOR.bold + COLOR.cyan) + '\n');
+        for (const [ai, w] of pasang) process.stdout.write(`  ${String(ACCOUNTS[ai].label || ACCOUNTS[ai].email).padEnd(22)} → ${w.party_hint}\n`);
+        process.stdout.write(paint('─'.repeat(70), COLOR.yellow) + '\n');
+        const conf = (await prompt(paint(`Ketik "link" buat lanjut, Enter buat batal: `, COLOR.bold + COLOR.yellow))).trim().toLowerCase();
+        if (conf !== 'link') { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); process.exit(0); }
+
+        let ok = 0, gagal = 0;
+        for (const [ai, w] of pasang) {
+          const tag = ACCOUNTS[ai].label || ACCOUNTS[ai].email;
+          try {
+            const { sv } = await buildSwapClients(states[ai]);
+            const r = await sv.linkWallet(w.party_id);
+            if (r.ok) { ok++; process.stdout.write(paint(`  ✓ ${tag} → ${w.party_hint}`, COLOR.green) + '\n'); }
+            else { gagal++; process.stdout.write(paint(`  ✗ ${tag} → ${r.status} ${JSON.stringify(r.body).slice(0, 120)}`, COLOR.red) + '\n'); }
+          } catch (e) { gagal++; process.stdout.write(paint(`  ✗ ${tag} → ${(e && e.message) || e}`, COLOR.red) + '\n'); }
+        }
+        process.stdout.write('\n' + paint(`selesai — ${ok} tertaut, ${gagal} gagal`, gagal ? COLOR.yellow : COLOR.green) + '\n');
+        if (ok) process.stdout.write(paint('Lanjutan: isi CC ke party Walley, lalu `node index.js walley-onboard <idx> <hint> go`\n', COLOR.cyan));
+        process.exit(gagal ? 1 : 0);
+      }
       if (ans === 't') {
         // Transfer lewat menu, semuanya pakai picker panah (pickList) — gak ada ngetik
         // indeks lagi. Saldo tiap akun diambil DULUAN biar kelihatan pas milih pengirim;
