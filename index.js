@@ -6055,27 +6055,48 @@ function _balCell(b, fmtFn) {
 }
 function renderBalanceTable(states, intervalMin, okCount, logBuf) {
   computeLayout(); clearScreen();
-  const rows = states.map(s => {
-    if (s._balErr) return { label: s.label || s.email, cc: paint('err', COLOR.red), usdcx: paint('err', COLOR.red), ceth: paint('err', COLOR.red), edelx: paint('err', COLOR.red) };
-    return { label: s.label || s.email, cc: _balCell(balanceOf(s, 'amulet'), fmtCC), usdcx: _balCell(balanceOf(s, 'usdcx'), fmtUSDC), ceth: _balCell(balanceOf(s, 'ceth'), fmtCeth), edelx: _balCell(balanceOf(s, 'edelx'), fmtEdelx) };
-  });
+  // Satu baris per WALLET (supa + walley), bukan per akun — biar dana di kedua
+  // party kelihatan sekaligus. Potongan partyId ikut biar gampang dicocokin waktu
+  // nyiapin kiriman bulk.
+  const shortPid = (pid) => { if (!pid) return ''; const t = String(pid).split('::')[1] || String(pid); return t.slice(0, 10) + '…'; };
+  const cellsOf = (toks) => {
+    const fake = { balances: toks || [] };
+    return {
+      cc: _balCell(balanceOf(fake, 'amulet'), fmtCC), usdcx: _balCell(balanceOf(fake, 'usdcx'), fmtUSDC),
+      ceth: _balCell(balanceOf(fake, 'ceth'), fmtCeth), edelx: _balCell(balanceOf(fake, 'edelx'), fmtEdelx),
+    };
+  };
+  const rows = [];
+  for (const s of states) {
+    const nm = s.label || s.email;
+    const aktif = ((acctSession(s.email) || {}).wallet || {}).kind || 'supanova';
+    if (s._balErr) { rows.push({ label: nm, wallet: paint('err', COLOR.red), pid: '', cc: paint('err', COLOR.red), usdcx: '', ceth: '', edelx: '' }); continue; }
+    if (s._balSupa) rows.push({ label: nm, wallet: paint('supa' + (aktif === 'supanova' ? '*' : ' '), aktif === 'supanova' ? COLOR.cyan : COLOR.gray), pid: paint(shortPid(s._pidSupa), COLOR.gray), ...cellsOf(s._balSupa) });
+    if (s._balWalley) rows.push({ label: s._balSupa ? '' : nm, wallet: paint('walley' + (aktif === 'walley' ? '*' : ' '), aktif === 'walley' ? COLOR.cyan : COLOR.gray), pid: paint(shortPid(s._pidWalley), COLOR.gray), ...cellsOf(s._balWalley) });
+  }
   const tot = { cc: { u: 0, l: 0 }, usdcx: { u: 0, l: 0 }, ceth: { u: 0, l: 0 }, edelx: { u: 0, l: 0 } };
   for (const s of states) {
     if (s._balErr) continue;
-    const cc = balanceOf(s, 'amulet'), ux = balanceOf(s, 'usdcx'), ce = balanceOf(s, 'ceth'), ed = balanceOf(s, 'edelx');
-    tot.cc.u += cc.unlocked; tot.cc.l += cc.locked; tot.usdcx.u += ux.unlocked; tot.usdcx.l += ux.locked; tot.ceth.u += ce.unlocked; tot.ceth.l += ce.locked; tot.edelx.u += ed.unlocked; tot.edelx.l += ed.locked;
+    for (const toks of [s._balSupa, s._balWalley]) {
+      if (!toks) continue;
+      const fake = { balances: toks };
+      const cc = balanceOf(fake, 'amulet'), ux = balanceOf(fake, 'usdcx'), ce = balanceOf(fake, 'ceth'), ed = balanceOf(fake, 'edelx');
+      tot.cc.u += cc.unlocked; tot.cc.l += cc.locked; tot.usdcx.u += ux.unlocked; tot.usdcx.l += ux.locked; tot.ceth.u += ce.unlocked; tot.ceth.l += ce.locked; tot.edelx.u += ed.unlocked; tot.edelx.l += ed.locked;
+    }
   }
-  const totalRow = { label: `TOTAL (${okCount}/${states.length})`, cc: _balCell({ unlocked: tot.cc.u, locked: tot.cc.l }, fmtCC), usdcx: _balCell({ unlocked: tot.usdcx.u, locked: tot.usdcx.l }, fmtUSDC), ceth: _balCell({ unlocked: tot.ceth.u, locked: tot.ceth.l }, fmtCeth), edelx: _balCell({ unlocked: tot.edelx.u, locked: tot.edelx.l }, fmtEdelx) };
-  const head = { label: 'AKUN', cc: 'CC', usdcx: 'USDCx', ceth: 'cETH', edelx: 'EDELx' };
+  const totalRow = { label: `TOTAL (${okCount}/${states.length})`, wallet: '', pid: '', cc: _balCell({ unlocked: tot.cc.u, locked: tot.cc.l }, fmtCC), usdcx: _balCell({ unlocked: tot.usdcx.u, locked: tot.usdcx.l }, fmtUSDC), ceth: _balCell({ unlocked: tot.ceth.u, locked: tot.ceth.l }, fmtCeth), edelx: _balCell({ unlocked: tot.edelx.u, locked: tot.edelx.l }, fmtEdelx) };
+  const head = { label: 'AKUN', wallet: 'WALLET', pid: 'PARTY', cc: 'CC', usdcx: 'USDCx', ceth: 'cETH', edelx: 'EDELx' };
   const all = [head, ...rows, totalRow];
   const wl = Math.max(...all.map(r => visLen(r.label)));
+  const ww = Math.max(...all.map(r => visLen(r.wallet || '')));
+  const wp = Math.max(...all.map(r => visLen(r.pid || '')));
   const wc = Math.max(...all.map(r => visLen(r.cc)));
   const wu = Math.max(...all.map(r => visLen(r.usdcx)));
   const we = Math.max(...all.map(r => visLen(r.ceth)));
   const wd = Math.max(...all.map(r => visLen(r.edelx)));
   const GAP = '  ';
   const mkRow = (r, style) => {
-    const body = pad(r.label, wl, 'right') + GAP + pad(r.cc, wc, 'left') + GAP + pad(r.usdcx, wu, 'left') + GAP + pad(r.ceth, we, 'left') + GAP + pad(r.edelx, wd, 'left');
+    const body = pad(r.label, wl, 'right') + GAP + pad(r.wallet || '', ww, 'right') + GAP + pad(r.pid || '', wp, 'right') + GAP + pad(r.cc, wc, 'left') + GAP + pad(r.usdcx, wu, 'left') + GAP + pad(r.ceth, we, 'left') + GAP + pad(r.edelx, wd, 'left');
     return row(style ? paint(body, style) : body);
   };
   const out = [line()];
@@ -6110,9 +6131,23 @@ async function runBalanceMonitor() {
       try {
         const proxy = pickProxy(s.privyEmail || s.email);
         const token = await ensurePrivyToken(s);
-        const bal = await balancesFor(s.email, token, proxy);
-        s.balances = (bal && bal.tokens) || [];
-        s._balErr = null;
+        // Ambil KEDUA wallet, jangan cuma yg aktif — kalau nggak, akun yg udah pindah
+        // ke Walley kelihatan nol padahal dananya masih di party Supanova.
+        const bs = await supaBalances(token, proxy).catch(() => null);
+        s._balSupa = (bs && bs.tokens) || null;
+        s._pidSupa = (acctSession(s.email) || {}).partyId || null;
+        s._balWalley = null; s._pidWalley = null;
+        const wsel = (acctSession(s.email) || {}).wallet;
+        if (wsel && wsel.partyId) {
+          const w = loadWalleyWallets().find(x => x.party_id === wsel.partyId || x.party_hint === wsel.partyHint);
+          if (w) {
+            s._pidWalley = w.party_id;
+            const bw = await new WalleyCantonClient({ wallet: w, proxy }).balances().catch(() => null);
+            s._balWalley = (bw && bw.tokens) || null;
+          }
+        }
+        s.balances = s._balSupa || [];
+        s._balErr = (!s._balSupa && !s._balWalley) ? 'gagal baca saldo' : null;
       } catch (e) { s._balErr = ((e && e.message) || String(e)).slice(0, 60); s.balances = s.balances || []; }
     });
     const okCount = states.filter(s => !s._balErr).length;
