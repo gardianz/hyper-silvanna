@@ -57,7 +57,9 @@
       }
     },
     "_help_feeTokens": "Token untuk membayar settlement fee swap RFQ. [] atau dikosongkan = CC (Amulet). [\"USDCx\"] = bayar pakai USDCx, jauh lebih murah kalau CC sedang mahal. Nama parameternya feeTokens (jamak, array) sesuai request UI. Fee non-Amulet dibayar lewat Utility transfer factory, bukan factory Amulet.",
-    "feeTokens": [],
+    "feeTokens": [
+      "USDCx"
+    ],
     "_help_hardMaxFeeCC": "PLAFON MUTLAK fee per swap (CC). Beda dari maxFeeCC: maxFeeCC itu gate 'tunggu sampai fee turun' yang SENGAJA dibypass di mode8 malam (trabas biar task kelar sebelum reset 07:00) dan opsi 7 (force dump) -> di situ batasnya jadi tanpa batas. hardMaxFeeCC berlaku di SEMUA jalur dan TIDAK bisa dibypass, jadi satu fee spike gak bisa ngebakar CC sebanyak apa pun. Fee normal 1.23 CC (RFQ) / 4.3 CC (terminal). 0 = matikan (gak disaranin).",
     "hardMaxFeeCC": 15,
     "feeSpikeWaitSec": 300,

@@ -121,7 +121,9 @@ async function walleyReq(method, path_, { body = null, token = null, proxy = nul
   if (body) headers['Content-Type'] = 'application/json';
   const r = await request(method, `${WALLEY_API}${path_}`, { headers, body: body ? JSON.stringify(body) : null, timeoutMs: REQ.timeoutMs, proxy });
   if (r.status === 401 || r.status === 403) { const e = new Error(`walley ${path_} ${r.status}`); e.unauthorized = true; throw e; }
-  if (r.status < 200 || r.status >= 300) throw new Error(`walley ${path_} status=${r.status} body=${(r.text || '').slice(0, 200)}`);
+  // Pesan DAML_FAILURE-nya panjang dan justru ekornya yg nerangin kontrak/choice mana
+  // yg nolak — jangan dipotong pendek.
+  if (r.status < 200 || r.status >= 300) throw new Error(`walley ${path_} status=${r.status} body=${(r.text || '').replace(/\s+/g, ' ').slice(0, 900)}`);
   return r.json != null ? r.json : (() => { try { return JSON.parse(r.text); } catch (_) { return null; } })();
 }
 
@@ -268,6 +270,153 @@ async function finishOnboard(sv, w, acct) {
   return false;
 }
 
+
+// ── Canton lewat Walley — antarmuka SAMA PERSIS dengan CantonClient ──────────
+// Supaya seluruh jalur swap gak perlu diubah, kelas ini niru metode yg dipakai
+// pemanggil: activeContracts / activeContractsByInterface / prepareTransaction /
+// submitPrepared / queryCompletion, plus balances().
+//
+// Bedanya di bawah kap:
+//   Supanova  POST /canton/api/prepare_transaction {commands:[{ExerciseCommand:…}],
+//             disclosedContracts:[…]}                       -> {hash}
+//             POST /canton/api/submit_prepared {hash,signature} -> {submissionId}
+//   Walley    POST /v1/transactions/prepare {commands:{act_as,command_id,
+//             commands:[{type:'Exercise',template_id:{package_id,module_name,
+//             entity_name},…}],disclosed_contracts:[…]}, fee_payer}
+//                                                          -> {transaction,token,fee_transaction?}
+//             POST /v1/transactions/submit-and-wait {party_id,transaction,token,…}
+//
+// Pemetaan bentuk command-nya BUKAN tebakan: dipakai apa adanya oleh walley-onboard
+// yang sudah terbukti bikin UserService on-chain.
+class WalleyCantonClient {
+  constructor({ wallet, timeoutMs = REQ.timeoutMs, proxy = null, tag = null } = {}) {
+    this.w = wallet; this.timeoutMs = timeoutMs; this.proxy = proxy; this.tag = tag;
+    this._prep = new Map();   // hash -> {transaction, fee_transaction, token}
+    this._done = new Map();   // submissionId -> hasil submit-and-wait
+  }
+  get partyId() { return this.w.party_id; }
+  get token() { return null; }   // pemanggil kadang baca ini; Walley pakai token sendiri
+
+  // "pkg:Module:Entity" -> {package_id, module_name, entity_name}
+  static splitTemplate(t) {
+    const [package_id, module_name, entity_name] = String(t).split(':');
+    return { package_id, module_name, entity_name };
+  }
+
+  _toWalley(body) {
+    const cmds = (body.commands || []).map((c) => {
+      if (c.ExerciseCommand) {
+        const e = c.ExerciseCommand;
+        return { type: 'Exercise', template_id: WalleyCantonClient.splitTemplate(e.templateId), contract_id: e.contractId, choice: e.choice, choice_argument: e.choiceArgument };
+      }
+      if (c.CreateCommand) {
+        const e = c.CreateCommand;
+        return { type: 'Create', template_id: WalleyCantonClient.splitTemplate(e.templateId), create_arguments: e.createArguments || e.createArgument };
+      }
+      throw new Error(`command Walley gak dikenal: ${Object.keys(c).join(',')}`);
+    });
+    return {
+      act_as: [this.w.party_id],
+      command_id: body.commandId || `bot-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
+      commands: cmds,
+      disclosed_contracts: (body.disclosedContracts || []).filter(d => d && d.contractId).map(d => ({
+        contract_id: d.contractId,
+        created_event_blob: d.createdEventBlob,
+        template_id: WalleyCantonClient.splitTemplate(d.templateId),
+        synchronizer_id: d.synchronizerId || SWAP.synchronizerId,
+      })),
+    };
+  }
+
+  async prepareTransaction(body) {
+    await waitTrafficGate(this.tag);
+    const token = await walleyToken(this.w, this.proxy);
+    let prep;
+    try {
+      prep = await walleyReq('POST', '/v1/transactions/prepare', { body: { commands: this._toWalley(body), fee_payer: this.w.party_id }, token, proxy: this.proxy });
+    } catch (e) {
+      logDebug('walley prepare REQUEST', this._toWalley(body));
+      logDebug('walley prepare ERROR', (e && e.message) || String(e));
+      throw e;
+    }
+    const tx = prep && prep.transaction;
+    if (!tx || !tx.prepared_transaction_hash) throw new Error(`walley prepare gak balikin transaksi: ${JSON.stringify(prep).slice(0, 220)}`);
+    this._prep.set(tx.prepared_transaction_hash, prep);
+    // Bentuk balasannya disamakan sama Supanova ({hash}) biar pemanggil gak berubah.
+    return { hash: tx.prepared_transaction_hash, costEstimation: prep.fee_amount != null ? { totalTrafficCostEstimation: prep.fee_amount } : undefined };
+  }
+
+  async submitPrepared({ hash /* signature diabaikan: Walley minta amplop utuh */ }) {
+    const prep = this._prep.get(hash);
+    if (!prep) throw new Error('walley submit: hasil prepare gak ketemu buat hash ini');
+    const token = await walleyToken(this.w, this.proxy);
+    const body = { party_id: this.w.party_id, transaction: walleySignPrepared(this.w, prep.transaction), token: prep.token };
+    if (prep.fee_transaction) body.fee_transaction = walleySignPrepared(this.w, prep.fee_transaction);
+    const res = await walleyReq('POST', '/v1/transactions/submit-and-wait', { body, token, proxy: this.proxy });
+    // submit-and-wait udah NUNGGU selesai, jadi submissionId cuma penanda lokal.
+    const id = (res && (res.submission_id || res.submissionId)) || `walley-${hash.slice(0, 16)}`;
+    this._done.set(id, res);
+    this._prep.delete(hash);
+    return { submissionId: id };
+  }
+
+  async queryCompletion(submissionId) {
+    // Gak ada polling: submit-and-wait udah blocking. Kalau balasannya nyimpen status
+    // gagal, teruskan apa adanya biar completionErr() bisa nandain.
+    const r = this._done.get(submissionId);
+    if (!r) return { status: 'completed' };
+    const st = String((r.status || r.state || '')).toLowerCase();
+    if (st.includes('fail') || st.includes('reject')) return { status: 'failed', message: r.message || JSON.stringify(r).slice(0, 200) };
+    return { status: 'completed', ...r };
+  }
+
+  async _acs(filter) {
+    const token = await walleyToken(this.w, this.proxy);
+    const end = await walleyReq('GET', '/v1/proxy/v2/state/ledger-end', { token, proxy: this.proxy });
+    const body = { filter: { filtersByParty: { [this.w.party_id]: { cumulative: [{ identifierFilter: filter }] } } }, verbose: false, activeAtOffset: (end && end.offset) || 0 };
+    const rows = await walleyReq('POST', '/v1/proxy/v2/state/active-contracts', { body, token, proxy: this.proxy });
+    const out = [];
+    for (const row of (Array.isArray(rows) ? rows : [])) {
+      const entry = (row && row.contractEntry) || row || {};
+      let created = entry.createdEvent || null;
+      if (!created) for (const k of Object.keys(entry)) { const v = entry[k]; if (v && v.createdEvent) { created = v.createdEvent; break; } }
+      if (!created || !created.contractId) continue;
+      out.push({
+        contractId: created.contractId, templateId: created.templateId,
+        createArgument: created.createArgument, createdEventBlob: created.createdEventBlob,
+        interfaceViews: created.interfaceViews,
+      });
+    }
+    return out;
+  }
+  async activeContracts(templateId) { return this._acs({ TemplateFilter: { value: { templateId, includeCreatedEventBlob: true } } }); }
+  async activeContractsByInterface(interfaceId) { return this._acs({ InterfaceFilter: { value: { interfaceId, includeInterfaceView: true } } }); }
+
+  /** Saldo dalam BENTUK YANG SAMA dengan /canton/api/balances Supanova. */
+  async balances() {
+    const rows = await this._acs({ InterfaceFilter: { value: { interfaceId: HOLDING_IFACE, includeInterfaceView: true } } });
+    const byId = new Map();
+    for (const c of rows) {
+      for (const v of (c.interfaceViews || [])) {
+        const val = (v && (v.viewValue || v.value)) || null;
+        if (!val || !val.instrumentId) continue;
+        const key = val.instrumentId.id;
+        if (!byId.has(key)) byId.set(key, { instrumentId: { admin: val.instrumentId.admin, id: key }, unlockedUtxos: [], lockedUtxos: [] });
+        const slot = val.lock != null ? 'lockedUtxos' : 'unlockedUtxos';
+        byId.get(key)[slot].push({ contractId: c.contractId, amount: String(val.amount) });
+      }
+    }
+    // Field AGREGAT wajib ikut: unlockedOf()/balOf() baca totalUnlockedBalance dan
+    // totalBalance, BUKAN panjang array UTXO. Tanpa ini saldo kebaca 0 dan sizing
+    // swap jadi nol padahal ledgernya berisi.
+    const tokens = [...byId.values()].map(t => {
+      const sum = (arr) => arr.reduce((n, u) => n + (Number(u.amount) || 0), 0);
+      const un = sum(t.unlockedUtxos), lo = sum(t.lockedUtxos);
+      return { ...t, totalUnlockedBalance: String(un), totalBalance: String(un + lo) };
+    });
+    return { tokens };
+  }
+}
 
 // ── Persist action IDs (auto-fetch) ──────────────────────────────────────────
 // Simpan hasil discovery ke action_ids.json → rerun load dulu (gak scan bundle
@@ -1166,6 +1315,17 @@ async function supaMe(token, proxy) {
   const r = await request('GET', `${SUPA}/me`, { headers: supaHeaders(token), timeoutMs: REQ.timeoutMs, proxy });
   return { status: r.status, data: r.json };
 }
+// Saldo untuk SATU akun, sadar pilihan wallet-nya. Akun Walley saldonya di ledger
+// Walley, bukan di /canton/api/balances Supanova — tanpa ini dashboard nampilin
+// angka party Supanova padahal bot-nya nge-swap di party Walley.
+async function balancesFor(email, token, proxy) {
+  const wsel = (acctSession(email) || {}).wallet;
+  if (wsel && wsel.kind === 'walley') {
+    const w = loadWalleyWallets().find(x => x.party_id === wsel.partyId || x.party_hint === wsel.partyHint);
+    if (w) return new WalleyCantonClient({ wallet: w, proxy }).balances();
+  }
+  return supaBalances(token, proxy);
+}
 async function supaBalances(token, proxy) {
   const r = await request('GET', `${SUPA}/balances`, { headers: supaHeaders(token), timeoutMs: REQ.timeoutMs, proxy });
   if (r.status === 401) { const e = new Error('balances 401'); e.unauthorized = true; throw e; }
@@ -1299,6 +1459,8 @@ class CantonClient {
     if (r.status >= 400 && r.status !== 304) throw new Error(`query_completion status=${r.status}`);
     return r.json;
   }
+  /** Saldo — disamakan antarmukanya dengan WalleyCantonClient.balances(). */
+  async balances() { return supaBalances(this.token, this.proxy); }
 }
 function toScaled(s) { const [i, f = ''] = String(s).split('.'); const frac = (f + '0'.repeat(10)).slice(0, 10); const neg = i.startsWith('-'); const ii = neg ? i.slice(1) : i; const v = BigInt((ii || '0') + frac); return neg ? -v : v; }
 function fromScaled(v) { const neg = v < 0n; let a = neg ? -v : v; const s = a.toString().padStart(11, '0'); return (neg ? '-' : '') + s.slice(0, -10) + '.' + s.slice(-10); }
@@ -2391,7 +2553,7 @@ async function swapOnce(ctx, direction, quantityCC) {
     // token yg KITA SERAHKAN (SWAP.tokenId di-set per-arah oleh engine ping-pong). Tanpa ini
     // LP gak majuin proposal (sama kayak cETH-buy tanpa CC meta → poll dvpProposalCid timeout).
     try {
-      const bal = await supaBalances(ctx.identityToken || canton.token, ctx.proxy || null);
+      const bal = await canton.balances();
       const toks = (bal && bal.tokens) || [];
       const holdings = {}, totals = {};
       const add = (tk, key) => {
@@ -2405,7 +2567,7 @@ async function swapOnce(ctx, direction, quantityCC) {
     } catch (_) { }
   } else if (direction === SWAP.dirOpen) {
     try {
-      const bal = await supaBalances(ctx.identityToken || canton.token, ctx.proxy || null);
+      const bal = await canton.balances();
       const ccTok = ((bal && bal.tokens) || []).find(t => String((t.instrumentId && t.instrumentId.id) || '').toUpperCase() === 'AMULET');
       const ccUtxos = (ccTok && ccTok.unlockedUtxos || [])
         .map(u => ({ cid: u.contractId, amount: fmt10(String(u.amount)) }))
@@ -2563,7 +2725,7 @@ async function swapOnce(ctx, direction, quantityCC) {
     // Kita SERAHKAN token (USDCx-buy / cETH-sell) — fetch holdings token + cek saldo.
     // admin token diambil dari ourLeg.instrument (dvp terms) → benar utk pair manapun.
     const tokenLabel = legTokenLabel, tokenId = legTokenId, tokenAdmin = (ourLeg.instrument && ourLeg.instrument.admin) || legTokenAdmin;
-    const bal = await supaBalances(ctx.identityToken || canton.token, ctx.proxy || null);
+    const bal = await canton.balances();
     const tokenTok = ((bal && bal.tokens) || []).find(t => String((t.instrumentId && t.instrumentId.id) || '').toUpperCase() === tokenId);
     const tokenHoldings = (tokenTok && tokenTok.unlockedUtxos || []).map(u => u.contractId).filter(Boolean);
     if (!tokenHoldings.length) throw new Error(`tidak ada ${tokenLabel} holding untuk swap`);
@@ -3081,12 +3243,13 @@ async function swapOnceAtomic(ctx, side, baseQty) {
   // fee gate SEBELUM bikin transaksi apa pun
   const feeCC = Number((q.lpFees && q.lpFees[0] && q.lpFees[0].amount) || 0);
   if (Number.isFinite(feeCC) && feeCC > 0) {
-    log(`Fee RFQ: ${feeCC} CC (batas ${feeCap})`);
+    const feeUnit = (fee0 && fee0.instrumentId) ? (String(fee0.instrumentId).toUpperCase() === 'AMULET' ? 'CC' : fee0.instrumentId) : 'CC';
+    log(`Fee RFQ: ${feeCC} ${feeUnit} (batas ${feeCap})`);
     if (feeCC > feeCap) { const e = new Error(`fee ${feeCC} CC > batas ${feeCap} CC`); e.feeSpike = true; e.feeCC = feeCC; throw e; }
   }
 
   // 3. Holding kita + CC utk fee.
-  const bal = await supaBalances(identityToken || (canton && canton.token), proxy);
+  const bal = await canton.balances();
   const toks = (bal && bal.tokens) || [];
   const holdOf = (id) => { const t = toks.find(x => String((x.instrumentId && x.instrumentId.id) || '').toUpperCase() === String(id).toUpperCase()); return ((t && t.unlockedUtxos) || []).map(u => u.contractId).filter(Boolean); };
   const sendId = weSendBase ? baseId : quoteId2;
@@ -3115,7 +3278,7 @@ async function swapOnceAtomic(ctx, side, baseQty) {
 
   // 5. Konteks fee — factoryCid utk `fees`. Instrumennya ikut quote (lihat feeTokens).
   const fee0 = (q.lpFees && q.lpFees[0]) || null;
-  let feeFactoryCid = null, feeDisclosed = [], feeExtraArgs = null;
+  let feeFactoryCid = null, feeDisclosed = [], feeExtraArgs = null, feeHoldCids = [];
   if (fee0) {
     // Factory mana yg dipakai TERGANTUNG instrument fee-nya:
     //   Amulet (CC)  → getTransferFactoryContextAction (SWAP.actionIds.prepareTransfer)
@@ -3127,6 +3290,7 @@ async function swapOnceAtomic(ctx, side, baseQty) {
     const feeAction = feeIsAmulet ? SWAP.actionIds.prepareTransfer : SWAP.actionIds.utilityTransferFactory;
     // Holding buat bayar fee: CC kalau Amulet, holding instrument fee-nya kalau bukan.
     const feeHold = feeIsAmulet ? ccHoldings.slice(0, 8) : holdOf(fee0.instrumentId).slice(0, 8);
+    feeHoldCids = feeHold;
     if (!feeHold.length) { const e = new Error(`gak ada holding ${fee0.instrumentId} buat bayar fee`); e.insufficientFunds = true; throw e; }
     const now = new Date();
     const fcRaw = await sv.swapAction(feeAction, [{
@@ -3186,7 +3350,9 @@ async function swapOnceAtomic(ctx, side, baseQty) {
           // GABUNGAN holding token yg kita kirim + UTXO CC buat fee. Daml-nya ngambil
           // fee dari "pool" yg sama; kalau CC gak ikut → "no pool holdings for fee
           // instrument". Di capture UI userInputHoldingCids memang campuran keduanya.
-          userInputHoldingCids: [...userHoldings.slice(0, 8), ...ccHoldings.slice(0, 4)],
+          // Holding INSTRUMENT FEE wajib ikut, bukan cuma CC. Waktu fee dibayar USDCx
+          // dan yg dikirim tetap CC, ledger nolak: "no pool holdings for fee instrument".
+          userInputHoldingCids: [...userHoldings.slice(0, 8), ...(feeHoldCids.length ? feeHoldCids.slice(0, 4) : ccHoldings.slice(0, 4))],
           baseTransferFactoryCid: facOf(baseCtx.ctx), quoteTransferFactoryCid: facOf(quoteCtx.ctx),
           baseTransferArgs: baseArgs, baseAcceptArgs: baseArgs,      // identik (verified)
           quoteTransferArgs: quoteArgs, quoteAcceptArgs: quoteArgs,
@@ -3196,7 +3362,7 @@ async function swapOnceAtomic(ctx, side, baseQty) {
     }],
     disclosedContracts: disclosed,
   };
-  log(`AtomicDVP_Settle: ${disclosed.length} disclosed · fee ${feeCC} CC`);
+  log(`AtomicDVP_Settle: ${disclosed.length} disclosed · fee ${feeCC} ${(fee0 && fee0.instrumentId && String(fee0.instrumentId).toUpperCase() !== 'AMULET') ? fee0.instrumentId : 'CC'}`);
 
   // 7. prepare → sign → submit.
   const prep = await canton.prepareTransaction(body);
@@ -3242,7 +3408,7 @@ async function settleTerminalProposal(ctx, proposal, consumedSet) {
   //    holdingsByToken {CC,token}) → LP/orderbook majuin proposal → dvpProposalCid.
   const meta = { accept: true, source: 'order_match' };
   try {
-    const bal = await supaBalances(ctx.identityToken || canton.token, ctx.proxy || null);
+    const bal = await canton.balances();
     const toks = (bal && bal.tokens) || [];
     const holdings = {}, totals = {};
     const add = (tk, key) => { const utxos = (tk && tk.unlockedUtxos || []).map(u => ({ cid: u.contractId, amount: fmt10(String(u.amount)) })).filter(x => x.cid); if (utxos.length) { holdings[key] = utxos; totals[key] = utxos.reduce((s, u) => s + Number(u.amount), 0); } };
@@ -3354,7 +3520,7 @@ async function settleTerminalProposal(ctx, proposal, consumedSet) {
   let allocate;
   if (!weProvideCC) {
     const tokenAdmin = (ourLeg.instrument && ourLeg.instrument.admin) || legTokenAdmin;
-    const bal = await supaBalances(ctx.identityToken || canton.token, ctx.proxy || null);
+    const bal = await canton.balances();
     const tokenTok = ((bal && bal.tokens) || []).find(t => String((t.instrumentId && t.instrumentId.id) || '').toUpperCase() === String(legTokenId).toUpperCase());
     const tokenHoldings = (tokenTok && tokenTok.unlockedUtxos || []).map(u => u.contractId).filter(Boolean);
     if (!tokenHoldings.length) throw new Error(`tidak ada ${legTokenLabel} holding`);
@@ -3892,7 +4058,7 @@ async function tickAccount(state) {
     const proxy = pickProxy(state.privyEmail || state.email);
     const token = await ensurePrivyToken(state);
     state.status = 'fetching'; render(global.__states);
-    try { const bal = await supaBalances(token, proxy); state.balances = (bal && bal.tokens) || []; } catch (_) { }
+    try { const bal = await balancesFor(state.email, token, proxy); state.balances = (bal && bal.tokens) || []; } catch (_) { }
     const sv = await ensureSilvanaSession(state).catch(() => null);
     if (sv) {
       const me = await supaMe(token, proxy).catch(() => null);
@@ -4115,8 +4281,29 @@ async function buildSwapClients(state) {
   // refresh/expired mid-sesi, string statis bikin canton 401 → active_contracts
   // []→ "DvpProposal lookup failed activeCount:0" walau /swap (pakai sv.bearer
   // live) masih jalan. Samain sumber token dgn sv.bearer.
-  const canton = new CantonClient({ token: () => { try { return acctSession(email).privy.token || identityToken; } catch (_) { return identityToken; } }, timeoutMs: REQ.timeoutMs, proxy, tag: state.label || email });
-  return { sv, privy, canton, partyId, identityToken, proxy };
+  const cantonSupa = new CantonClient({ token: () => { try { return acctSession(email).privy.token || identityToken; } catch (_) { return identityToken; } }, timeoutMs: REQ.timeoutMs, proxy, tag: state.label || email });
+
+  // Pilihan wallet per akun (session.json[email].wallet). Default Supanova supaya
+  // akun lama gak berubah perilaku sama sekali. Kalau 'walley', SEMUA operasi Canton
+  // (prepare/submit/ACS/saldo) pindah ke API Walley dan tanda tangan jadi LOKAL
+  // pakai seed — Privy TEE gak dipakai sama sekali.
+  const wsel = acctSession(email).wallet || null;
+  if (wsel && wsel.kind === 'walley') {
+    const w = loadWalleyWallets().find(x => x.party_id === wsel.partyId || x.party_hint === wsel.partyHint);
+    if (!w) throw new Error(`wallet Walley '${wsel.partyHint || wsel.partyId}' gak ketemu di ${WALLEY_WALLETS_PATH}`);
+    const canton = new WalleyCantonClient({ wallet: w, timeoutMs: REQ.timeoutMs, proxy, tag: state.label || email });
+    // Shim penanda tangan: bentuknya niru PrivyWallet supaya jalur swap gak berubah.
+    // rawSign gak kepake buat Walley (amplopnya ditandatangani di submitPrepared),
+    // tapi tetap disediain karena beberapa jalur manggilnya.
+    const signer = {
+      wallet: null, walletCandidates: [],
+      async authenticate() { return true; },
+      async rawSign(hashHex) { const { key } = walleyKeyFromSeed(w.seed_hex); return crypto.sign(null, Buffer.from(String(hashHex).replace(/^0x/, ''), 'hex'), key).toString('hex'); },
+      nextWallet() { return null; },
+    };
+    return { sv, privy: signer, canton, partyId: w.party_id, identityToken, proxy, walletKind: 'walley', walley: w };
+  }
+  return { sv, privy, canton: cantonSupa, partyId, identityToken, proxy, walletKind: 'supanova' };
 }
 
 /**
@@ -4242,7 +4429,7 @@ async function transferToken({ idx, tokenArg, amountArg, toArg, go = false, out 
   const idTok = state.identityToken || canton.token;
   const proxy = getProxy(a.email);
 
-  const bal = await supaBalances(idTok, proxy);
+  const bal = await balancesFor(state.email, idTok, proxy);
   const tok = ((bal && bal.tokens) || []).find(t => String((t.instrumentId && t.instrumentId.id) || '').toUpperCase() === wantId.toUpperCase());
   if (!tok) bad(`instrument '${tokenRaw}' gak ada di balances. Lihat: node index.js balance ${idx}`);
   const instrumentId = tok.instrumentId.id, instrumentAdmin = tok.instrumentId.admin;
@@ -4624,7 +4811,7 @@ async function drainStaleDvpProposals(sv, canton, privy, partyId, log = () => { 
 // (USDCx / cETH) unlocked. tokenId dari SWAP.tokenId (di-set per pair aktif).
 async function refreshBalances(state, token, proxy) {
   try {
-    const b = await supaBalances(token, proxy);
+    const b = await balancesFor(state.email, token, proxy);
     if (b && b.tokens) state.balances = b.tokens;
     const t = (b && b.tokens || []).find(x => String((x.instrumentId && x.instrumentId.id) || '').toUpperCase() === SWAP.tokenId);
     return t ? Number(t.totalUnlockedBalance || t.totalBalance || 0) : 0;
@@ -5840,7 +6027,7 @@ async function runBalanceMonitor() {
       try {
         const proxy = pickProxy(s.privyEmail || s.email);
         const token = await ensurePrivyToken(s);
-        const bal = await supaBalances(token, proxy);
+        const bal = await balancesFor(s.email, token, proxy);
         s.balances = (bal && bal.tokens) || [];
         s._balErr = null;
       } catch (e) { s._balErr = ((e && e.message) || String(e)).slice(0, 60); s.balances = s.balances || []; }
@@ -6195,7 +6382,7 @@ Usage:
           const idTok = await ensurePrivyToken(state);
           // supaMe balik {status, data} — partyId-nya di .data, bukan di level atas.
           partyId = ((await supaMe(idTok, getProxy(a.email))).data || {}).partyId || '?';
-          bal = await supaBalances(idTok, getProxy(a.email));
+          bal = await balancesFor(a.email, idTok, getProxy(a.email));
         } catch (e) {
           process.stdout.write(paint(`▎ ${a.label || a.email} — GAGAL: ${(e && e.message) || e}\n`, COLOR.red));
           continue;
@@ -7253,6 +7440,83 @@ Usage:
       process.stdout.write(paint('  w) wallet Walley  — tautkan wallet Walley ke akun Silvana (dukung Supanova + Walley)', COLOR.gray) + '\n');
       const ans = (await prompt(paint('pilih [0/1/2/3/4/5/6/7/8/8r/9/t/w]: ', COLOR.bold))).trim().toLowerCase();
       if (ans === 'w') {
+        const sub = await pickList({
+          title: 'Wallet — mau ngapain?',
+          items: [
+            { label: 'Pilih wallet aktif', detail: paint('tentuin akun mana pakai Supanova / Walley buat swap', COLOR.gray) },
+            { label: 'Token fee swap   ', detail: paint('bayar settlement fee pakai CC atau USDCx', COLOR.gray) },
+            { label: 'Tautkan Walley   ', detail: paint('hubungin wallet Walley ke akun Silvana (sekali per akun)', COLOR.gray) },
+          ],
+        });
+        if (!sub.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); process.exit(0); }
+
+        if (sub[0] === 0) {
+          // Pilih wallet aktif per akun. Yg nentuin party mana dipakai bot itu
+          // session.json[email].wallet — bukan daftar wallet di Silvana (di sana
+          // dua-duanya nempel bareng).
+          const ws = loadWalleyWallets();
+          const items = ACCOUNTS.map((a, i) => {
+            const sess = acctSession(a.email) || {};
+            const cur = (sess.wallet && sess.wallet.kind) || 'supanova';
+            const walleyPunya = ws.find(x => x.party_id === (sess.wallet || {}).partyId);
+            const detail = paint(`aktif: ${cur}`, cur === 'walley' ? COLOR.cyan : COLOR.gray)
+              + (walleyPunya ? paint(`  (${walleyPunya.party_hint})`, COLOR.gray) : '');
+            return { label: (a.label || a.email).padEnd(20), detail };
+          });
+          const pilih = await pickList({ title: 'Pilih akun yg mau diubah wallet aktifnya:', items, multi: true });
+          if (!pilih.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); process.exit(0); }
+          const kind = await pickList({
+            title: 'Pakai wallet mana buat swap?',
+            items: [
+              { label: 'Supanova', detail: paint('party supa1::… , tanda tangan lewat Privy TEE (default)', COLOR.gray) },
+              { label: 'Walley  ', detail: paint('party walley-… , tanda tangan lokal dari seed', COLOR.gray) },
+            ],
+          });
+          if (!kind.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); process.exit(0); }
+
+          for (const i of pilih) {
+            const a = ACCOUNTS[i];
+            if (kind[0] === 0) { patchAcctSession(a.email, { wallet: null }); process.stdout.write(paint(`  ${a.label || a.email} → Supanova`, COLOR.green) + '\n'); continue; }
+            // Walley: ambil party yg udah ke-link di akun ini.
+            let sv2; try { ({ sv: sv2 } = await buildSwapClients(makeStates()[i])); } catch (e) { process.stdout.write(paint(`  ${a.label || a.email} → GAGAL: ${e.message}`, COLOR.red) + '\n'); continue; }
+            const linked = await sv2.listWallets().catch(() => []);
+            const cand = ws.filter(x => linked.some(l => l.partyId === x.party_id));
+            if (!cand.length) { process.stdout.write(paint(`  ${a.label || a.email} → gak ada wallet Walley ter-link. Pakai menu "Tautkan Walley" dulu.`, COLOR.yellow) + '\n'); continue; }
+            let w = cand[0];
+            if (cand.length > 1) {
+              const pk = await pickList({ title: `Wallet Walley buat ${a.label || a.email}:`, items: cand.map(x => ({ label: x.party_hint, detail: paint(String(x.party_id).slice(0, 30) + '…', COLOR.gray) })) });
+              if (!pk.length) continue;
+              w = cand[pk[0]];
+            }
+            patchAcctSession(a.email, { wallet: { kind: 'walley', partyId: w.party_id, partyHint: w.party_hint } });
+            process.stdout.write(paint(`  ${a.label || a.email} → Walley (${w.party_hint})`, COLOR.green) + '\n');
+          }
+          process.stdout.write(paint('\nTersimpan di session.json. Swap berikutnya pakai wallet ini.\n', COLOR.cyan));
+          process.exit(0);
+        }
+
+        if (sub[0] === 1) {
+          // Token fee. Ditulis ke config.json biar kepakai juga pas headless/pm2.
+          const now = Array.isArray((CONFIG.swap || {}).feeTokens) ? CONFIG.swap.feeTokens : [];
+          const pk = await pickList({
+            title: `Token buat bayar settlement fee (sekarang: ${now.length ? now.join(',') : 'CC'}):`,
+            items: [
+              { label: 'CC (Amulet)', detail: paint('default — fee dibayar dari saldo CC', COLOR.gray) },
+              { label: 'USDCx      ', detail: paint('fee dibayar USDCx, CC gak kepotong', COLOR.gray) },
+            ],
+          });
+          if (!pk.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); process.exit(0); }
+          const val = pk[0] === 0 ? [] : ['USDCx'];
+          try {
+            const raw = JSON.parse(fs.readFileSync(CFG_PATH, 'utf8'));
+            raw.swap = raw.swap || {}; raw.swap.feeTokens = val;
+            fs.writeFileSync(CFG_PATH, JSON.stringify(raw, null, 2) + '\n');
+            SWAP.feeTokens = val;
+            process.stdout.write(paint(`\n✓ feeTokens = ${JSON.stringify(val)} (tersimpan di config.json)\n`, COLOR.green));
+          } catch (e) { console.error(paint('gagal nulis config.json: ' + e.message, COLOR.red)); process.exit(1); }
+          process.exit(0);
+        }
+
         // Tautkan wallet Walley ke akun Silvana. Silvana nyimpen BANYAK wallet per akun
         // (kartu "Connected Wallets"), jadi Supanova lama TETAP nempel — ini nambah,
         // bukan ngeganti. Yang nentuin party mana yg dipakai bot itu session.json.
@@ -7338,7 +7602,7 @@ Usage:
         await mapLimit(ACCOUNTS.map((_, i) => i), 5, async (i) => {
           try {
             const tk = await ensurePrivyToken(states[i]);
-            const b = await supaBalances(tk, getProxy(ACCOUNTS[i].email));
+            const b = await balancesFor(ACCOUNTS[i].email, tk, getProxy(ACCOUNTS[i].email));
             const m = {};
             for (const t of (b && b.tokens) || []) {
               m[t.instrumentId.id] = (t.unlockedUtxos || []).reduce((x, u) => x + (Number(u.amount) || 0), 0);
