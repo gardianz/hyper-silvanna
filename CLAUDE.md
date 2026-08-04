@@ -25,7 +25,7 @@ node index.js paste           # resume `register` if the paste step was interrup
 node index.js wallets         # list Privy wallets per account, flag which matches partyId
 node index.js pin <walletId>  # pin a privyWalletId into session.json
 node index.js balance [idx|all]                        # read-only: every instrument, unlocked/locked/UTXO count
-node index.js transfer <idx> CC <amt> <dest> [go]      # send CC; omit `go` for a dry run
+node index.js transfer <idx> <token> <amt|max> <dest> [go]   # any instrument; omit `go` for a dry run
 node index.js help            # full subcommand list
 ```
 
@@ -160,43 +160,37 @@ Both fee gates before `acceptQuote` exist so a fee spike aborts **without** leav
 Supanova rejects `limit`/`pageSize` on `active_contracts` (returns empty) and caps results at
 200 — hence the periodic proposal draining rather than pagination.
 
-### Standalone transfers are CC-only, and that is a protocol limit not an omission
+### Transfers go through the Supanova **wallet** API, not Silvana
 
-Silvana has no wallet UI at all (`/wallet` and `/portfolio` are 404) and the bundle exposes no
-send/withdraw server action — only the fee-transfer helpers. Supanova has no transfer endpoint
-either (`/canton/api/transfer*`, `/send`, `/transfer_offer*` all 404 on both GET and POST). So a
-transfer has to be assembled as a raw Canton command, the same way the swap fee payment already is.
+Silvana is the trading platform and has no wallet at all (`/wallet` and `/portfolio` are 404, and
+the bundle exposes no send action). The wallet is a separate product at `app.supanova.app`, and its
+transfer endpoints sit **outside** `/canton/api/` — which is why probing `/canton/api/transfer*`
+returns 404 and led an earlier attempt to conclude, wrongly, that transfers were impossible:
 
-**It does not work yet, for any token.** `transfer` is wired end to end and fails at
-`prepare_transaction`, so nothing is ever signed or submitted and a failed attempt costs 0 CC.
-Three distinct walls were found live, in order:
+```
+POST /canton/transfers/prepare_transfer   {receiverPartyId, amount, instrumentId, instrumentAdmin?, memo?} -> {hash}
+GET  /canton/transfers/calculate_transfer_fee?partyId=&instrumentId=&instrumentAdmin=
+GET  /canton/transfers/pending_incoming_transfers
+POST /canton/transfers/prepare_response_to_incoming_transfer
+POST /canton/transfers/prepare_withdraw_transfer
+```
 
-1. Passing every unlocked Amulet UTXO as `inputHoldingCids` leaves the server's fee service with
-   nothing: `Not enough balance for batch transfer: need 17.32, have 0.0000000000 across 0 UTXOs`.
-   Fixed — `transferCC` now picks the smallest set of UTXOs covering the amount and refuses to
-   proceed unless at least one UTXO is left over for the fee.
-2. A bare `ExerciseCommand` on the transfer factory makes the server append its own fee command,
-   and Canton rejects that: `Preparing multiple commands is currently not supported`.
-3. Wrapping the transfer in `Execute_MultiCall` (one command, `Op_BatchTransfer` shaped exactly
-   like the `feeBatch` in `buildMultiCallAccept`) hits the same error, because our MultiCall does
-   not itself pay the fee — so the server still appends one. Paying it inside needs a fee context,
-   and `buildFeeTransferDataAction` returns `null` for every non-DvP `feeType` probed
-   (`transfer`, `traffic`, `batch_transfer`, `token_transfer`, `amulet_transfer`, `send`); it only
-   answers for `dvp_contract` with a real `proposalId`.
+`transferToken()` uses the first two: ask the fee, POST `prepare_transfer`, sign the returned hash
+with `privy.rawSign`, then `submit_prepared` + `queryCompletion` exactly like a swap. The server
+assembles the Daml command and pays the fee itself, so none of the MultiCall machinery is involved
+and **any** instrument works — CC, EDELx, cETH.
 
-So the missing piece is the fee context for a non-DvP transfer, and nothing reachable exposes it —
-consistent with Silvana having no transfer UI at all. Unblocking this needs a capture of a real
-transfer from a client that can do one; `app.supanova.app` is a different product (Cosmos/IOTA
-endpoints) and is not that client.
+Two things that cost real time to discover:
+- `calculate_transfer_fee` needs the `x-canton-node-id` header like every other Canton call, and its
+  fields are `supaFee` / `amuletTransferFee` — not `feeCC`/`fee`/`amount`.
+- The fee is a flat **16 CC per transfer**, identical for CC, EDELx and cETH. Verified live: sending
+  1 CC moved the balance 939.7347 → 922.7347. That is ~13× a swap's fee, so batching matters.
 
-It does **not** work for EDELx/cETH. Those live in the Utility registry, whose `extraArgs` requires
-a `transfer-rule` contract id (`utilArgs`), and the only source of that cid anywhere in this codebase
-is `env.utilityAcceptRefs[]` — a field of the RFQ accept envelope, which exists only mid-swap. Adding
-token transfers means capturing a real transfer from a UI that has one; do not guess the rule cid.
-
-`TRANSFER_FACTORY_IFACE` is no longer on the failing path (the command is a MultiCall now) and has
-never been validated; treat it as unverified if the code is ever reverted to a bare
-`TransferFactory_Transfer`.
+Do not rebuild this as a raw Canton command. That path was tried and is a dead end: a bare
+`ExerciseCommand` makes the server append its own fee command and Canton answers
+`Preparing multiple commands is currently not supported`, while wrapping it in `Execute_MultiCall`
+fails the same way because our MultiCall does not pay the fee, and `buildFeeTransferDataAction`
+returns `null` for every non-DvP `feeType`.
 
 ### Pairs and the `SWAP` global
 
