@@ -814,6 +814,26 @@ const MIN_ACTIVITY_LINES = 4;
 let selView = 0;
 // Flag parallel swap aktif (di-set di menu, cuma opsi 0/1 + config swap.parallel).
 let parallelSwapActive = false;
+// Batasi sesi ke sebagian akun (buat uji coba). null = semua akun.
+// Diisi lewat argumen `only=3` atau `only=0,2,5` di subcommand pingpong.
+let ONLY_ACCOUNTS = null;
+function applyOnlyArg(argv) {
+  for (const a of argv) {
+    const m = String(a).match(/^only=([\d,\-]+)$/i);
+    if (!m) continue;
+    const out = [];
+    for (const part of m[1].split(',').filter(Boolean)) {
+      const rg = part.match(/^(\d+)-(\d+)$/);
+      if (rg) { const lo = Number(rg[1]), hi = Number(rg[2]); for (let i = Math.min(lo, hi); i <= Math.max(lo, hi); i++) out.push(i); }
+      else if (/^\d+$/.test(part)) out.push(Number(part));
+    }
+    const uniq = [...new Set(out)].filter(i => ACCOUNTS[i]);
+    if (uniq.length) { ONLY_ACCOUNTS = uniq; return `only → ${uniq.length} akun: ${uniq.map(i => ACCOUNTS[i].label || ACCOUNTS[i].email).join(', ')}`; }
+  }
+  return null;
+}
+// Indeks akun yg ikut sesi (hormatin ONLY_ACCOUNTS).
+function sessionAccountIdxs() { return ONLY_ACCOUNTS ? ONLY_ACCOUNTS.slice() : ACCOUNTS.map((_, i) => i); }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 // Map paralel dgn batas konkurensi. Jaga urutan hasil = urutan input. Error per
@@ -3243,7 +3263,10 @@ async function swapOnceAtomic(ctx, side, baseQty) {
   // fee gate SEBELUM bikin transaksi apa pun
   const feeCC = Number((q.lpFees && q.lpFees[0] && q.lpFees[0].amount) || 0);
   if (Number.isFinite(feeCC) && feeCC > 0) {
-    const feeUnit = (fee0 && fee0.instrumentId) ? (String(fee0.instrumentId).toUpperCase() === 'AMULET' ? 'CC' : fee0.instrumentId) : 'CC';
+    // Instrumennya dibaca dari q.lpFees — fee0 baru dideklarasi jauh di bawah, jadi
+    // nyentuh dia di sini kena TDZ ("Cannot access 'fee0' before initialization").
+    const _fi = (q.lpFees && q.lpFees[0] && q.lpFees[0].instrumentId) || 'Amulet';
+    const feeUnit = String(_fi).toUpperCase() === 'AMULET' ? 'CC' : _fi;
     log(`Fee RFQ: ${feeCC} ${feeUnit} (batas ${feeCap})`);
     if (feeCC > feeCap) { const e = new Error(`fee ${feeCC} CC > batas ${feeCap} CC`); e.feeSpike = true; e.feeCC = feeCC; throw e; }
   }
@@ -5392,9 +5415,9 @@ async function runDayTraderSession(reason) {
   logActivity(`Mulai cek & auto-swap (${reason || 'manual'})${parallelSwapActive ? ` [parallel x${conc}]` : ''}`, COLOR.cyan);
   try {
     if (parallelSwapActive) {
-      await mapLimit(ACCOUNTS.map((_, i) => i), conc, (i) => withAccountDeadline(() => runAccountSwapSession(i), lbl(i)));
+      await mapLimit(sessionAccountIdxs(), conc, (i) => withAccountDeadline(() => runAccountSwapSession(i), lbl(i)));
     } else {
-      for (let i = 0; i < ACCOUNTS.length; i++) await withAccountDeadline(() => runAccountSwapSession(i), lbl(i));
+      for (const i of sessionAccountIdxs()) await withAccountDeadline(() => runAccountSwapSession(i), lbl(i));
     }
     logActivity('Sesi selesai — berhenti sampai jadwal berikutnya.', COLOR.cyan);
   } finally { dtSessionRunning = false; }
@@ -5717,7 +5740,7 @@ async function runEdelCethAccount(i) {
           const res = useRfq
             ? await swapOnceAtomic(swapCtx, direction, q)
             : await terminalSwapOnce(swapCtx, direction, q);
-          if (res && res.ok) { swaps++; bumpOvercap(); proxyFails = 0; hardErrs = 0; noLiqStreak = 0; trafficRelax(); lastDustEdelx = Number(res.dustEdelx) || 0; if (res.feeCC) { recordBurn(res.feeCC, tag); bumpDaily(state, res.feeCC, 0); } logActivity(`[${tag}] ✓ ping-pong #${swaps} sukses (fee ${res.feeCC != null ? res.feeCC + ' CC' : '?'})`, COLOR.green); outcome = 'ok'; }
+          if (res && res.ok) { swaps++; bumpOvercap(); proxyFails = 0; hardErrs = 0; noLiqStreak = 0; trafficRelax(); lastDustEdelx = Number(res.dustEdelx) || 0; if (res.feeCC) { recordBurn(res.feeCC, tag); bumpDaily(state, res.feeCC, 0); } logActivity(`[${tag}] ✓ ping-pong #${swaps} sukses (fee ${res.feeCC != null ? res.feeCC + ' ' + ((SWAP.feeTokens && SWAP.feeTokens[0]) || 'CC') : '?'})`, COLOR.green); outcome = 'ok'; }
           else { logActivity(`[${tag}] ping-pong gagal (no ok) — retry`, COLOR.yellow); await sleep(4000); outcome = 'retry'; }
           break;
         } catch (e) {
@@ -5906,8 +5929,9 @@ async function runEdelCethSession(reason) {
   const lbl = (i) => (ACCOUNTS[i] && (ACCOUNTS[i].label || ACCOUNTS[i].email)) || `akun ${i}`;
   logActivity(`Mulai ping-pong EDELx↔cETH (${reason || 'manual'})${parallelSwapActive ? ` [parallel x${conc}]` : ''}`, COLOR.cyan);
   try {
-    if (parallelSwapActive) await mapLimit(ACCOUNTS.map((_, i) => i), conc, (i) => withAccountDeadline(() => runEdelCethAccount(i), lbl(i)));
-    else for (let i = 0; i < ACCOUNTS.length; i++) await withAccountDeadline(() => runEdelCethAccount(i), lbl(i));
+    const idxs = sessionAccountIdxs();
+    if (parallelSwapActive) await mapLimit(idxs, conc, (i) => withAccountDeadline(() => runEdelCethAccount(i), lbl(i)));
+    else for (const i of idxs) await withAccountDeadline(() => runEdelCethAccount(i), lbl(i));
     logActivity('Sesi ping-pong selesai — berhenti sampai jadwal berikutnya.', COLOR.cyan);
   } finally { dtSessionRunning = false; }
 }
@@ -7019,6 +7043,8 @@ Usage:
     PINGPONG_ROUTE = (argv[0] === 'pingpong-rfq' || argv.includes('rfq')) ? 'rfq' : 'clob';
     const _oc = applyOvercapArg(argv);
     if (_oc) process.stdout.write(paint(_oc + '\n', COLOR.yellow));
+    const _on = applyOnlyArg(argv);
+    if (_on) process.stdout.write(paint(_on + '\n', COLOR.yellow));
     SESSION_ENGINE = 'pingpong';
     parallelSwapActive = SWAP.parallel;
     process.stdout.write('\n' + paint(`Engine: PING-PONG EDELx↔cETH [${PINGPONG_ROUTE === 'rfq' ? 'RFQ /swap' : 'CLOB /terminal'}] — SEMUA akun${parallelSwapActive ? ` · PARALLEL x${SWAP.concurrency}` : ''}`, COLOR.bold + COLOR.cyan) + '\n');
