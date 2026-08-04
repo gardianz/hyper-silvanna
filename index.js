@@ -6047,10 +6047,14 @@ function balanceOf(state, tokenId) {
 // ── Balance monitor (opsi 2): tabel + grand total, auto-refresh periodik ──────
 // Cell balance: unlocked (hijau) + "+locked" (abu) kalau ada. visLen strip ANSI →
 // pad align bener walau string udah diwarnai.
-function _balCell(b, fmtFn) {
+// Warna per token biar kolom gampang dibedain, dan angka NOL diredupkan supaya
+// yang berisi langsung kelihatan. Sebelumnya semua hijau — layar penuh angka
+// hijau yang sama bikin susah nyari mana yang beneran ada isinya.
+function _balCell(b, fmtFn, color) {
   if (!b) return paint('-', COLOR.gray);
-  const u = paint(fmtFn(b.unlocked), COLOR.green);
-  const l = b.locked > 1e-8 ? paint('+' + fmtFn(b.locked), COLOR.gray) : '';
+  const zero = !(Number(b.unlocked) > 1e-8);
+  const u = paint(fmtFn(b.unlocked), zero ? COLOR.gray : (color || COLOR.green));
+  const l = b.locked > 1e-8 ? paint('+' + fmtFn(b.locked), COLOR.yellow) : '';
   return u + l;
 }
 function renderBalanceTable(states, intervalMin, okCount, logBuf) {
@@ -6058,12 +6062,19 @@ function renderBalanceTable(states, intervalMin, okCount, logBuf) {
   // Satu baris per WALLET (supa + walley), bukan per akun — biar dana di kedua
   // party kelihatan sekaligus. Potongan partyId ikut biar gampang dicocokin waktu
   // nyiapin kiriman bulk.
-  const shortPid = (pid) => { if (!pid) return ''; const t = String(pid).split('::')[1] || String(pid); return t.slice(0, 10) + '…'; };
+  // Potongan lama ngambil 10 char PERTAMA fingerprint — semua party mulai "1220…"
+  // jadi kelihatan mirip semua dan gak ada gunanya. Sekarang: hint (yg emang beda
+  // tiap wallet, mis. walley-bebek) + ekor fingerprint biar tetap unik.
+  const shortPid = (pid) => {
+    if (!pid) return '';
+    const [hint, fp] = String(pid).split('::');
+    return `${String(hint || '?').slice(0, 16)}…${String(fp || '').slice(-6)}`;
+  };
   const cellsOf = (toks) => {
     const fake = { balances: toks || [] };
     return {
-      cc: _balCell(balanceOf(fake, 'amulet'), fmtCC), usdcx: _balCell(balanceOf(fake, 'usdcx'), fmtUSDC),
-      ceth: _balCell(balanceOf(fake, 'ceth'), fmtCeth), edelx: _balCell(balanceOf(fake, 'edelx'), fmtEdelx),
+      cc: _balCell(balanceOf(fake, 'amulet'), fmtCC, COLOR.mag), usdcx: _balCell(balanceOf(fake, 'usdcx'), fmtUSDC, COLOR.cyan),
+      ceth: _balCell(balanceOf(fake, 'ceth'), fmtCeth, COLOR.yellow), edelx: _balCell(balanceOf(fake, 'edelx'), fmtEdelx, COLOR.green),
     };
   };
   const rows = [];
@@ -6084,7 +6095,7 @@ function renderBalanceTable(states, intervalMin, okCount, logBuf) {
       tot.cc.u += cc.unlocked; tot.cc.l += cc.locked; tot.usdcx.u += ux.unlocked; tot.usdcx.l += ux.locked; tot.ceth.u += ce.unlocked; tot.ceth.l += ce.locked; tot.edelx.u += ed.unlocked; tot.edelx.l += ed.locked;
     }
   }
-  const totalRow = { label: `TOTAL (${okCount}/${states.length})`, wallet: '', pid: '', cc: _balCell({ unlocked: tot.cc.u, locked: tot.cc.l }, fmtCC), usdcx: _balCell({ unlocked: tot.usdcx.u, locked: tot.usdcx.l }, fmtUSDC), ceth: _balCell({ unlocked: tot.ceth.u, locked: tot.ceth.l }, fmtCeth), edelx: _balCell({ unlocked: tot.edelx.u, locked: tot.edelx.l }, fmtEdelx) };
+  const totalRow = { label: `TOTAL (${okCount}/${states.length})`, wallet: '', pid: '', cc: _balCell({ unlocked: tot.cc.u, locked: tot.cc.l }, fmtCC, COLOR.mag), usdcx: _balCell({ unlocked: tot.usdcx.u, locked: tot.usdcx.l }, fmtUSDC, COLOR.cyan), ceth: _balCell({ unlocked: tot.ceth.u, locked: tot.ceth.l }, fmtCeth, COLOR.yellow), edelx: _balCell({ unlocked: tot.edelx.u, locked: tot.edelx.l }, fmtEdelx, COLOR.green) };
   const head = { label: 'AKUN', wallet: 'WALLET', pid: 'PARTY', cc: 'CC', usdcx: 'USDCx', ceth: 'cETH', edelx: 'EDELx' };
   const all = [head, ...rows, totalRow];
   const wl = Math.max(...all.map(r => visLen(r.label)));
