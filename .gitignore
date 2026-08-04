@@ -20,3 +20,4 @@ action_ids.json
 node_modules/
 __MACOSX/
 tools/inspect-out.json
+walley_wallets.jsonl

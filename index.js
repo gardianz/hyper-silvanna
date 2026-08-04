@@ -44,7 +44,13 @@ const SESS_PATH = path.join(ROOT, 'session.json');
 const RAWKEYS_PATH = path.join(ROOT, 'raw_keys.json');
 // Wallet Walley (walley.cc) — alternatif Supanova. Filenya SENGAJA di luar repo
 // (defaultnya folder bot Walley) karena isinya mnemonic; jangan pernah disalin ke sini.
+// Urutan cari file wallet Walley:
+//   1. env WALLEY_WALLETS            (paling menang, buat path khusus)
+//   2. walley_wallets.jsonl di repo  (gitignored — tempat lokal kalau folder bot
+//                                     Walley gak ada / mau dipisah per deploy)
+//   3. ../../walley/wallets.jsonl    (default: output bot Walley)
 const WALLEY_WALLETS_PATH = process.env.WALLEY_WALLETS
+  || (fs.existsSync(path.join(ROOT, 'walley_wallets.jsonl')) ? path.join(ROOT, 'walley_wallets.jsonl') : null)
   || path.join(path.dirname(path.dirname(ROOT)), 'walley', 'wallets.jsonl');
 const WALLEY_API = 'https://api.walley.cc';
 // Interface Holding standar token Canton — dipakai buat baca saldo dari ledger API.
@@ -92,6 +98,23 @@ function loadRawKey(email) {
 const _walleyTok = new Map();   // partyId → {token, expMs}
 
 // seed 32 byte → private key Ed25519. PKCS8 buat Ed25519 = prefix tetap + seed.
+// Walley meng-encode seed 32 byte LANGSUNG di recovery phrase (bukan BIP39
+// PBKDF2) — lihat README bot Walley: "recovery phrase meng-encode seed itu secara
+// langsung". Jadi mnemonic -> entropy 32 byte = seed, bukan lewat seed derivation.
+function mnemonicToSeedHex(mnemonic) {
+  const words = String(mnemonic).trim().split(/\s+/);
+  const wl = fs.readFileSync(path.join(path.dirname(path.dirname(ROOT)), 'walley', 'bip39_english.txt'), 'utf8').trim().split('\n').map(x => x.trim());
+  let bits = '';
+  for (const w of words) {
+    const i = wl.indexOf(w);
+    if (i < 0) throw new Error(`kata '${w}' gak ada di wordlist BIP39`);
+    bits += i.toString(2).padStart(11, '0');
+  }
+  const entBits = Math.floor(bits.length / 33) * 32;
+  const buf = Buffer.alloc(entBits / 8);
+  for (let i = 0; i < buf.length; i++) buf[i] = parseInt(bits.slice(i * 8, i * 8 + 8), 2);
+  return buf.toString('hex');
+}
 function walleyKeyFromSeed(seedHex) {
   const seed = Buffer.from(String(seedHex).replace(/^0x/, ''), 'hex');
   if (seed.length !== 32) throw new Error(`seed harus 32 byte, dapat ${seed.length}`);
@@ -105,12 +128,20 @@ function walleyKeyFromSeed(seedHex) {
 function loadWalleyWallets() {
   let raw; try { raw = fs.readFileSync(WALLEY_WALLETS_PATH, 'utf8'); } catch (_) { return []; }
   const out = [];
+  const push = (w) => {
+    if (!w || !w.party_id) return;
+    // seed_hex ATAU mnemonic — kalau cuma mnemonic, seed diturunkan sekali di sini
+    // supaya sisa kode cukup pegang seed_hex.
+    if (!w.seed_hex && w.mnemonic) { try { w.seed_hex = mnemonicToSeedHex(w.mnemonic); } catch (_) { return; } }
+    if (w.seed_hex) out.push(w);
+  };
+  // Dukung DUA bentuk: JSONL (satu objek per baris, output bot Walley) dan JSON
+  // array biasa — biar gampang kalau kamu nyusun filenya manual.
+  const t = raw.trim();
+  if (t.startsWith('[')) { try { (JSON.parse(t) || []).forEach(push); return out; } catch (_) { } }
   for (const line of raw.split('\n')) {
-    const s = line.trim(); if (!s) continue;
-    try {
-      const w = JSON.parse(s);
-      if (w && w.party_id && (w.seed_hex || w.mnemonic)) out.push(w);
-    } catch (_) { }
+    const ln = line.trim(); if (!ln) continue;
+    try { push(JSON.parse(ln)); } catch (_) { }
   }
   return out;
 }
