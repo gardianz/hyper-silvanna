@@ -7478,21 +7478,31 @@ Usage:
   } else if (argv.length === 0) {
     if (!ACCOUNTS.length) { console.error(paint('accounts.json kosong. Jalankan: node index.js register', COLOR.red)); process.exit(1); }
     (async () => {
-      process.stdout.write('\n' + paint('SilvanaBot-Sipal', COLOR.bold + COLOR.cyan) + '\n');
-      process.stdout.write(paint('  0) swap CC→cETH   — dashboard + auto DAY_TRADER (pair cETH)', COLOR.gray) + '\n');
-      process.stdout.write(paint('  1) swap CC→USDCx  — dashboard + auto DAY_TRADER (pair USDCx)', COLOR.gray) + '\n');
-      process.stdout.write(paint('  2) check balance  — tabel CC/USDCx/cETH/EDELx + total, auto-refresh /1mnt', COLOR.gray) + '\n');
-      process.stdout.write(paint('  3) run (OTP urut) — login akun 1-per-1 (OTP gak tabrakan) lalu run USDCx', COLOR.gray) + '\n');
-      process.stdout.write(paint('  4) change wallet  — ganti wallet supa 1 akun (hapus lama → login email supa baru)', COLOR.gray) + '\n');
-      process.stdout.write(paint('  5) maintenance    — a) cleanup DvpProposal stale  b) reset season (fee + loss → 0)', COLOR.gray) + '\n');
-      process.stdout.write(paint('  6) swap back      — dump token (USDCx/cETH/EDELx) → CC, SEMUA akun', COLOR.gray) + '\n');
-      process.stdout.write(paint('  7) EDELx manual   — a) CC→EDELx (input CC, multi-akun parallel)  b) dump EDELx→CC (1 akun)', COLOR.gray) + '\n');
-      process.stdout.write(paint('  8) EDELx↔cETH     — ping-pong SEMUA akun via CLOB /terminal (orderbook, fee ~4.3 CC)', COLOR.gray) + '\n');
-      process.stdout.write(paint('  8r) EDELx↔cETH RFQ — ping-pong SEMUA akun via /swap AtomicDVP (fee ~1.25 CC, anti-CLOB-macet)', COLOR.gray) + '\n');
-      process.stdout.write(paint('  9) bulk back      — dump ke CC, SEMUA akun (pilih pair: USDCx/cETH/EDELx/semua)', COLOR.gray) + '\n');
-      process.stdout.write(paint('  t) transfer      — kirim token (CC/EDELx/cETH) ke akun sendiri / party luar', COLOR.gray) + '\n');
-      process.stdout.write(paint('  w) wallet Walley  — tautkan wallet Walley ke akun Silvana (dukung Supanova + Walley)', COLOR.gray) + '\n');
-      const ans = (await prompt(paint('pilih [0/1/2/3/4/5/6/7/8/8r/9/t/w]: ', COLOR.bold))).trim().toLowerCase();
+      for (;;) {
+      // Menu utama: picker panah, dan BALIK ke menu setelah aksi pendek selesai.
+      // Dulu tiap cabang manggil process.exit(0) jadi sekali milih langsung keluar.
+      const MENU = [
+        ['0', 'swap CC→cETH', 'dashboard + auto DAY_TRADER (pair cETH)'],
+        ['1', 'swap CC→USDCx', 'dashboard + auto DAY_TRADER (pair USDCx)'],
+        ['2', 'check balance', 'tabel CC/USDCx/cETH/EDELx + total, auto-refresh'],
+        ['3', 'run (OTP urut)', 'login akun 1-per-1 lalu run USDCx'],
+        ['4', 'change wallet', 'ganti wallet supa 1 akun'],
+        ['5', 'maintenance', 'cleanup DvpProposal stale / reset season'],
+        ['6', 'swap back', 'dump token (USDCx/cETH/EDELx) → CC, SEMUA akun'],
+        ['7', 'EDELx manual', 'CC→EDELx multi-akun / dump EDELx→CC 1 akun'],
+        ['8', 'ping-pong CLOB', 'mode 8 via /terminal (orderbook, fee ~4.3 CC)'],
+        ['8r', 'ping-pong RFQ', 'mode 8 via /swap AtomicDVP (fee murah, anti-macet)'],
+        ['9', 'bulk back', 'dump ke CC, SEMUA akun (pilih pair)'],
+        ['t', 'transfer', 'kirim token ke akun sendiri / party luar'],
+        ['w', 'wallet', 'pilih wallet aktif · token fee · tautkan Walley'],
+      ];
+      const mpk = await pickList({
+        title: 'SilvanaBot-Sipal',
+        items: MENU.map(([c, l, d]) => ({ label: `${c})`.padEnd(4) + l.padEnd(16), detail: paint(d, COLOR.gray) })),
+        hint: '↑/↓ pindah · Enter pilih · q keluar',
+      });
+      if (!mpk.length) { process.stdout.write(paint('bye 👋\n', COLOR.gray)); process.exit(0); }
+      const ans = MENU[mpk[0]][0];
       if (ans === 'w') {
         const sub = await pickList({
           title: 'Wallet — mau ngapain?',
@@ -7502,7 +7512,7 @@ Usage:
             { label: 'Tautkan Walley   ', detail: paint('hubungin wallet Walley ke akun Silvana (sekali per akun)', COLOR.gray) },
           ],
         });
-        if (!sub.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); process.exit(0); }
+        if (!sub.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
 
         if (sub[0] === 0) {
           // Pilih wallet aktif per akun. Yg nentuin party mana dipakai bot itu
@@ -7518,7 +7528,7 @@ Usage:
             return { label: (a.label || a.email).padEnd(20), detail };
           });
           const pilih = await pickList({ title: 'Pilih akun yg mau diubah wallet aktifnya:', items, multi: true });
-          if (!pilih.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); process.exit(0); }
+          if (!pilih.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
           const kind = await pickList({
             title: 'Pakai wallet mana buat swap?',
             items: [
@@ -7526,7 +7536,7 @@ Usage:
               { label: 'Walley  ', detail: paint('party walley-… , tanda tangan lokal dari seed', COLOR.gray) },
             ],
           });
-          if (!kind.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); process.exit(0); }
+          if (!kind.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
 
           for (const i of pilih) {
             const a = ACCOUNTS[i];
@@ -7546,7 +7556,7 @@ Usage:
             process.stdout.write(paint(`  ${a.label || a.email} → Walley (${w.party_hint})`, COLOR.green) + '\n');
           }
           process.stdout.write(paint('\nTersimpan di session.json. Swap berikutnya pakai wallet ini.\n', COLOR.cyan));
-          process.exit(0);
+          continue;
         }
 
         if (sub[0] === 1) {
@@ -7559,7 +7569,7 @@ Usage:
               { label: 'USDCx      ', detail: paint('fee dibayar USDCx, CC gak kepotong', COLOR.gray) },
             ],
           });
-          if (!pk.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); process.exit(0); }
+          if (!pk.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
           const val = pk[0] === 0 ? [] : ['USDCx'];
           try {
             const raw = JSON.parse(fs.readFileSync(CFG_PATH, 'utf8'));
@@ -7567,15 +7577,15 @@ Usage:
             fs.writeFileSync(CFG_PATH, JSON.stringify(raw, null, 2) + '\n');
             SWAP.feeTokens = val;
             process.stdout.write(paint(`\n✓ feeTokens = ${JSON.stringify(val)} (tersimpan di config.json)\n`, COLOR.green));
-          } catch (e) { console.error(paint('gagal nulis config.json: ' + e.message, COLOR.red)); process.exit(1); }
-          process.exit(0);
+          } catch (e) { console.error(paint('gagal nulis config.json: ' + e.message, COLOR.red)); continue; }
+          continue;
         }
 
         // Tautkan wallet Walley ke akun Silvana. Silvana nyimpen BANYAK wallet per akun
         // (kartu "Connected Wallets"), jadi Supanova lama TETAP nempel — ini nambah,
         // bukan ngeganti. Yang nentuin party mana yg dipakai bot itu session.json.
         const ws = loadWalleyWallets();
-        if (!ws.length) { console.error(paint(`wallets.jsonl gak kebaca di ${WALLEY_WALLETS_PATH}`, COLOR.red)); process.exit(1); }
+        if (!ws.length) { console.error(paint(`wallets.jsonl gak kebaca di ${WALLEY_WALLETS_PATH}`, COLOR.red)); continue; }
         process.stdout.write('\n' + paint('Baca wallet yg udah ke-link tiap akun…', COLOR.gray) + '\n');
         const states = makeStates();
         const linked = new Array(ACCOUNTS.length).fill(null);
@@ -7595,11 +7605,11 @@ Usage:
           return { label: (a.label || a.email).padEnd(20), detail, disabled: !!sudah, note: paint('[udah punya Walley]', COLOR.green) };
         });
         const pilih = await pickList({ title: 'Tautkan Walley — pilih akun (yg udah punya dilewati):', items, multi: true });
-        if (!pilih.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); process.exit(0); }
+        if (!pilih.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
 
         // Wallet Walley yg masih bebas.
         const bebas = ws.filter(w => !dipakai.has(w.party_id));
-        if (bebas.length < pilih.length) { console.error(paint(`wallet Walley bebas cuma ${bebas.length}, butuh ${pilih.length}`, COLOR.red)); process.exit(1); }
+        if (bebas.length < pilih.length) { console.error(paint(`wallet Walley bebas cuma ${bebas.length}, butuh ${pilih.length}`, COLOR.red)); continue; }
         const mode = await pickList({
           title: 'Cara memilih wallet Walley:',
           items: [
@@ -7607,7 +7617,7 @@ Usage:
             { label: 'Manual', detail: paint('pilih sendiri satu per satu', COLOR.gray) },
           ],
         });
-        if (!mode.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); process.exit(0); }
+        if (!mode.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
 
         const pasang = [];
         if (mode[0] === 0) {
@@ -7619,7 +7629,7 @@ Usage:
               title: `Wallet Walley buat ${ACCOUNTS[ai].label || ACCOUNTS[ai].email}:`,
               items: sisa.map(x => ({ label: String(x.party_hint || '-').padEnd(22), detail: paint(String(x.party_id).slice(0, 30) + '…', COLOR.gray) })),
             });
-            if (!w.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); process.exit(0); }
+            if (!w.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
             pasang.push([ai, sisa[w[0]]]);
             sisa.splice(w[0], 1);
           }
@@ -7630,7 +7640,7 @@ Usage:
         for (const [ai, w] of pasang) process.stdout.write(`  ${String(ACCOUNTS[ai].label || ACCOUNTS[ai].email).padEnd(22)} → ${w.party_hint}\n`);
         process.stdout.write(paint('─'.repeat(70), COLOR.yellow) + '\n');
         const conf = (await prompt(paint(`Ketik "link" buat lanjut, Enter buat batal: `, COLOR.bold + COLOR.yellow))).trim().toLowerCase();
-        if (conf !== 'link') { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); process.exit(0); }
+        if (conf !== 'link') { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
 
         let ok = 0, gagal = 0;
         for (const [ai, w] of pasang) {
@@ -7644,7 +7654,7 @@ Usage:
         }
         process.stdout.write('\n' + paint(`selesai — ${ok} tertaut, ${gagal} gagal`, gagal ? COLOR.yellow : COLOR.green) + '\n');
         if (ok) process.stdout.write(paint('Lanjutan: isi CC ke party Walley, lalu `node index.js walley-onboard <idx> <hint> go`\n', COLOR.cyan));
-        process.exit(gagal ? 1 : 0);
+        continue;
       }
       if (ans === 't') {
         // Transfer lewat menu, semuanya pakai picker panah (pickList) — gak ada ngetik
@@ -7673,7 +7683,7 @@ Usage:
           title: 'Transfer — pilih TOKEN:',
           items: TOKENS.map(t => ({ label: t.padEnd(6), detail: paint(`total ${totalOf(t).toFixed(6)}`, COLOR.gray) })),
         });
-        if (!tokPick.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); process.exit(0); }
+        if (!tokPick.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
         const token = TOKENS[tokPick[0]];
         const instId = idOf(token);
 
@@ -7696,7 +7706,7 @@ Usage:
           return { label: (a.label || a.email).padEnd(20), detail, disabled: dust, note: paint(`[dust ≤ ${dustMin} — dilewati]`, COLOR.yellow) };
         });
         const chosen = await pickList({ title: `Transfer ${token} — pilih akun PENGIRIM:`, items, multi: true });
-        if (!chosen.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); process.exit(0); }
+        if (!chosen.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
 
         // 3) Tujuan + jumlah.
         process.stdout.write(paint('tujuan: partyId lengkap (hint::sidikjari), atau #N / label akun sendiri', COLOR.gray) + '\n');
@@ -7713,14 +7723,14 @@ Usage:
           try { await transferToken({ idx: i, tokenArg: token, amountArg: amount, toArg: to, go: false }); okIdx.push(i); }
           catch (e) { process.stdout.write(paint(`  DILEWATI: ${(e && e.message) || e}`, COLOR.red) + '\n'); }
         }
-        if (!okIdx.length) { console.error(paint('\ngak ada akun yg lolos cek — batal.', COLOR.red)); process.exit(1); }
+        if (!okIdx.length) { console.error(paint('\ngak ada akun yg lolos cek — batal.', COLOR.red)); continue; }
         process.stdout.write('\n' + paint('─'.repeat(64), COLOR.yellow) + '\n');
         process.stdout.write(paint(`TAHAP 2/2 — KIRIM BENERAN (bukan dry-run lagi)`, COLOR.bold + COLOR.red) + '\n');
         process.stdout.write(paint(`  ${okIdx.length} akun · ${amount} ${token} per akun · tujuan ${to}`, COLOR.yellow) + '\n');
         process.stdout.write(paint(`  fee 16 CC per akun ≈ ${okIdx.length * 16} CC total`, COLOR.yellow) + '\n');
         process.stdout.write(paint('─'.repeat(64), COLOR.yellow) + '\n');
         const conf = (await prompt(paint(`Ketik ULANG jumlahnya ("${amount}") buat KIRIM, Enter buat batal: `, COLOR.bold + COLOR.yellow))).trim();
-        if (conf !== amount) { process.stdout.write(paint('dibatalin — gak ada yg dikirim.\n', COLOR.gray)); process.exit(0); }
+        if (conf !== amount) { process.stdout.write(paint('dibatalin — gak ada yg dikirim.\n', COLOR.gray)); continue; }
 
         let sukses = 0, gagal = 0;
         for (const i of okIdx) {
@@ -7728,7 +7738,7 @@ Usage:
           catch (e) { gagal++; process.stdout.write(paint(`  [${ACCOUNTS[i].label || ACCOUNTS[i].email}] GAGAL: ${(e && e.message) || e}`, COLOR.red) + '\n'); }
         }
         process.stdout.write('\n' + paint(`selesai — ${sukses} terkirim, ${gagal} gagal`, gagal ? COLOR.yellow : COLOR.green) + '\n');
-        process.exit(gagal ? 1 : 0);
+        continue;
       }
       if (ans === '2') {
         // Cek balance: tabel + grand total, AUTO-REFRESH tiap N menit (default 15,
@@ -8065,6 +8075,8 @@ Usage:
       parallelSwapActive = SWAP.parallel && (ans === '0' || ans === '1');
       process.stdout.write('\n' + paint(`Pair aktif: ${pair.market} (CC↔${pair.tokenLabel})${parallelSwapActive ? ` · PARALLEL x${SWAP.concurrency}` : ''}`, COLOR.bold + COLOR.cyan) + '\n');
       runMain().catch(e => { console.error(paint('FATAL: ' + (e && e.stack || e), COLOR.red)); process.exit(1); });
+      return;   // runMain ambil alih (dashboard + cron) — jangan balik ke menu
+      }
     })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
   } else {
     console.error(paint('cmd tidak dikenal: ' + argv[0] + '. Lihat: node index.js help', COLOR.red));
