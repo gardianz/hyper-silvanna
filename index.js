@@ -1723,6 +1723,31 @@ class SilvanaClient {
    * stabil: GET /api/parties/{partyId} → {success, party:{userServiceCid,...}}.
    * Auth cookie (jar). Tahan redeploy (gak ada hash next-action).
    */
+  /** Wallet yg ke-link di sisi Silvana (kartu "Connected Wallets" di /settings). */
+  async listWallets() {
+    const r = await request('GET', `${APP_BASE}/api/wallets`, this._opts({
+      headers: this._hdr({ 'Accept': '*/*', 'Referer': APP_BASE + '/settings', ...this._bearerHdr }),
+    }));
+    if (r.status !== 200) throw new Error(`wallets status=${r.status} body=${(r.text || '').slice(0, 160)}`);
+    let j = r.json; if (!j) { try { j = JSON.parse(r.text); } catch (_) { } }
+    return Array.isArray(j) ? j : [];
+  }
+
+  /**
+   * Tautkan party ke akun Silvana — jalur yg dipakai UI: POST /api/wallets {partyId}.
+   * UI NELAN hasilnya (`.catch(()=>{})`), jadi kalau server nolak halaman diam aja.
+   * Di sini errornya DIANGKAT supaya kelihatan (mis. 409 "already linked to another
+   * account"). Balikin {ok, status, body}.
+   */
+  async linkWallet(partyId) {
+    const r = await request('POST', `${APP_BASE}/api/wallets`, this._opts({
+      headers: this._hdr({ 'Accept': '*/*', 'Content-Type': 'application/json', 'Referer': APP_BASE + '/settings', ...this._bearerHdr }),
+      body: JSON.stringify({ partyId }),
+    }));
+    let j = r.json; if (!j) { try { j = JSON.parse(r.text); } catch (_) { } }
+    return { ok: r.status >= 200 && r.status < 300, status: r.status, body: j || (r.text || '').slice(0, 200) };
+  }
+
   async recoverParty(partyId) {
     if (!partyId) throw new Error('partyId required');
     const r = await request('GET', `${APP_BASE}/api/parties/${encodeURIComponent(partyId)}`, this._opts({
@@ -6242,13 +6267,28 @@ Usage:
       P(`  akun    : ${a.label || a.email}`);
       P(`  party   : ${w.party_id}`);
       P(`  CC      : ${holds.total} dari ${holds.cids.length} UTXO unlocked`);
-      if (!holds.cids.length) die('party Walley gak punya UTXO CC unlocked — isi CC dulu, fee onboarding dibayar dari situ');
 
       // MultiCall config diambil dari Silvana (butuh sesi akun ini).
       const state = makeStates()[idx];
       const { sv } = await buildSwapClients(state);
+
+      // Tautkan party ke akun Silvana kalau belum. Jalur UI: POST /api/wallets {partyId}.
+      // Idempotent: kalau udah ada di daftar, dilewati.
+      const linked = await sv.listWallets().catch(() => []);
+      if (linked.some(x => x.partyId === w.party_id)) {
+        P(`  wallet  : udah ke-link di Silvana (${(linked.find(x => x.partyId === w.party_id) || {}).name || '-'})`, COLOR.green);
+      } else if (!go) {
+        P(`  wallet  : BELUM ke-link — bakal di-POST /api/wallets pas dijalanin pakai go`, COLOR.yellow);
+      } else {
+        const lr = await sv.linkWallet(w.party_id);
+        P(`  wallet  : link → ${lr.status} ${JSON.stringify(lr.body).slice(0, 140)}`, lr.ok ? COLOR.green : COLOR.red);
+        if (!lr.ok) die('penautan wallet gagal — lihat pesan di atas (409 = party udah nempel di akun lain)');
+      }
       const mc = await sv.swapAction(SWAP.actionIds.getMultiCall, ['supa']);
       if (!mc || !mc.contractId) die('getMulticallConfigAction gagal');
+      // Guard CC ditaruh SETELAH link: penautan wallet sama sekali gak butuh CC,
+      // jadi jangan diblokir cuma karena party-nya masih kosong.
+      if (!holds.cids.length) die('party Walley gak punya UTXO CC unlocked — isi CC dulu, inputHoldings MultiCall butuh minimal 1 UTXO');
       P(`  multicall: ${String(mc.templateId).slice(0, 46)}…`);
 
       // templateId Silvana "pkg:Module:Entity" → bentuk terpisah yg diminta Walley.
