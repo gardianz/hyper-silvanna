@@ -7541,6 +7541,7 @@ Usage:
             { label: 'Pilih wallet aktif', detail: paint('tentuin akun mana pakai Supanova / Walley buat swap', COLOR.gray) },
             { label: 'Token fee swap   ', detail: paint('bayar settlement fee pakai CC atau USDCx', COLOR.gray) },
             { label: 'Tautkan Walley   ', detail: paint('hubungin wallet Walley ke akun Silvana (sekali per akun)', COLOR.gray) },
+            { label: 'Daftar party ID  ', detail: paint('tabel partyId Supanova & Walley per akun (buat kirim bulk)', COLOR.gray) },
           ],
         });
         if (!sub.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
@@ -7587,6 +7588,51 @@ Usage:
             process.stdout.write(paint(`  ${a.label || a.email} → Walley (${w.party_hint})`, COLOR.green) + '\n');
           }
           process.stdout.write(paint('\nTersimpan di session.json. Swap berikutnya pakai wallet ini.\n', COLOR.cyan));
+          continue;
+        }
+
+        if (sub[0] === 3) {
+          // Daftar party ID per akun, DIPISAH Supanova vs Walley. Dipakai buat nyiapin
+          // kiriman bulk: tinggal copy kolom yg mau dituju.
+          process.stdout.write('\n' + paint('Baca party tiap akun…', COLOR.gray) + '\n');
+          const ws = loadWalleyWallets();
+          const rows = ACCOUNTS.map((a, i) => {
+            const sess = acctSession(a.email) || {};
+            const aktif = (sess.wallet && sess.wallet.kind) || 'supanova';
+            const wPid = (sess.wallet && sess.wallet.partyId) || null;
+            // Walley yg ke-link tapi belum jadi wallet aktif tetap ditampilin.
+            const wAlt = wPid ? null : (ws.find(x => x.party_id && sess.walleyLinked === x.party_id) || null);
+            return { label: a.label || a.email, supa: sess.partyId || null, walley: wPid || (wAlt && wAlt.party_id) || null, aktif };
+          });
+          const lines = [];
+          lines.push('');
+          lines.push(paint('AKUN'.padEnd(22) + 'AKTIF'.padEnd(10) + 'PARTY ID', COLOR.bold + COLOR.gray));
+          for (const r of rows) {
+            lines.push(paint(r.label.padEnd(22), COLOR.bold) + paint(r.aktif.padEnd(10), r.aktif === 'walley' ? COLOR.cyan : COLOR.gray));
+            lines.push(paint('  supanova  ', COLOR.gray) + (r.supa ? paint(r.supa, COLOR.white) : paint('—', COLOR.gray)));
+            lines.push(paint('  walley    ', COLOR.gray) + (r.walley ? paint(r.walley, COLOR.cyan) : paint('—', COLOR.gray)));
+          }
+          process.stdout.write(lines.join('\n') + '\n');
+
+          // Versi datar buat copy-paste / kirim bulk.
+          const pk = await pickList({
+            title: 'Simpan daftar datar (satu partyId per baris) ke file?',
+            items: [
+              { label: 'Tidak', detail: paint('cukup tampil di layar', COLOR.gray) },
+              { label: 'Walley saja', detail: paint('party Walley semua akun', COLOR.gray) },
+              { label: 'Supanova saja', detail: paint('party Supanova semua akun', COLOR.gray) },
+              { label: 'Dua-duanya', detail: paint('label, supanova, walley (CSV)', COLOR.gray) },
+            ],
+          });
+          if (pk.length && pk[0] > 0) {
+            const out = path.join(ROOT, 'party-ids.txt');
+            let txt = '';
+            if (pk[0] === 1) txt = rows.filter(r => r.walley).map(r => r.walley).join('\n') + '\n';
+            else if (pk[0] === 2) txt = rows.filter(r => r.supa).map(r => r.supa).join('\n') + '\n';
+            else txt = 'label,supanova,walley\n' + rows.map(r => `${r.label},${r.supa || ''},${r.walley || ''}`).join('\n') + '\n';
+            fs.writeFileSync(out, txt);
+            process.stdout.write(paint(`\n✓ ditulis ke ${out}\n`, COLOR.green));
+          }
           continue;
         }
 
