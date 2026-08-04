@@ -552,6 +552,8 @@ const SWAP = {
   maxFeeCC: Number((CONFIG.swap || {}).maxFeeCC) || 3.5,
   // Token pembayar settlement fee RFQ. [] = CC (Amulet). ["USDCx"] = bayar USDCx.
   feeTokens: Array.isArray((CONFIG.swap || {}).feeTokens) ? (CONFIG.swap || {}).feeTokens : [],
+  // Ambang minimum saldo TOKEN FEE (kalau feeTokens dipakai). 0 = cukup > 0.
+  minFeeTokenReserve: Number((CONFIG.swap || {}).minFeeTokenReserve) || 0,
 
   // PLAFON MUTLAK — beda sama maxFeeCC. maxFeeCC itu gate "tunggu sampai fee turun"
   // yang SENGAJA di-bypass di dua tempat: mode 8 malam (trabas biar task kelar sebelum
@@ -3338,7 +3340,15 @@ async function swapOnceAtomic(ctx, side, baseQty) {
   const userHoldings = holdOf(sendId);
   if (!userHoldings.length) { const e = new Error(`gak ada holding ${sendId}`); e.insufficientBalance = true; throw e; }
   const ccHoldings = holdOf('Amulet');
-  if (!ccHoldings.length) { const e = new Error('gak ada CC buat fee'); e.insufficientFunds = true; throw e; }
+  // CC cuma WAJIB kalau fee-nya emang dibayar CC. Waktu feeTokens dipasang (mis.
+  // USDCx), akun tanpa CC sama sekali tetap sah — dulu cek ini gak bersyarat jadi
+  // semua akun ber-fee-USDCx mental di sini dengan pesan "top-up CC" yg menyesatkan.
+  const _feeTok = (ctx.feeTokens != null ? ctx.feeTokens : SWAP.feeTokens) || [];
+  const _feeId = _feeTok.length ? String(_feeTok[0]) : 'Amulet';
+  if (!holdOf(_feeId).length) {
+    const e = new Error(`gak ada holding ${_feeId} buat bayar fee`);
+    e.insufficientFunds = true; throw e;
+  }
 
   // 4. Konteks transfer per instrument. Sisi PENGIRIM yang nyetor holding.
   const refs = env.utilityAcceptRefs || [];
@@ -5680,7 +5690,19 @@ async function runEdelCethAccount(i) {
       const edelx = unlockedOf(state, P8.baseId);
       const ceth = unlockedOf(state, P8.quoteId);
       const cc = ccUnlockedFrom(state);
-      if (cc < reserve) { logActivity(`[${tag}] CC ${floor6(cc)} < reserve ${reserve} (fee reversal) — stop, top-up CC`, COLOR.red); break; }
+      // Reserve dijaga pada instrument yg BENERAN dipakai bayar fee. Kalau feeTokens
+      // di-set (mis. USDCx), CC nol itu WAJAR dan gak boleh bikin berhenti — dulu
+      // guard ini selalu nuntut CC jadi akun ber-fee-USDCx mati sebelum swap pertama.
+      const feeTok = (SWAP.feeTokens && SWAP.feeTokens[0]) || null;
+      if (feeTok) {
+        const feeBal = unlockedOf(state, String(feeTok).toUpperCase());
+        // Ambang buat token fee: pakai minFeeTokenReserve kalau ada, kalau nggak
+        // cukup "lebih dari nol" — fee USDCx per swap cuma ~0.15.
+        const feeMin = Number(SWAP.minFeeTokenReserve) || 0;
+        if (!(feeBal > feeMin)) { logActivity(`[${tag}] ${feeTok} ${floor6(feeBal)} habis (buat fee) — stop, top-up ${feeTok}`, COLOR.red); break; }
+      } else if (cc < reserve) {
+        logActivity(`[${tag}] CC ${floor6(cc)} < reserve ${reserve} (fee reversal) — stop, top-up CC`, COLOR.red); break;
+      }
 
       let deliver, edelxQty, minQty = 0, isMaxDump = false;   // minQty = EDELx senilai min swap (floor reduce); isMaxDump = dump penuh (kena haircut)
       let deliveredUsd = 0;   // USD-value niat yg dideliver (modal net gate; loss diukur delta real)
