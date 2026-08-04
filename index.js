@@ -153,9 +153,14 @@ async function walleyHoldings(w, proxy = null) {
   const rows = await walleyReq('POST', '/v1/proxy/v2/state/active-contracts', { body, token, proxy });
   const bal = {};
   for (const row of (Array.isArray(rows) ? rows : [])) {
-    // Bentuk row bisa dibungkus beberapa lapis; cari view Holding-nya apa adanya.
-    const ev = (row && (row.contractEntry || row)) || {};
-    const created = ev.activeContract && ev.activeContract.createdEvent ? ev.activeContract.createdEvent : (ev.createdEvent || ev);
+    // Bentuk asli row (terpantau live):
+    //   {workflowId, contractEntry:{ JsActiveContract:{ createdEvent:{…, interfaceViews:[…] } } }}
+    // Nama pembungkusnya JsActiveContract — bukan activeContract. Jangan ditebak:
+    // ambil kunci apa pun di dalam contractEntry yang punya createdEvent.
+    const entry = (row && row.contractEntry) || row || {};
+    let created = entry.createdEvent || null;
+    if (!created) for (const k of Object.keys(entry)) { const v = entry[k]; if (v && v.createdEvent) { created = v.createdEvent; break; } }
+    if (!created) continue;
     const views = (created && created.interfaceViews) || [];
     for (const v of views) {
       const val = (v && (v.viewValue || v.value)) || null;
@@ -170,6 +175,99 @@ async function walleyHoldings(w, proxy = null) {
   }
   return bal;
 }
+
+// Party operator Silvana — tujuan Op_CreateUserServiceRequest. Diambil dari bundle
+// web Silvana (onboardingStore), bukan tebakan.
+const SILVANA_OPERATOR = 'silvana-orderbook::1220997446016f1e96be9215bab224eace372752853ef99175c332307489bccbb07b';
+
+// Cid UTXO Amulet unlocked milik party Walley — dipakai jadi inputHoldings MultiCall
+// (fee onboarding dibayar dari situ).
+async function walleyAmuletCids(w, proxy = null) {
+  const token = await walleyToken(w, proxy);
+  const end = await walleyReq('GET', '/v1/proxy/v2/state/ledger-end', { token, proxy });
+  const body = {
+    filter: { filtersByParty: { [w.party_id]: { cumulative: [{ identifierFilter: { InterfaceFilter: { value: { interfaceId: HOLDING_IFACE, includeInterfaceView: true } } } }] } } },
+    verbose: false, activeAtOffset: (end && end.offset) || 0,
+  };
+  const rows = await walleyReq('POST', '/v1/proxy/v2/state/active-contracts', { body, token, proxy });
+  const cids = []; let total = 0;
+  for (const row of (Array.isArray(rows) ? rows : [])) {
+    const entry = (row && row.contractEntry) || row || {};
+    let created = entry.createdEvent || null;
+    if (!created) for (const k of Object.keys(entry)) { const v = entry[k]; if (v && v.createdEvent) { created = v.createdEvent; break; } }
+    if (!created || !created.contractId) continue;
+    for (const v of (created.interfaceViews || [])) {
+      const val = (v && (v.viewValue || v.value)) || null;
+      if (!val) continue;
+      const id = (val.instrumentId && val.instrumentId.id) || '';
+      const locked = val.lock != null;
+      if (String(id).toUpperCase() !== 'AMULET' || locked) continue;
+      cids.push(created.contractId); total += Number(val.amount || 0);
+    }
+  }
+  return { cids, total: Number(total.toFixed(10)) };
+}
+
+// Bungkus prepared transaction Walley dengan tanda tangan Ed25519 lokal.
+// Bentuknya persis yg dipakai bot Python (_sign_prepared).
+function walleySignPrepared(w, prepared) {
+  const { key } = walleyKeyFromSeed(w.seed_hex);
+  const hash = prepared.prepared_transaction_hash;
+  const sig = crypto.sign(null, Buffer.from(hash, 'base64'), key).toString('base64');
+  return {
+    prepared_transaction: prepared.prepared_transaction,
+    hashing_scheme_version: prepared.hashing_scheme_version,
+    signature: { format: 'RAW', signature: sig, signed_by: walleyFingerprint(w), signing_algorithm_spec: 'ED25519' },
+  };
+}
+// Fingerprint = yg dipakai Canton buat nunjuk kunci. Disimpan di wallets.jsonl.
+function walleyFingerprint(w) { return w.fingerprint; }
+
+// Cari cid UserService party Walley di ledger, lalu daftarin ke Silvana.
+// Operator Silvana ngubah UserServiceRequest jadi UserService sendiri (terpantau
+// live: request 0, UserService 1 beberapa detik setelah submit). Silvana BARU
+// ngakuin party-nya setelah dipanggil autoRecoverParty — /api/parties/{id} balik
+// null sampai itu dilakukan, dan itu yg bikin polling doang gak pernah kelar.
+async function walleyUserServiceCid(w) {
+  const token = await walleyToken(w);
+  const end = await walleyReq('GET', '/v1/proxy/v2/state/ledger-end', { token });
+  const T = '#utility-settlement-app-v1:Utility.Settlement.App.V1.Service.User:UserService';
+  const body = {
+    filter: { filtersByParty: { [w.party_id]: { cumulative: [{ identifierFilter: { TemplateFilter: { value: { templateId: T, includeCreatedEventBlob: false } } } }] } } },
+    verbose: false, activeAtOffset: (end && end.offset) || 0,
+  };
+  const rows = await walleyReq('POST', '/v1/proxy/v2/state/active-contracts', { body, token });
+  for (const row of (Array.isArray(rows) ? rows : [])) {
+    const entry = (row && row.contractEntry) || row || {};
+    let created = entry.createdEvent || null;
+    if (!created) for (const k of Object.keys(entry)) { const v = entry[k]; if (v && v.createdEvent) { created = v.createdEvent; break; } }
+    if (created && created.contractId) return created.contractId;
+  }
+  return null;
+}
+
+async function finishOnboard(sv, w, acct) {
+  const P = (m, c) => process.stdout.write(paint(m + '\n', c || COLOR.gray));
+  P('\nnunggu UserService muncul di ledger…');
+  let cid = null;
+  for (let i = 0; i < 12 && !cid; i++) {
+    cid = await walleyUserServiceCid(w).catch(() => null);
+    if (!cid) { process.stdout.write(paint(`  cek ${i + 1}/12…\n`, COLOR.gray)); await sleep(5000); }
+  }
+  if (!cid) { P('⚠ UserService belum muncul — coba lagi beberapa menit.', COLOR.yellow); return false; }
+  P(`✓ UserService on-chain: ${String(cid).slice(0, 26)}…`, COLOR.green);
+  const { pubRaw } = walleyKeyFromSeed(w.seed_hex);
+  const res = await sv.swapAction(SWAP.actionIds.autoRecoverParty, [{
+    partyId: w.party_id, userServiceCid: cid,
+    publicKey: pubRaw.toString('base64'), email: acct.email,
+  }]).catch(e => ({ _err: (e && e.message) || String(e) }));
+  P(`autoRecoverParty → ${JSON.stringify(res).slice(0, 200)}`, res && res.success ? COLOR.green : COLOR.yellow);
+  const pr = await sv.recoverParty(w.party_id).catch(() => null);
+  if (pr && pr.userServiceCid) { P(`✓ Silvana ngakuin party ini — userServiceCid ${String(pr.userServiceCid).slice(0, 24)}…`, COLOR.green); return true; }
+  P('⚠ /api/parties masih null — cek pesan autoRecoverParty di atas.', COLOR.yellow);
+  return false;
+}
+
 
 // ── Persist action IDs (auto-fetch) ──────────────────────────────────────────
 // Simpan hasil discovery ke action_ids.json → rerun load dulu (gak scan bundle
@@ -357,6 +455,7 @@ const SWAP = {
     cancelOrder: '4022f5e5f5c6ab32b7939cc75a192f6e4738cf1379',
     submitPreconfirmation: '40b97b1d16dd581c9ad4f2fad40e5e71cd39e3cdb3',
     getSettlementHistory: '4067fe2fd14e778bd08be31aa9a3cd4fedb68c78f2',
+    autoRecoverParty: '400e5f853d',
   },
   // Package ID untuk Splice.Api.Token.AllocationInstructionV1 — dipakai
   // saat membangun ExerciseCommand AllocationFactory_Allocate.
@@ -1351,6 +1450,8 @@ const ACTION_NAME = {
   cancelOrder: 'cancelOrder',
   submitPreconfirmation: 'submitPreconfirmation',
   getSettlementHistory: 'getSettlementHistory',
+  // Daftarin party ke Silvana setelah UserService-nya ada on-chain (dipakai walley-onboard).
+  autoRecoverParty: 'autoRecoverParty',
   // ── RFQ ATOMIC (atomic-dvp-v2) ── Silvana udah pindah dari alur DvpProposal ke
   // settle SEKALI TEMBAK: ExerciseCommand #atomic-dvp-v2:AtomicDVP → AtomicDVP_Settle.
   // Di jalur ini dvpProposalCid GAK PERNAH ADA (makanya swapOnce lama nyangkut di
@@ -6113,6 +6214,90 @@ Usage:
         }
       }
       process.stdout.write(paint(`\n${ok}/${n} party kebaca · ${kosong} masih kosong (butuh CC sebelum bisa dipakai)\n`, COLOR.cyan));
+      process.exit(0);
+    })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
+  } else if (argv[0] === 'walley-onboard') {
+    // `node index.js walley-onboard <akunIdx> <hint|partyId> [go]`
+    // Bikin UserServiceRequest on-chain buat party Walley, biar Silvana ngenalin dia
+    // sebagai party yg udah onboard. Perintahnya PERSIS yg dipakai web Silvana:
+    //   {tag:'Op_CreateUserServiceRequest', value:{operator: SILVANA_OPERATOR}}
+    // dibungkus Execute_MultiCall (satu command — Canton cuma nerima satu).
+    // Transaksinya lewat API Walley: /v1/transactions/prepare → tanda tangan lokal
+    // → /v1/transactions/submit-and-wait. Tanpa `go` cuma nampilin rencana.
+    (async () => {
+      const die = (m) => { console.error(paint(m, COLOR.red)); process.exit(1); };
+      const idx = Number(argv[1]);
+      const who = String(argv[2] || '');
+      const go = argv.includes('go');
+      const a = ACCOUNTS[idx];
+      if (!a) die(`akun idx ${argv[1]} gak ada`);
+      const ws = loadWalleyWallets();
+      const w = ws.find(x => x.party_id === who || x.party_hint === who || String(x.party_id).startsWith(who));
+      if (!w) die(`wallet Walley '${who}' gak ketemu di ${WALLEY_WALLETS_PATH}`);
+      const P = (m, c) => process.stdout.write(paint(m + '\n', c || COLOR.gray));
+
+      const token = await walleyToken(w);
+      const holds = await walleyAmuletCids(w);
+      P(`\n▎ WALLEY ONBOARD ${go ? '[LIVE]' : '[DRY-RUN]'}`, COLOR.bold + (go ? COLOR.red : COLOR.cyan));
+      P(`  akun    : ${a.label || a.email}`);
+      P(`  party   : ${w.party_id}`);
+      P(`  CC      : ${holds.total} dari ${holds.cids.length} UTXO unlocked`);
+      if (!holds.cids.length) die('party Walley gak punya UTXO CC unlocked — isi CC dulu, fee onboarding dibayar dari situ');
+
+      // MultiCall config diambil dari Silvana (butuh sesi akun ini).
+      const state = makeStates()[idx];
+      const { sv } = await buildSwapClients(state);
+      const mc = await sv.swapAction(SWAP.actionIds.getMultiCall, ['supa']);
+      if (!mc || !mc.contractId) die('getMulticallConfigAction gagal');
+      P(`  multicall: ${String(mc.templateId).slice(0, 46)}…`);
+
+      // templateId Silvana "pkg:Module:Entity" → bentuk terpisah yg diminta Walley.
+      const [pkgId, moduleName, entityName] = String(mc.templateId).split(':');
+      const command = {
+        act_as: [w.party_id],
+        command_id: `walley-onboard-${Date.now()}`,
+        commands: [{
+          type: 'Exercise',
+          template_id: { package_id: pkgId, module_name: moduleName, entity_name: entityName },
+          contract_id: mc.contractId,
+          choice: 'Execute_MultiCall',
+          choice_argument: {
+            sender: w.party_id,
+            inputHoldings: holds.cids,
+            operations: [{ tag: 'Op_CreateUserServiceRequest', value: { operator: SILVANA_OPERATOR } }],
+          },
+        }],
+        // template_id di disclosed_contracts juga bentuk TERPISAH, bukan string
+        // "pkg:Module:Entity" — kirim string bikin body ditolak sebelum sempat
+        // divalidasi isinya ("Failed to deserialize the JSON body").
+        disclosed_contracts: mc.blob ? [{
+          contract_id: mc.contractId,
+          created_event_blob: mc.blob,
+          template_id: { package_id: pkgId, module_name: moduleName, entity_name: entityName },
+          synchronizer_id: mc.synchronizerId,
+        }] : [],
+      };
+      // Idempotent: kalau UserService-nya udah ada, langsung ke tahap daftarin aja.
+      const sudah = await walleyUserServiceCid(w).catch(() => null);
+      if (sudah) {
+        P(`  UserService udah ada on-chain (${String(sudah).slice(0, 20)}…) — lewati pembuatan`, COLOR.green);
+        if (!go) { P('\n  dry-run — tambah `go` buat daftarin ke Silvana.', COLOR.cyan); process.exit(0); }
+        await finishOnboard(sv, w, a);
+        process.exit(0);
+      }
+      if (!go) { P('\n  dry-run — belum ada yg dikirim. Tambah `go` buat eksekusi.', COLOR.cyan); process.exit(0); }
+
+      const prep = await walleyReq('POST', '/v1/transactions/prepare', { body: { commands: command, fee_payer: w.party_id }, token });
+      if (!prep || !prep.transaction) die(`prepare gagal: ${JSON.stringify(prep).slice(0, 250)}`);
+      P(`  fee     : ${prep.fee_amount != null ? prep.fee_amount : '?'}`);
+      const signed = walleySignPrepared(w, prep.transaction);
+      const signedFee = prep.fee_transaction ? walleySignPrepared(w, prep.fee_transaction) : null;
+      const body = { party_id: w.party_id, transaction: signed, token: prep.token };
+      if (signedFee) body.fee_transaction = signedFee;
+      const res = await walleyReq('POST', '/v1/transactions/submit-and-wait', { body, token });
+      P(`\n✓ submit OK — ${JSON.stringify(res).slice(0, 180)}`, COLOR.green);
+
+      await finishOnboard(sv, w, a);
       process.exit(0);
     })().catch(e => { console.error(paint('FATAL: ' + ((e && e.message) || e), COLOR.red)); process.exit(1); });
   } else if (argv[0] === 'wallets') {
