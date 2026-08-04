@@ -38,6 +38,8 @@
     "reduceMinFactor": 0.5,
     "_help_allowOvercap": "Kayak opsi 0/1. false = stop pas task 'EDELx-cETH Daily Trader' penuh (10/10). true = swap TERUS lebih dari 10 sampai dailySwapCount total swap sesi (task tetap capped 10, dihitung counter swap lokal). Pakai bareng dailySwapCount > 10.",
     "allowOvercap": false,
+    "_help_pair": "Pasangan token ping-pong mode 8. base/quote harus cocok dengan market_id Silvana (\"<base>-<quote>\"). Kirim base = sell, kirim quote = buy. Daftar market aktif: node index.js markets.",
+    "pair": { "base": "EDELx", "quote": "cETH" },
     "dailySwapCount": 10
   },
   "swap": {

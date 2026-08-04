@@ -687,6 +687,9 @@ const M8 = {
   // total swap sesi (task tetap capped 10, dihitung pakai counter swap lokal).
   allowOvercap: (_m8.allowOvercap != null ? _m8.allowOvercap === true : (_m8sw.allowOvercap === true)),
   dailyCap: Math.max(1, _m8num(_m8.dailySwapCount, _m8num(_m8sw.dailySwapCount, 10))),
+  // Pasangan token ping-pong. base/quote HARUS cocok sama market_id Silvana
+  // ("<base>-<quote>"), lihat `node index.js markets`.
+  pair: (_m8.pair && _m8.pair.base && _m8.pair.quote) ? { base: String(_m8.pair.base), quote: String(_m8.pair.quote) } : { base: 'EDELx', quote: 'cETH' },
 };
 // Jam sekarang (0–23) di timezone tz. Pola sama msUntilNext (Intl.DateTimeFormat TZ).
 function nowHourInTz(tz) {
@@ -781,6 +784,17 @@ function setActivePair(key) {
 // EDELx↔cETH (opsi 8, token↔token). market EDELx-cETH, base=EDELx, quote=cETH.
 // deliver='EDELx' → SELL (EDELx→cETH). deliver='cETH' → BUY (cETH→EDELx). Set SWAP.tokenId
 // = token yg KITA SERAHKAN (dipakai swapOnce buat cari holding + holdingsByToken meta).
+// Pasangan token ping-pong (mode 8). Dulu dipatok EDELx/cETH; sekarang bebas —
+// market_id Silvana = "<base>-<quote>", dan arah swap ditentukan mana yang DIKIRIM:
+// kirim base = sell, kirim quote = buy. Daftar market aktif bisa dilihat lewat
+// menu 8 (picker) atau `node index.js markets`.
+const P8 = {
+  get base() { return (M8.pair && M8.pair.base) || 'EDELx'; },
+  get quote() { return (M8.pair && M8.pair.quote) || 'cETH'; },
+  get baseId() { return String(P8.base).toUpperCase(); },
+  get quoteId() { return String(P8.quote).toUpperCase(); },
+  get market() { return `${P8.base}-${P8.quote}`; },
+};
 const EDEL_CETH = {
   market: 'EDELx-cETH',
   edelxAdmin: 'edel-registrar::122085b19d439b7e68abf7c94c3d9949f9e23aef3f1d4835ccbcb0993ed96fb53432',
@@ -796,14 +810,17 @@ function setEdelCethLeg(deliver) {
 // NON-mutating: balikin {direction, leg} buat di-pass via ctx.leg ke swapOnce. WAJIB
 // dipakai engine ping-pong (parallel) — SWAP global di-share antar akun → race.
 function edelCethLeg(deliver) {
-  const isEdel = deliver === 'EDELx';
+  // Kirim BASE = sell, kirim QUOTE = buy. tokenAdmin cuma fallback — admin asli
+  // diambil dari terms DVP waktu swap, jadi pasangan baru gak perlu daftar admin.
+  const isBase = String(deliver).toUpperCase() === P8.baseId;
+  const adminOf = (id) => (id === 'EDELX' ? EDEL_CETH.edelxAdmin : id === 'CETH' ? EDEL_CETH.cethAdmin : null);
   return {
-    direction: isEdel ? 'sell' : 'buy',
+    direction: isBase ? 'sell' : 'buy',
     leg: {
-      market: EDEL_CETH.market, baseIsCC: false, tokenToToken: true,
-      tokenId: isEdel ? 'EDELX' : 'CETH',
-      tokenLabel: isEdel ? 'EDELx' : 'cETH',
-      tokenAdmin: isEdel ? EDEL_CETH.edelxAdmin : EDEL_CETH.cethAdmin,
+      market: P8.market, baseIsCC: P8.baseId === 'CC', tokenToToken: true,
+      tokenId: isBase ? P8.baseId : P8.quoteId,
+      tokenLabel: isBase ? P8.base : P8.quote,
+      tokenAdmin: adminOf(isBase ? P8.baseId : P8.quoteId),
     },
   };
 }
@@ -2186,6 +2203,17 @@ function prompt(question) {
       resolve((ans || '').trim());
     });
   });
+}
+
+// Daftar market aktif dari Silvana. Dipakai picker pasangan token mode 8 supaya
+// user milih dari yg BENERAN ada, bukan ngetik bebas lalu gagal pas swap.
+async function fetchMarkets(sv) {
+  const r = await request('GET', `${APP_BASE}/api/markets`, sv._opts({ headers: sv._hdr({ 'Accept': 'application/json', 'Referer': APP_BASE + '/swap', ...sv._bearerHdr }) }));
+  if (r.status !== 200) throw new Error(`markets status=${r.status}`);
+  let j = r.json; if (!j) { try { j = JSON.parse(r.text); } catch (_) { } }
+  const arr = Array.isArray(j) ? j : (j && j.markets) || [];
+  return arr.filter(m => m && m.market_id && m.is_active !== false)
+    .map(m => ({ id: m.market_id, base: m.base_instrument, quote: m.quote_instrument, type: (m.price_feeds && m.price_feeds.type) || 'langsung' }));
 }
 
 // ── Picker interaktif (panah ↑/↓, spasi centang, Enter konfirmasi) ───────────
@@ -5579,19 +5607,19 @@ async function runEdelCethAccount(i) {
     if (!userServiceCid) { try { const p = await sv.recoverParty(partyId); if (p && p.userServiceCid) { userServiceCid = p.userServiceCid; patchAcctSession(state.email, { userServiceCid }); } } catch (_) { } }
     await ensureActionIds(sv, partyId, tag);
 
-    // Target dari earn-hub task EDELx-cETH (analog DAY_TRADER).
+    // Target dari earn-hub task ${P8.market} (analog DAY_TRADER).
     let tinfo = await fetchEdelCethTrader(sv, partyId).catch(() => ({ dt: null, all: '' }));
     logActivity(`[${tag}] earn-hub tasks: ${tinfo.all || '(kosong)'}`, COLOR.gray);
     let dt = tinfo.dt;
-    if (!dt) { logActivity(`[${tag}] task EDELx-cETH Daily Trader tak terbaca — set config swap.edelCethTaskCode (lihat list di atas). Skip.`, COLOR.yellow); return; }
+    if (!dt) { logActivity(`[${tag}] task ${P8.market} Daily Trader tak terbaca — set config swap.edelCethTaskCode (lihat list di atas). Skip.`, COLOR.yellow); return; }
     state.dayTrader = { count: dt.current, target: dt.target }; render(global.__states);
     // allowOvercap (kayak opsi 0/1): false → stop pas task penuh (10/10). true → lanjut
     // sampai dailyCap TOTAL swap sesi (task capped 10, jadi pakai counter `swaps` lokal).
     const overcap = M8.allowOvercap;
     const startCount = Number(dt.current) || 0;
     const dailyCap = M8.dailyCap;
-    if (overcap ? (startCount >= dailyCap) : (dt.current >= dt.target)) { logActivity(`[${tag}] EDELx-cETH ${dt.current}/${dt.target}${overcap ? ` (overcap cap ${dailyCap})` : ''} sudah penuh ✓`, COLOR.green); return; }
-    logActivity(`[${tag}] EDELx-cETH ${dt.current}/${dt.target} (task ${dt.code})${overcap ? ` — overcap → target ${dailyCap} swap` : ''} — mulai ping-pong`, COLOR.cyan);
+    if (overcap ? (startCount >= dailyCap) : (dt.current >= dt.target)) { logActivity(`[${tag}] ${P8.market} ${dt.current}/${dt.target}${overcap ? ` (overcap cap ${dailyCap})` : ''} sudah penuh ✓`, COLOR.green); return; }
+    logActivity(`[${tag}] ${P8.market} ${dt.current}/${dt.target} (task ${dt.code})${overcap ? ` — overcap → target ${dailyCap} swap` : ''} — mulai ping-pong`, COLOR.cyan);
 
     let swaps = 0;
     // Progres overcap buat kolom OVERCAP di dashboard. Kolom SWAP mentok di task
@@ -5613,13 +5641,13 @@ async function runEdelCethAccount(i) {
       try { const fr = await ensureFreshClients(state, clients); if (fr !== clients) { clients = fr; ({ sv, partyId, identityToken, proxy } = clients); } } catch (_) { }
       await ensureActionIds(sv, partyId, tag);
       try { const ti = await fetchEdelCethTrader(sv, partyId); if (ti && ti.dt) { dt = ti.dt; state.dayTrader = { count: dt.current, target: dt.target }; } } catch (_) { }
-      if (targetReached()) { logActivity(`[${tag}] EDELx-cETH ${dt.current}/${dt.target}${overcap ? ` (overcap ${startCount + swaps}/${dailyCap})` : ''} ✓ — berhenti`, COLOR.green); break; }
+      if (targetReached()) { logActivity(`[${tag}] ${P8.market} ${dt.current}/${dt.target}${overcap ? ` (overcap ${startCount + swaps}/${dailyCap})` : ''} ✓ — berhenti`, COLOR.green); break; }
 
       // populate state.balances (SWAP.tokenId apapun; kita baca EDELx/cETH/CC manual).
-      SWAP.tokenId = 'EDELX';
+      SWAP.tokenId = P8.baseId;
       await refreshBalances(state, identityToken, proxy).catch(() => 0);
-      const edelx = unlockedOf(state, 'EDELX');
-      const ceth = unlockedOf(state, 'CETH');
+      const edelx = unlockedOf(state, P8.baseId);
+      const ceth = unlockedOf(state, P8.quoteId);
       const cc = ccUnlockedFrom(state);
       if (cc < reserve) { logActivity(`[${tag}] CC ${floor6(cc)} < reserve ${reserve} (fee reversal) — stop, top-up CC`, COLOR.red); break; }
 
@@ -5634,8 +5662,8 @@ async function runEdelCethAccount(i) {
       // ($12), atau max EDELx kalau worth < usdAmount. Dua-duanya < minUsd → dust, stop.
       {
         const usdPx = (pd) => { const b = Number(pd && pd.bid), a = Number(pd && pd.ask), l = Number(pd && pd.last); return (l > 0 ? l : (a > 0 && b > 0 ? (a + b) / 2 : (a > 0 ? a : (b > 0 ? b : 0)))) || 0; };
-        pe = await sv.getPrice('EDELx-USDCx').catch(() => null);
-        pc = await sv.getPrice('cETH-USDCx').catch(() => null);
+        pe = await sv.getPrice(`${P8.base}-USDCx`).catch(() => null);
+        pc = await sv.getPrice(`${P8.quote}-USDCx`).catch(() => null);
         usdPerEdelx = usdPx(pe); usdPerCeth = usdPx(pc);
         if (!(usdPerEdelx > 0) || !(usdPerCeth > 0)) { logActivity(`[${tag}] harga USD belum ada — tunggu`, COLOR.yellow); await sleep(Math.min(30000, SWAP.rfqRetryMs || 30000)); continue; }
         // Cleanup rutin (req #3): tiap M8.cleanupEveryChecks cek-harga → drain DvpProposal stale (expired),
@@ -5655,8 +5683,8 @@ async function runEdelCethAccount(i) {
           // Size di harga ORDER dari ORDERBOOK (bukan cross-rate USD: feed itu meleset ~3.6%,
           // bikin qty overshoot → "Insufficient cETH" → retry −1% tiap swap). Book gagal →
           // fallback cross-rate USD (terminalSwapOnce tetap nge-cap pakai maxDeliverCeth).
-          deliver = 'cETH';
-          const bkA = await sv.orderbookDepth(EDEL_CETH.market, { lpOnly: M8.bookLpOnly !== false, depth: 20 }).catch(() => null);
+          deliver = P8.quote;
+          const bkA = await sv.orderbookDepth(P8.market, { lpOnly: M8.bookLpOnly !== false, depth: 20 }).catch(() => null);
           const askPx = (bkA && bkA.bestAsk) || 0;   // cETH per EDELx
           edelxQty = askPx > 0
             ? floor6(ceth / (askPx * (1 + M8.orderCross)))
@@ -5666,7 +5694,7 @@ async function runEdelCethAccount(i) {
           logActivity(`[${tag}] deliver cETH MAX ${floor6(ceth)} (~$${valC.toFixed(2)}) → ${edelxQty} EDELx`, COLOR.gray);
         } else if (valE > minUsd) {
           // EDELx → cETH (sell), sebesar usdAmount (atau max EDELx kalau worth < usdAmount).
-          deliver = 'EDELx';
+          deliver = P8.base;
           const swapUsd = Math.min(valE, usdAmount);
           edelxQty = floor6(swapUsd / usdPerEdelx);
           deliveredUsd = swapUsd;
@@ -5683,7 +5711,7 @@ async function runEdelCethAccount(i) {
       // BUKA posisi (EDELx→cETH) = bebas (catat modal pas sukses). TUTUP (cETH→EDELx, dump SEMUA cETH)
       // DI-GATE: EDELx yg diterima balik harus ≥ modal + minNetUsd. minNetUsd NEGATIF = allowed-loss,
       // POSITIF = cari profit, 0 = break-even, null = gate mati. MALAM (night) → dilewati (trabas).
-      if (!night && M8.minNetUsd != null && deliver === 'cETH') {
+      if (!night && M8.minNetUsd != null && String(deliver).toUpperCase() === P8.quoteId) {
         const hs = (pd) => { const b = Number(pd && pd.bid), a = Number(pd && pd.ask); return (a > 0 && b > 0) ? (a - b) / (a + b) : 0; };
         const spreadCost = deliveredUsd * (hs(pe) + hs(pc));   // deliveredUsd = valC (nilai cETH yg didump)
         // Haircut FIXED 0.1% (M8.haircut): terminal fee tetap (maker 0.1%), gak adaptif lagi.
@@ -5705,12 +5733,12 @@ async function runEdelCethAccount(i) {
       const { direction, leg } = edelCethLeg(deliver);   // ctx.leg (per-call, anti-race parallel)
 
       const countBefore = (dt && Number(dt.current)) || 0;   // task count sebelum swap (buat confirm on-chain)
-      const recvId = deliver === 'EDELx' ? 'CETH' : 'EDELX'; // token yg bakal DITERIMA (settle → kredit ke unlocked)
+      const recvId = String(deliver).toUpperCase() === P8.baseId ? P8.quoteId : P8.baseId; // token yg bakal DITERIMA (settle → kredit ke unlocked)
       const recvBefore = unlockedOf(state, recvId);
       // Deliver side (buat ukur qty yg BENERAN keluar wallet — dust yg di-cancel gak kehitung).
-      const deliverId = deliver === 'EDELx' ? 'EDELX' : 'CETH';
+      const deliverId = String(deliver).toUpperCase() === P8.baseId ? P8.baseId : P8.quoteId;
       const deliverBefore = unlockedOf(state, deliverId);
-      const deliverPriceUsd = deliver === 'EDELx' ? usdPerEdelx : usdPerCeth;
+      const deliverPriceUsd = String(deliver).toUpperCase() === P8.baseId ? usdPerEdelx : usdPerCeth;
       // Haircut FIXED (cuma MAX-DUMP): potong qty teoritis −haircut (0.1%) duluan biar
       // attempt-1 lolos (buffer deliver ≤ saldo), gak retry −1% dari nol. rf = 1 − haircut.
       if (isMaxDump) {
@@ -5733,9 +5761,9 @@ async function runEdelCethAccount(i) {
         // match tapi counterparty gak nyelesaiin settlement; RFQ di-quote langsung sama
         // LP, terbukti tetap jalan pas CLOB mandek total, fee juga lebih murah.
         const useRfq = mode8ShouldUseRfq();
-        logActivity(`[${tag}] ping-pong #${swaps + 1}: ${direction} ${deliver}→${deliver === 'EDELx' ? 'cETH' : 'EDELx'} (${q} EDELx${adj ? ` adj#${adj}` : ''})${useRfq ? ` [RFQ — sisa ${hoursUntilDailyReset()}j ke reset]` : ''}`, COLOR.cyan);
+        logActivity(`[${tag}] ping-pong #${swaps + 1}: ${direction} ${deliver}→${String(deliver).toUpperCase() === P8.baseId ? P8.quote : P8.base} (${q} ${P8.base}${adj ? ` adj#${adj}` : ''})${useRfq ? ` [RFQ — sisa ${hoursUntilDailyReset()}j ke reset]` : ''}`, COLOR.cyan);
         try {
-          const swapCtx = { ...clients, email: state.email, label: tag, userServiceCid, leg, maxFeeCC: night ? Infinity : M8.maxFeeCC, minUsd, usdPerEdelx, maxDeliverCeth: (deliver === 'cETH' ? ceth : 0), log: (m) => logActivity(`[${tag}] ${m}`, COLOR.gray), onWalletPicked: (id) => { try { patchAcctSession(state.email, { privyWalletId: id }); } catch (_) { } } };
+          const swapCtx = { ...clients, email: state.email, label: tag, userServiceCid, leg, maxFeeCC: night ? Infinity : M8.maxFeeCC, minUsd, usdPerEdelx, maxDeliverCeth: (String(deliver).toUpperCase() === P8.quoteId ? ceth : 0), log: (m) => logActivity(`[${tag}] ${m}`, COLOR.gray), onWalletPicked: (id) => { try { patchAcctSession(state.email, { privyWalletId: id }); } catch (_) { } } };
           // RFQ pakai qty BASE yg sama (EDELx) + ctx.leg yg sama → aman buat token↔token.
           const res = useRfq
             ? await swapOnceAtomic(swapCtx, direction, q)
@@ -5848,17 +5876,17 @@ async function runEdelCethAccount(i) {
         let countUp = false, recvOk = false;
         for (let r = 0; ; r++) {
           const w = SYNC_WAIT_MS;
-          logActivity(`[${tag}] Sync EDELx-cETH… (cek ${r + 1}, tunggu ${Math.round(w / 1000)}s, sampai settle+saldo)`, COLOR.gray);
+          logActivity(`[${tag}] Sync ${P8.market}… (cek ${r + 1}, tunggu ${Math.round(w / 1000)}s, sampai settle+saldo)`, COLOR.gray);
           await sleep(w);
           try { const fr = await ensureFreshClients(state, clients); if (fr !== clients) { clients = fr; ({ sv, partyId, identityToken, proxy } = clients); } } catch (_) { }
           const chk = await fetchEdelCethTrader(sv, partyId).catch(() => ({ dt: null }));
           if (chk.dt) { dt = chk.dt; state.dayTrader = { count: dt.current, target: dt.target }; }
-          SWAP.tokenId = 'EDELX'; await refreshBalances(state, identityToken, proxy).catch(() => 0);
+          SWAP.tokenId = P8.baseId; await refreshBalances(state, identityToken, proxy).catch(() => 0);
           render(global.__states);
           const recvNow = unlockedOf(state, recvId);
           if (chk.dt && chk.dt.current > countBefore) countUp = true;
           if (recvNow > recvBefore + Math.max(recvBefore * 0.25, 1e-7)) recvOk = true; // token recv udah kebayar
-          if (countUp && recvOk) { logActivity(`[${tag}] ✓ confirmed (EDELx-cETH ${dt.current}/${dt.target}, ${recvId === 'CETH' ? 'cETH' : 'EDELx'} ${floor6(recvNow)} kebayar)`, COLOR.green); break; }
+          if (countUp && recvOk) { logActivity(`[${tag}] ✓ confirmed (${P8.market} ${dt.current}/${dt.target}, ${recvId === P8.quoteId ? P8.quote : P8.base} ${floor6(recvNow)} kebayar)`, COLOR.green); break; }
           if (chk.dt && chk.dt.current >= chk.dt.target && recvOk) break;        // target penuh & saldo masuk
           // Reset harian lewat pas nunggu → count jatuh ke 0, countBefore masih angka
           // kemarin, jadi countUp gak akan pernah true lagi. Ini persis yg bikin sesi
@@ -5887,7 +5915,7 @@ async function runEdelCethAccount(i) {
         // fee (maker/taker, kebaked di harga) + haircut dalam 1 angka EDELx. CC FEE (kolom FEE/*)
         // TERPISAH — dibayar dari reserve CC, gak nyentuh delta EDELx → gak double-count di loss.
         // Dust yg di-cancel gak kehitung (deliveredQty/recvQty = delta unlocked real).
-        if (deliver === 'EDELx') {
+        if (String(deliver).toUpperCase() === P8.baseId) {
           // BUKA posisi: catat EDELx real keluar (anchor qty) + modal USD (buat net gate). Loss
           // BELUM realized — nunggu swap balik. Leg buka gak nambah loss.
           if (deliveredQty > 0) setEdelCethRoundEdelx(state.email, deliveredQty);
@@ -5908,15 +5936,15 @@ async function runEdelCethAccount(i) {
             setEdelCethRoundEdelx(state.email, 0);   // clear anchor — round selesai
           }
         }
-        if (targetReached()) { logActivity(`[${tag}] EDELx-cETH ${dt.current}/${dt.target}${overcap ? ` (overcap ${startCount + swaps}/${dailyCap})` : ''} ✓ — berhenti`, COLOR.green); break; }
+        if (targetReached()) { logActivity(`[${tag}] ${P8.market} ${dt.current}/${dt.target}${overcap ? ` (overcap ${startCount + swaps}/${dailyCap})` : ''} ✓ — berhenti`, COLOR.green); break; }
         const delay = SWAP.postSwapDelayMinSec + Math.random() * Math.max(0, SWAP.postSwapDelayMaxSec - SWAP.postSwapDelayMinSec);
         await sleep(Math.max(3, delay) * 1000);
       } else {
         await sleep(SWAP.delayBetweenSwapsSec * 1000);
       }
     }
-    SWAP.tokenId = 'EDELX';
-    const fe = unlockedOf(state, 'EDELX'), fc = unlockedOf(state, 'CETH');
+    SWAP.tokenId = P8.baseId;
+    const fe = unlockedOf(state, P8.baseId), fc = unlockedOf(state, P8.quoteId);
     logActivity(`[${tag}] ping-pong selesai: ${swaps} swap, sisa EDELx ${floor6(fe)} / cETH ${floor6(fc)}`, swaps ? COLOR.green : COLOR.yellow);
   } catch (e) {
     state.status = 'error'; state.message = shortSwapReason(e);
@@ -7968,6 +7996,23 @@ Usage:
         //   8r = RFQ /swap AtomicDVP. LP nge-quote langsung; fee ~1.25 CC; tetap jalan
         //        waktu settlement CLOB mandek (kejadian 26/07 stage 2 seharian).
         PINGPONG_ROUTE = (ans === '8r') ? 'rfq' : 'clob';
+        // Pasangan token. Diambil dari daftar market AKTIF Silvana biar gak bisa milih
+        // pasangan yg gak ada. Enter/q = pakai yg sekarang (config mode8.pair).
+        try {
+          const { sv: sv0 } = await buildSwapClients(makeStates()[0]);
+          const mk = await fetchMarkets(sv0);
+          const cur = P8.market;
+          const items = mk.map(m => ({
+            label: String(m.id).padEnd(14),
+            detail: paint(`kirim ${m.base} = sell · kirim ${m.quote} = buy`, COLOR.gray) + (m.id === cur ? paint('   ← sekarang', COLOR.green) : ''),
+          }));
+          const pk = await pickList({ title: `Pasangan token ping-pong (sekarang ${cur}):`, items, hint: '↑/↓ pindah · Enter pilih · q pakai yg sekarang' });
+          if (pk.length) {
+            const m = mk[pk[0]];
+            M8.pair = { base: m.base, quote: m.quote };
+            process.stdout.write(paint(`pasangan → ${P8.market}\n`, COLOR.cyan));
+          }
+        } catch (e) { process.stdout.write(paint(`(daftar market gak kebaca: ${e.message}) — pakai ${P8.market}\n`, COLOR.yellow)); }
         // Target swap per akun. Kosong = ikut task earn-hub (berhenti di 10/10).
         // Isi angka > 10 = overcap: lanjut swap walau task udah penuh.
         {
