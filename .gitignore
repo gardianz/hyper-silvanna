@@ -19,6 +19,5 @@ action_ids.json
 # Node
 node_modules/
 __MACOSX/
-tools/inspect-out.json
 walley_wallets.jsonl
 party-ids.txt
