@@ -2238,6 +2238,33 @@ function prompt(question) {
   });
 }
 
+// Pilih pasangan token DUA TAHAP: token asal dulu, baru token tujuan yg beneran
+// punya market sama dia. Lebih enak daripada nyodorin belasan "EDELx-cETH" mentah
+// yg maksa user mikir sendiri mana base mana quote.
+// Balikin {market, base, quote, from, to} — base/quote ngikut orientasi market
+// asli (yg nentuin sell/buy), from/to ngikut yg dipilih user.
+async function pickTokenPair(sv, { title = 'Pilih token', fromLabel = 'Token ASAL (yg dikirim)', toLabel = 'Token TUJUAN (yg diterima)' } = {}) {
+  const mk = await fetchMarkets(sv);
+  if (!mk.length) throw new Error('daftar market kosong');
+  const tokens = [...new Set(mk.flatMap(m => [m.base, m.quote]))].sort((a, b) => a.localeCompare(b));
+  const pasangan = (t) => mk.filter(m => m.base === t || m.quote === t);
+  const fromItems = tokens.map(t => ({
+    label: String(t).padEnd(8),
+    detail: paint(`${pasangan(t).length} pasangan`, COLOR.gray),
+  }));
+  const f = await pickList({ title: `${title} — ${fromLabel}:`, items: fromItems });
+  if (!f.length) return null;
+  const from = tokens[f[0]];
+  const lawan = pasangan(from).map(m => ({ tok: m.base === from ? m.quote : m.base, m }));
+  const t = await pickList({
+    title: `${title} — ${toLabel} (dari ${from}):`,
+    items: lawan.map(x => ({ label: String(x.tok).padEnd(8), detail: paint(`market ${x.m.id}`, COLOR.gray) })),
+  });
+  if (!t.length) return null;
+  const { tok: to, m } = lawan[t[0]];
+  return { market: m.id, base: m.base, quote: m.quote, from, to };
+}
+
 // Daftar market aktif dari Silvana. Dipakai picker pasangan token mode 8 supaya
 // user milih dari yg BENERAN ada, bukan ngetik bebas lalu gagal pas swap.
 async function fetchMarkets(sv) {
@@ -7605,8 +7632,7 @@ Usage:
       // Menu utama: picker panah, dan BALIK ke menu setelah aksi pendek selesai.
       // Dulu tiap cabang manggil process.exit(0) jadi sekali milih langsung keluar.
       const MENU = [
-        ['0', 'swap CC→cETH', 'dashboard + auto DAY_TRADER (pair cETH)'],
-        ['1', 'swap CC→USDCx', 'dashboard + auto DAY_TRADER (pair USDCx)'],
+        ['s', 'swap 1x (RFQ)', 'swap sekali: pilih token asal → tujuan, pilih akun'],
         ['2', 'check balance', 'tabel CC/USDCx/cETH/EDELx + total, auto-refresh'],
         ['3', 'run (OTP urut)', 'login akun 1-per-1 lalu run USDCx'],
         ['4', 'change wallet', 'ganti wallet supa 1 akun'],
@@ -7626,6 +7652,92 @@ Usage:
       });
       if (!mpk.length) { process.stdout.write(paint('bye 👋\n', COLOR.gray)); process.exit(0); }
       const ans = MENU[mpk[0]][0];
+      if (ans === 's') {
+        // Swap SEKALI lewat jalur RFQ. User milih token asal -> tujuan -> akun ->
+        // jumlah. Sengaja RFQ: fee jauh lebih murah dan gak nyangkut kayak CLOB.
+        const { sv: sv0 } = await buildSwapClients(makeStates()[0]);
+        const pr = await pickTokenPair(sv0, { title: 'Swap 1x (RFQ)' }).catch(e => { console.error(paint('gagal baca market: ' + e.message, COLOR.red)); return null; });
+        if (!pr) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
+        // Arah: kirim base = sell, kirim quote = buy.
+        const side = (String(pr.from).toUpperCase() === String(pr.base).toUpperCase()) ? 'sell' : 'buy';
+        process.stdout.write(paint(`\n${pr.from} → ${pr.to}  ·  market ${pr.market}  ·  arah ${side}\n`, COLOR.cyan));
+
+        // Saldo token asal tiap akun, biar milihnya gak buta.
+        process.stdout.write(paint('Baca saldo…', COLOR.gray) + '\n');
+        const states = makeStates();
+        const bal = new Array(ACCOUNTS.length).fill(null);
+        await mapLimit(ACCOUNTS.map((_, i) => i), 5, async (i) => {
+          try { const { canton } = await buildSwapClients(states[i]); const b = await canton.balances(); bal[i] = (b && b.tokens) || []; }
+          catch (e) { bal[i] = { _err: (e && e.message) || String(e) }; }
+        });
+        const amtOf = (i, id) => {
+          const t = Array.isArray(bal[i]) ? bal[i].find(x => String(x.instrumentId.id).toUpperCase() === String(id).toUpperCase()) : null;
+          return t ? Number(t.totalUnlockedBalance || 0) : 0;
+        };
+        const items = ACCOUNTS.map((a, i) => {
+          if (!Array.isArray(bal[i])) return { label: (a.label || a.email).padEnd(20), detail: paint('gagal baca saldo', COLOR.red), disabled: true, note: paint('[dilewati]', COLOR.red) };
+          const v = amtOf(i, pr.from);
+          return { label: (a.label || a.email).padEnd(20), detail: paint(`${pr.from} ${v.toFixed(6)}`, v > 0 ? COLOR.green : COLOR.gray), disabled: !(v > 0), note: paint('[kosong]', COLOR.yellow) };
+        });
+        const pilih = await pickList({ title: `Akun yg mau swap ${pr.from} → ${pr.to}:`, items, multi: true });
+        if (!pilih.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
+
+        const amountRaw = (await prompt(paint(`jumlah ${pr.from} per akun (angka, atau ketik max): `, COLOR.bold))).trim();
+        if (!amountRaw) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
+        process.stdout.write('\n' + paint('─'.repeat(64), COLOR.yellow) + '\n');
+        process.stdout.write(paint(`SWAP 1x — ${pilih.length} akun · ${amountRaw} ${pr.from} → ${pr.to} · fee ${(SWAP.feeTokens && SWAP.feeTokens[0]) || 'CC'}`, COLOR.bold + COLOR.red) + '\n');
+        process.stdout.write(paint('─'.repeat(64), COLOR.yellow) + '\n');
+        const conf = (await prompt(paint('Ketik "swap" buat jalan, Enter buat batal: ', COLOR.bold + COLOR.yellow))).trim().toLowerCase();
+        if (conf !== 'swap') { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
+
+        let ok = 0, gagal = 0;
+        for (const i of pilih) {
+          const a = ACCOUNTS[i], tag = a.label || a.email;
+          try {
+            const clients = await buildSwapClients(states[i]);
+            // userServiceCid: cache dulu, kalau kosong pulihkan dari on-chain (pola
+            // yg sama dipakai engine ping-pong).
+            let userServiceCid = getUserServiceCid(a.email);
+            if (!userServiceCid) {
+              const pty = await clients.sv.recoverParty(clients.partyId).catch(() => null);
+              if (pty && pty.userServiceCid) { userServiceCid = pty.userServiceCid; patchAcctSession(a.email, { userServiceCid }); }
+            }
+            if (!userServiceCid) throw new Error('userServiceCid gak ketemu — party belum onboard?');
+            // leg mengikuti orientasi market: quantity RFQ selalu dalam BASE.
+            const leg = { market: pr.market, baseIsCC: String(pr.base).toUpperCase() === 'CC', tokenToToken: true, tokenId: String(pr.from).toUpperCase(), tokenLabel: pr.from, tokenAdmin: null };
+            // qty dalam satuan BASE. Kalau user kirim quote (buy), konversi lewat harga.
+            let qty;
+            if (/^(max|all|semua)$/i.test(amountRaw)) {
+              const punya = amtOf(i, pr.from);
+              qty = side === 'sell' ? punya : null;   // buy: qty base dihitung dari harga
+              if (side === 'buy') {
+                const px = await clients.sv.getPrice(pr.market).catch(() => null);
+                const rate = Number(px && (px.price || px.value)) || 0;
+                if (!(rate > 0)) throw new Error(`harga ${pr.market} gak kebaca buat hitung max`);
+                qty = Math.floor((punya / rate) * 1e6) / 1e6;
+              }
+            } else {
+              const n = Number(amountRaw);
+              if (!Number.isFinite(n) || n <= 0) throw new Error(`jumlah '${amountRaw}' gak valid`);
+              if (side === 'sell') qty = n;
+              else {
+                const px = await clients.sv.getPrice(pr.market).catch(() => null);
+                const rate = Number(px && (px.price || px.value)) || 0;
+                if (!(rate > 0)) throw new Error(`harga ${pr.market} gak kebaca`);
+                qty = Math.floor((n / rate) * 1e6) / 1e6;
+              }
+            }
+            if (!(qty > 0)) throw new Error('jumlah hasil hitung nol');
+            const ctx = { ...clients, email: a.email, label: tag, userServiceCid, leg, minUsd: M8.minUsd, log: (m) => process.stdout.write(paint(`  [${tag}] ${m}\n`, COLOR.gray)) };
+            const r = await swapOnceAtomic(ctx, side, fmt10(String(qty)));
+            if (r && r.ok) { ok++; process.stdout.write(paint(`  ✓ ${tag} — ${qty} ${pr.base} (${side}) fee ${r.feeCC}`, COLOR.green) + '\n'); }
+            else { gagal++; process.stdout.write(paint(`  ✗ ${tag} — gagal tanpa keterangan`, COLOR.red) + '\n'); }
+          } catch (e) { gagal++; process.stdout.write(paint(`  ✗ ${tag} — ${(e && e.message) || e}`, COLOR.red) + '\n'); }
+        }
+        process.stdout.write('\n' + paint(`selesai — ${ok} sukses, ${gagal} gagal`, gagal ? COLOR.yellow : COLOR.green) + '\n');
+        continue;
+      }
+
       if (ans === 'w') {
         const sub = await pickList({
           title: 'Wallet — mau ngapain?',
@@ -8175,21 +8287,13 @@ Usage:
         //   8r = RFQ /swap AtomicDVP. LP nge-quote langsung; fee ~1.25 CC; tetap jalan
         //        waktu settlement CLOB mandek (kejadian 26/07 stage 2 seharian).
         PINGPONG_ROUTE = (ans === '8r') ? 'rfq' : 'clob';
-        // Pasangan token. Diambil dari daftar market AKTIF Silvana biar gak bisa milih
-        // pasangan yg gak ada. Enter/q = pakai yg sekarang (config mode8.pair).
+        // Pasangan token, dipilih DUA TAHAP (asal lalu tujuan). Enter/q = pakai yg sekarang.
         try {
           const { sv: sv0 } = await buildSwapClients(makeStates()[0]);
-          const mk = await fetchMarkets(sv0);
-          const cur = P8.market;
-          const items = mk.map(m => ({
-            label: String(m.id).padEnd(14),
-            detail: paint(`kirim ${m.base} = sell · kirim ${m.quote} = buy`, COLOR.gray) + (m.id === cur ? paint('   ← sekarang', COLOR.green) : ''),
-          }));
-          const pk = await pickList({ title: `Pasangan token ping-pong (sekarang ${cur}):`, items, hint: '↑/↓ pindah · Enter pilih · q pakai yg sekarang' });
-          if (pk.length) {
-            const m = mk[pk[0]];
-            M8.pair = { base: m.base, quote: m.quote };
-            process.stdout.write(paint(`pasangan → ${P8.market}\n`, COLOR.cyan));
+          const pr = await pickTokenPair(sv0, { title: `Ping-pong (sekarang ${P8.market})` });
+          if (pr) {
+            M8.pair = { base: pr.base, quote: pr.quote };
+            process.stdout.write(paint(`pasangan → ${P8.market} (mulai dari ${pr.from} → ${pr.to})\n`, COLOR.cyan));
           }
         } catch (e) { process.stdout.write(paint(`(daftar market gak kebaca: ${e.message}) — pakai ${P8.market}\n`, COLOR.yellow)); }
         // Target swap per akun. Kosong = ikut task earn-hub (berhenti di 10/10).
