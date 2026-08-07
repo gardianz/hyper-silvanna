@@ -3376,6 +3376,24 @@ async function swapOnceAtomic(ctx, side, baseQty) {
   const sendId = weSendBase ? baseId : quoteId2;
   const userHoldings = holdOf(sendId);
   if (!userHoldings.length) { const e = new Error(`gak ada holding ${sendId}`); e.insufficientBalance = true; throw e; }
+  // CEK SANGGUP KIRIM. LP boleh ngutip lebih gede dari yg kita sizing — harga gerak
+  // antara sizing dan quote. Kalau gak dicek, prepare-nya baru nolak jauh di belakang
+  // dengan "input holdings do not cover leg amount", dan itu gak kebaca sebagai
+  // kekurangan saldo jadi engine gak ngecilin qty. Jalur CLOB udah punya cap serupa
+  // (maxDeliverCeth); jalur RFQ dulu sama sekali gak punya.
+  {
+    const sumOf = (id) => {
+      const t = toks.find(x => String((x.instrumentId && x.instrumentId.id) || '').toUpperCase() === String(id).toUpperCase());
+      return t ? Number(t.totalUnlockedBalance || 0) : 0;
+    };
+    const kirim = Number(weSendBase ? q.baseAmount : q.quoteAmount) || 0;
+    const punya = sumOf(sendId);
+    if (kirim > 0 && punya > 0 && kirim > punya + 1e-12) {
+      const e = new Error(`${sendId} kurang buat leg: butuh ${kirim} punya ${punya} (LP ngutip lebih gede dari sizing)`);
+      e.insufficientBalance = true; e.tokenNeeded = kirim; e.tokenHave = punya;
+      throw e;
+    }
+  }
   const ccHoldings = holdOf('Amulet');
   // CC cuma WAJIB kalau fee-nya emang dibayar CC. Waktu feeTokens dipasang (mis.
   // USDCx), akun tanpa CC sama sekali tetap sah — dulu cek ini gak bersyarat jadi
@@ -5916,7 +5934,9 @@ async function runEdelCethAccount(i) {
           if (e && !e.insufficientBalance) {
             const em = (e && e.message) || '';
             const nm = em.match(/Need\s*([0-9.]+)[\s,]+available\s*([0-9.]+)/i);
-            if (nm || /Insufficient\s+\w+\s+balance/i.test(em)) {
+            // "input holdings do not cover leg amount" itu bentuk Daml dari kekurangan
+            // saldo — tanpa pola ini dia jatuh ke hardErrs dan qty gak pernah dikecilin.
+            if (nm || /Insufficient\s+\w+\s+balance/i.test(em) || /input holdings do not cover leg amount/i.test(em)) {
               e.insufficientBalance = true;
               if (nm) { e.tokenNeeded = Number(nm[1]); e.tokenHave = Number(nm[2]); }
             }
