@@ -722,6 +722,9 @@ const M8 = {
   dailyCap: Math.max(1, _m8num(_m8.dailySwapCount, _m8num(_m8sw.dailySwapCount, 10))),
   // Pasangan token ping-pong. base/quote HARUS cocok sama market_id Silvana
   // ("<base>-<quote>"), lihat `node index.js markets`.
+  // Ambang nilai USD tempat settlement fee turun ke tier murah (diukur ~$10).
+  // 0 = matikan penyesuaian.
+  feeTierMinUsd: _m8num(_m8.feeTierMinUsd, 10),
   pair: (_m8.pair && _m8.pair.base && _m8.pair.quote) ? { base: String(_m8.pair.base), quote: String(_m8.pair.quote) } : { base: 'EDELx', quote: 'cETH' },
 };
 // Jam sekarang (0–23) di timezone tz. Pola sama msUntilNext (Intl.DateTimeFormat TZ).
@@ -5810,7 +5813,16 @@ async function runEdelCethAccount(i) {
         } else if (valE > minUsd) {
           // EDELx → cETH (sell), sebesar usdAmount (atau max EDELx kalau worth < usdAmount).
           deliver = P8.base;
-          const swapUsd = Math.min(valE, usdAmount);
+          // TIER FEE: di bawah ~$10 settlement fee 3x lebih mahal. Diukur live pada
+          // EDELx-cETH: $9.5 kena 19.97 CC / 1.8 USDCx / 0.9 TUSDT, sedangkan $10.5
+          // cuma 6.66 / 0.6 / 0.3. Jadi swap kecil itu mahal BUKAN karena persentase,
+          // tapi karena jatuh ke tier mahal. Naikkan ke ambang kalau saldo cukup.
+          const tierMin = Math.max(0, Number(M8.feeTierMinUsd) || 0);
+          let swapUsd = Math.min(valE, usdAmount);
+          if (tierMin > 0 && swapUsd < tierMin) {
+            if (valE >= tierMin) { logActivity(`[${tag}] $${swapUsd.toFixed(2)} di bawah tier fee murah ($${tierMin}) → dinaikin ke $${tierMin.toFixed(2)}`, COLOR.yellow); swapUsd = tierMin; }
+            else logActivity(`[${tag}] cuma punya $${valE.toFixed(2)} — di bawah tier $${tierMin}, fee bakal ~3x lebih mahal`, COLOR.yellow);
+          }
           edelxQty = floor6(swapUsd / usdPerEdelx);
           deliveredUsd = swapUsd;
           isMaxDump = swapUsd >= valE - 1e-9;   // haircut cuma kalau dump SEMUA EDELx (bukan leg fixed-$)

@@ -192,6 +192,32 @@ Do not rebuild this as a raw Canton command. That path was tried and is a dead e
 fails the same way because our MultiCall does not pay the fee, and `buildFeeTransferDataAction`
 returns `null` for every non-DvP `feeType`.
 
+### Settlement fee has a cheap tier above ~$10 — size for it, not against it
+
+The RFQ settlement fee is **flat per settlement** and **tiered by USD value**, not proportional to
+trade size. Measured live on `EDELx-cETH` in one back-to-back sweep:
+
+| target | qty EDELx | CC | USDCx | TUSDT |
+| --- | --- | --- | --- | --- |
+| $8 | 1218 | 19.97 | 1.8 | 0.9 |
+| $9.5 | 1446 | 19.97 | 1.8 | 0.9 |
+| $10.5 | 1599 | **6.66** | **0.6** | **0.3** |
+
+So a swap just under $10 costs **three times** what a swap just over it costs. `mode8.feeTierMinUsd`
+(default 10) raises the size to the threshold when the balance allows, and warns when it does not.
+
+Two more things the same sweep settled:
+- Fee does **not** scale with size within a tier — 600 and 1400 EDELx paid the same. Larger swaps are
+  strictly more fee-efficient per dollar of volume.
+- Absolute fees drift with network load over minutes (the UI's "Network load" indicator). The same
+  1200 EDELx quote returned 0.9 TUSDT six times in a row within a minute, but 0.15 / 0.3 / 0.45 / 0.9
+  at different times. The **ratio** CC : USDCx : TUSDT stays ~22 : 2 : 1, so a cap that is sane for one
+  token is wildly wrong for another — `maxFeeCC` is denominated in whichever token `feeTokens` selects.
+
+`feeTokens` accepts `CC`, `USDCx`, `TUSDT`; `USD8` and `EDELx` return no quote. The request name is not
+the instrument id — `TUSDT` settles as instrument `tf-usdt`, so holdings lookups must go through
+`FEE_TOKEN_INSTRUMENT` or they find nothing and blame the wrong token.
+
 ### Pairs and the `SWAP` global
 
 `PAIRS` defines `usdcx` / `ceth` / `edelx`; `setActivePair()` mutates the global `SWAP`. The

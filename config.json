@@ -38,6 +38,8 @@
     "reduceMinFactor": 0.5,
     "_help_allowOvercap": "Kayak opsi 0/1. false = stop pas task 'EDELx-cETH Daily Trader' penuh (10/10). true = swap TERUS lebih dari 10 sampai dailySwapCount total swap sesi (task tetap capped 10, dihitung counter swap lokal). Pakai bareng dailySwapCount > 10.",
     "allowOvercap": false,
+    "_help_feeTierMinUsd": "Ambang nilai USD tempat settlement fee turun ke tier murah. Diukur live di EDELx-cETH: swap $9.5 kena 19.97 CC / 1.8 USDCx / 0.9 TUSDT, sedangkan $10.5 cuma 6.66 / 0.6 / 0.3 — tiga kali lebih murah. Kalau nilai swap di bawah ambang dan saldo cukup, jumlahnya dinaikkan supaya tidak jatuh ke tier mahal. 0 = matikan.",
+    "feeTierMinUsd": 10,
     "_help_pair": "Pasangan token ping-pong mode 8. base/quote harus cocok dengan market_id Silvana (\"<base>-<quote>\"). Kirim base = sell, kirim quote = buy. Daftar market aktif: node index.js markets.",
     "pair": {
       "base": "EDELx",
