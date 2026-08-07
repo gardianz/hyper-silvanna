@@ -3371,7 +3371,7 @@ async function swapOnceAtomic(ctx, side, baseQty) {
   // USDCx), akun tanpa CC sama sekali tetap sah — dulu cek ini gak bersyarat jadi
   // semua akun ber-fee-USDCx mental di sini dengan pesan "top-up CC" yg menyesatkan.
   const _feeTok = (ctx.feeTokens != null ? ctx.feeTokens : SWAP.feeTokens) || [];
-  const _feeId = _feeTok.length ? String(_feeTok[0]) : 'Amulet';
+  const _feeId = _feeTok.length ? feeInstrumentOf(_feeTok[0]) : 'Amulet';
   if (!holdOf(_feeId).length) {
     const e = new Error(`gak ada holding ${_feeId} buat bayar fee`);
     e.insufficientFunds = true; throw e;
@@ -3917,6 +3917,17 @@ const BURN_EVENTS = []; const BURN_EVENTS_MAX = 200;
 // Satuan fee IKUT instrumentnya. Sejak fee bisa dibayar USDCx, menjumlahkan
 // semuanya sebagai "CC" bikin angka season campur aduk dan gak ada artinya.
 function feeUnitNow() { return (SWAP.feeTokens && SWAP.feeTokens[0]) || 'CC'; }
+// Nama token fee di REQUEST beda sama instrumentId di HOLDINGS. Diukur live lewat
+// requestQuotesV2: feeTokens ["TUSDT"] balik settlementFee dgn instrumentId
+// "tf-usdt". Kalau dicari pakai "TUSDT" holdingnya gak ketemu dan swap ditolak
+// dgn alasan yg salah. CC -> Amulet juga beda nama.
+// Yg didukung server (diuji): CC, USDCx, TUSDT. USD8 & EDELx ditolak (gak ada quote).
+const FEE_TOKEN_IDS = ['CC', 'USDCx', 'TUSDT'];
+const FEE_TOKEN_INSTRUMENT = { CC: 'Amulet', AMULET: 'Amulet', USDCX: 'USDCx', TUSDT: 'tf-usdt' };
+function feeInstrumentOf(tok) {
+  const k = String(tok || 'CC').toUpperCase();
+  return FEE_TOKEN_INSTRUMENT[k] || String(tok);
+}
 function recordBurn(feeAmt, label, unit) {
   const f = Number(feeAmt);
   if (!Number.isFinite(f) || f <= 0) return;
@@ -5746,7 +5757,7 @@ async function runEdelCethAccount(i) {
       // guard ini selalu nuntut CC jadi akun ber-fee-USDCx mati sebelum swap pertama.
       const feeTok = (SWAP.feeTokens && SWAP.feeTokens[0]) || null;
       if (feeTok) {
-        const feeBal = unlockedOf(state, String(feeTok).toUpperCase());
+        const feeBal = unlockedOf(state, feeInstrumentOf(feeTok).toUpperCase());
         // Ambang buat token fee: pakai minFeeTokenReserve kalau ada, kalau nggak
         // cukup "lebih dari nol" — fee USDCx per swap cuma ~0.15.
         const feeMin = Number(SWAP.minFeeTokenReserve) || 0;
@@ -7746,6 +7757,7 @@ Usage:
             { label: 'Token fee swap   ', detail: paint('bayar settlement fee pakai CC atau USDCx', COLOR.gray) },
             { label: 'Tautkan Walley   ', detail: paint('hubungin wallet Walley ke akun Silvana (sekali per akun)', COLOR.gray) },
             { label: 'Daftar party ID  ', detail: paint('tabel partyId Supanova & Walley per akun (buat kirim bulk)', COLOR.gray) },
+            { label: 'Batas max fee    ', detail: paint('tolak swap kalau fee lewat batas (satuan ikut token fee)', COLOR.gray) },
           ],
         });
         if (!sub.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
@@ -7792,6 +7804,41 @@ Usage:
             process.stdout.write(paint(`  ${a.label || a.email} → Walley (${w.party_hint})`, COLOR.green) + '\n');
           }
           process.stdout.write(paint('\nTersimpan di session.json. Swap berikutnya pakai wallet ini.\n', COLOR.cyan));
+          continue;
+        }
+
+        if (sub[0] === 4) {
+          // Batas fee per swap. SATUANNYA ikut token fee yang dipakai — 5 itu ketat
+          // buat CC (fee bisa 20) tapi longgar banget buat TUSDT (fee ~0.9), jadi
+          // angka lama gak otomatis masuk akal setelah ganti token.
+          const unit = (SWAP.feeTokens && SWAP.feeTokens[0]) || 'CC';
+          process.stdout.write('\n' + paint(`Token fee sekarang: ${unit}`, COLOR.cyan) + '\n');
+          process.stdout.write(paint(`  swap.maxFeeCC      = ${SWAP.maxFeeCC}   (dipakai daytrader & swap 1x)`, COLOR.gray) + '\n');
+          process.stdout.write(paint(`  mode8.maxFeeCC     = ${M8.maxFeeCC}   (dipakai ping-pong siang)`, COLOR.gray) + '\n');
+          process.stdout.write(paint(`  swap.hardMaxFeeCC  = ${SWAP.hardMaxFeeCC}   (plafon mutlak, gak bisa ditrabas)`, COLOR.gray) + '\n');
+          const which = await pickList({
+            title: 'Batas mana yg mau diubah?',
+            items: [
+              { label: 'Keduanya', detail: paint('swap.maxFeeCC + mode8.maxFeeCC sekaligus', COLOR.gray) },
+              { label: 'swap saja', detail: paint('cuma swap.maxFeeCC', COLOR.gray) },
+              { label: 'mode8 saja', detail: paint('cuma mode8.maxFeeCC', COLOR.gray) },
+              { label: 'plafon mutlak', detail: paint('swap.hardMaxFeeCC — berlaku walau yg lain ditrabas', COLOR.gray) },
+            ],
+          });
+          if (!which.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
+          const raw = (await prompt(paint(`batas baru dalam ${unit} (angka): `, COLOR.bold))).trim();
+          const n = Number(raw);
+          if (!Number.isFinite(n) || n <= 0) { process.stdout.write(paint('angka gak valid — dibatalin.\n', COLOR.red)); continue; }
+          try {
+            const cfg = JSON.parse(fs.readFileSync(CFG_PATH, 'utf8'));
+            cfg.swap = cfg.swap || {}; cfg.mode8 = cfg.mode8 || {};
+            if (which[0] === 0 || which[0] === 1) { cfg.swap.maxFeeCC = n; SWAP.maxFeeCC = n; }
+            if (which[0] === 0 || which[0] === 2) { cfg.mode8.maxFeeCC = n; M8.maxFeeCC = n; }
+            if (which[0] === 3) { cfg.swap.hardMaxFeeCC = n; SWAP.hardMaxFeeCC = n; }
+            fs.writeFileSync(CFG_PATH, JSON.stringify(cfg, null, 2) + '\n');
+            process.stdout.write(paint(`\n✓ tersimpan — swap ${SWAP.maxFeeCC} · mode8 ${M8.maxFeeCC} · plafon ${SWAP.hardMaxFeeCC} (${unit})\n`, COLOR.green));
+            if (n > SWAP.hardMaxFeeCC) process.stdout.write(paint(`⚠ batas ${n} di ATAS plafon mutlak ${SWAP.hardMaxFeeCC} — yg berlaku tetap plafonnya.\n`, COLOR.yellow));
+          } catch (e) { console.error(paint('gagal nulis config.json: ' + e.message, COLOR.red)); }
           continue;
         }
 
@@ -7843,15 +7890,14 @@ Usage:
         if (sub[0] === 1) {
           // Token fee. Ditulis ke config.json biar kepakai juga pas headless/pm2.
           const now = Array.isArray((CONFIG.swap || {}).feeTokens) ? CONFIG.swap.feeTokens : [];
+          const ket = { CC: 'default — fee dari saldo CC', USDCx: 'fee dari USDCx, CC gak kepotong', TUSDT: 'fee dari TUSDT (instrument tf-usdt)' };
           const pk = await pickList({
             title: `Token buat bayar settlement fee (sekarang: ${now.length ? now.join(',') : 'CC'}):`,
-            items: [
-              { label: 'CC (Amulet)', detail: paint('default — fee dibayar dari saldo CC', COLOR.gray) },
-              { label: 'USDCx      ', detail: paint('fee dibayar USDCx, CC gak kepotong', COLOR.gray) },
-            ],
+            items: FEE_TOKEN_IDS.map(t => ({ label: String(t).padEnd(8), detail: paint(ket[t] || '', COLOR.gray) })),
           });
           if (!pk.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
-          const val = pk[0] === 0 ? [] : ['USDCx'];
+          const sel = FEE_TOKEN_IDS[pk[0]];
+          const val = sel === 'CC' ? [] : [sel];
           try {
             const raw = JSON.parse(fs.readFileSync(CFG_PATH, 'utf8'));
             raw.swap = raw.swap || {}; raw.swap.feeTokens = val;
