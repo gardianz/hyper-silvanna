@@ -2291,7 +2291,14 @@ async function pickList({ title, items, multi = false, hint = '' }) {
   const N = items.length;
   if (!N) return [];
   const enabled = items.map((it, i) => (it && !it.disabled) ? i : -1).filter(i => i >= 0);
-  if (!enabled.length) return [];
+  // Semua item terkunci → jangan balik diam-diam, itu kebaca sebagai "batal" padahal
+  // sebenarnya gak ada yg bisa dipilih. Tampilin daftarnya biar alasannya kelihatan.
+  if (!enabled.length) {
+    process.stdout.write('\n' + paint(title, COLOR.bold + COLOR.cyan) + '\n');
+    items.forEach(it => process.stdout.write(paint(`  ${it.label}${it.detail ? '  ' + it.detail : ''}  ${it.note || '[gak bisa dipilih]'}`, COLOR.gray) + '\n'));
+    process.stdout.write(paint('gak ada yg bisa dipilih.\n', COLOR.red));
+    return [];
+  }
 
   if (!process.stdin.isTTY) {
     // Fallback ketik: "all" | "0,2,5" | "0-4" | campuran.
@@ -7686,22 +7693,50 @@ Usage:
         process.stdout.write(paint(`\n${pr.from} → ${pr.to}  ·  market ${pr.market}  ·  arah ${side}\n`, COLOR.cyan));
 
         // Saldo token asal tiap akun, biar milihnya gak buta.
-        process.stdout.write(paint('Baca saldo…', COLOR.gray) + '\n');
+        // buildSwapClients itu MAHAL (login Silvana + Privy + auth Walley per akun).
+        // Buat sekadar baca saldo cukup token Privy + balancesFor, dan konkurensinya
+        // dinaikin. Progres dicetak biar gak kelihatan nge-hang.
         const states = makeStates();
         const bal = new Array(ACCOUNTS.length).fill(null);
-        await mapLimit(ACCOUNTS.map((_, i) => i), 5, async (i) => {
-          try { const { canton } = await buildSwapClients(states[i]); const b = await canton.balances(); bal[i] = (b && b.tokens) || []; }
-          catch (e) { bal[i] = { _err: (e && e.message) || String(e) }; }
+        let selesai = 0;
+        process.stdout.write(paint(`Baca saldo 0/${ACCOUNTS.length}…`, COLOR.gray));
+        await mapLimit(ACCOUNTS.map((_, i) => i), 8, async (i) => {
+          try {
+            const em = ACCOUNTS[i].email;
+            const pakaiWalley = ((acctSession(em) || {}).wallet || {}).kind === 'walley';
+            // JANGAN ensurePrivyToken di sini: kalau token expired dia jatuh ke prompt
+            // OTP dan seluruh picker menggantung nungguin ketikan. Akun Walley malah
+            // gak butuh token Privy sama sekali (saldonya dari ledger Walley).
+            let tk = null;
+            if (!pakaiWalley) {
+              const cached = getValidPrivySession(em);
+              if (!cached) { bal[i] = { _err: 'token Privy expired — login dulu (menu 3)' }; selesai++; return; }
+              tk = cached.token;
+            }
+            const b = await balancesFor(em, tk, getProxy(em));
+            bal[i] = (b && b.tokens) || [];
+          } catch (e) { bal[i] = { _err: ((e && e.message) || String(e)).slice(0, 40) }; }
+          selesai++;
+          process.stdout.write(`\r` + paint(`Baca saldo ${selesai}/${ACCOUNTS.length}…`, COLOR.gray));
         });
+        process.stdout.write('\n');
         const amtOf = (i, id) => {
           const t = Array.isArray(bal[i]) ? bal[i].find(x => String(x.instrumentId.id).toUpperCase() === String(id).toUpperCase()) : null;
           return t ? Number(t.totalUnlockedBalance || 0) : 0;
         };
         const items = ACCOUNTS.map((a, i) => {
-          if (!Array.isArray(bal[i])) return { label: (a.label || a.email).padEnd(20), detail: paint('gagal baca saldo', COLOR.red), disabled: true, note: paint('[dilewati]', COLOR.red) };
+          if (!Array.isArray(bal[i])) return { label: (a.label || a.email).padEnd(20), detail: paint(String((bal[i] && bal[i]._err) || 'gagal baca saldo'), COLOR.red), disabled: true, note: '' };
           const v = amtOf(i, pr.from);
           return { label: (a.label || a.email).padEnd(20), detail: paint(`${pr.from} ${v.toFixed(6)}`, v > 0 ? COLOR.green : COLOR.gray), disabled: !(v > 0), note: paint('[kosong]', COLOR.yellow) };
         });
+        const adaIsi = items.some(x => !x.disabled);
+        if (!adaIsi) {
+          const gagal = items.filter(x => /gagal baca/.test(String(x.detail))).length;
+          process.stdout.write('\n' + paint(`Gak ada akun yg punya ${pr.from}.`, COLOR.red) + '\n');
+          if (gagal) process.stdout.write(paint(`  (${gagal} akun gagal dibaca saldonya)`, COLOR.yellow) + '\n');
+          process.stdout.write(paint(`  Cek saldo lewat menu 2, atau pilih token asal lain.\n`, COLOR.gray));
+          continue;
+        }
         const pilih = await pickList({ title: `Akun yg mau swap ${pr.from} → ${pr.to}:`, items, multi: true });
         if (!pilih.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
 
