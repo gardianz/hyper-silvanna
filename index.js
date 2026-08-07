@@ -3934,6 +3934,10 @@ function feeUnitNow() { return (SWAP.feeTokens && SWAP.feeTokens[0]) || 'CC'; }
 // Yg didukung server (diuji): CC, USDCx, TUSDT. USD8 & EDELx ditolak (gak ada quote).
 const FEE_TOKEN_IDS = ['CC', 'USDCx', 'TUSDT'];
 const FEE_TOKEN_INSTRUMENT = { CC: 'Amulet', AMULET: 'Amulet', USDCX: 'USDCx', TUSDT: 'tf-usdt' };
+// Alias umum: nama token di market/menu -> instrumentId di holdings.
+// Bukan cuma urusan fee — menu swap juga perlu, karena CC itu instrument "Amulet"
+// dan TUSDT itu "tf-usdt". Nyari pakai nama menu bikin saldo kebaca 0 padahal ada.
+function instrumentIdOf(tok) { return feeInstrumentOf(tok); }
 function feeInstrumentOf(tok) {
   const k = String(tok || 'CC').toUpperCase();
   return FEE_TOKEN_INSTRUMENT[k] || String(tok);
@@ -6561,7 +6565,7 @@ async function runRegister() {
 const argv = process.argv.slice(2);
 // buildSwapClients/SWAP/transferCC ikut diekspor biar bisa diprobe dari skrip luar
 // tanpa nyalain bot (require aman: runMain kegate `require.main === module`).
-module.exports = { render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
+module.exports = { balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
 
 if (require.main === module) {
   if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
@@ -7720,8 +7724,9 @@ Usage:
           process.stdout.write(`\r` + paint(`Baca saldo ${selesai}/${ACCOUNTS.length}…`, COLOR.gray));
         });
         process.stdout.write('\n');
-        const amtOf = (i, id) => {
-          const t = Array.isArray(bal[i]) ? bal[i].find(x => String(x.instrumentId.id).toUpperCase() === String(id).toUpperCase()) : null;
+        const amtOf = (i, tok) => {
+          const want = String(instrumentIdOf(tok)).toUpperCase();
+          const t = Array.isArray(bal[i]) ? bal[i].find(x => String(x.instrumentId.id).toUpperCase() === want) : null;
           return t ? Number(t.totalUnlockedBalance || 0) : 0;
         };
         const items = ACCOUNTS.map((a, i) => {
