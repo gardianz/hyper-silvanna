@@ -2249,6 +2249,14 @@ function prompt(question) {
 // yg maksa user mikir sendiri mana base mana quote.
 // Balikin {market, base, quote, from, to} — base/quote ngikut orientasi market
 // asli (yg nentuin sell/buy), from/to ngikut yg dipilih user.
+// getPrice balikin {marketId, last, source, timestamp} — field harganya `last`,
+// BUKAN price/value. Salah nebak field bikin rate 0 dan swap ditolak dengan
+// "harga <market> gak kebaca" padahal harganya ada.
+function priceOf(px) {
+  if (!px) return 0;
+  return Number(px.last ?? px.price ?? px.value ?? px.lastPrice ?? 0) || 0;
+}
+
 async function pickTokenPair(sv, { title = 'Pilih token', fromLabel = 'Token ASAL (yg dikirim)', toLabel = 'Token TUJUAN (yg diterima)' } = {}) {
   const mk = await fetchMarkets(sv);
   if (!mk.length) throw new Error('daftar market kosong');
@@ -7784,8 +7792,26 @@ Usage:
 
         const amountRaw = (await prompt(paint(`jumlah ${pr.from} per akun (angka, atau ketik max): `, COLOR.bold))).trim();
         if (!amountRaw) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
+        // CEK NILAI USD dulu. Server nolak order di bawah minimum (~$10) dengan
+        // "below the minimum order value", dan tanpa cek ini kegagalannya baru muncul
+        // satu per satu per akun setelah konfirmasi — 15 kali error yg sama.
+        let nilaiUsd = null;
+        if (!/^(max|all|semua)$/i.test(amountRaw)) {
+          try {
+            const uSym = String(pr.from).toUpperCase() === 'USDCX' ? null : `${pr.from}-USDCx`;
+            const rate = uSym ? priceOf(await sv0.getPrice(uSym).catch(() => null)) : 1;
+            if (rate > 0) nilaiUsd = Number(amountRaw) * rate;
+          } catch (_) { }
+        }
+        const rfqMin = Math.max(0, Number(M8.rfqMinUsd) || 10);
+        if (nilaiUsd != null && nilaiUsd < rfqMin) {
+          process.stdout.write('\n' + paint(`${amountRaw} ${pr.from} ≈ $${nilaiUsd.toFixed(2)} — di BAWAH minimum order $${rfqMin}.`, COLOR.red) + '\n');
+          const perlu = (rfqMin / (nilaiUsd / Number(amountRaw))).toFixed(4);
+          process.stdout.write(paint(`  Server bakal nolak semua. Minimal sekitar ${perlu} ${pr.from}.\n`, COLOR.yellow));
+          continue;
+        }
         process.stdout.write('\n' + paint('─'.repeat(64), COLOR.yellow) + '\n');
-        process.stdout.write(paint(`SWAP 1x — ${pilih.length} akun · ${amountRaw} ${pr.from} → ${pr.to} · fee ${(SWAP.feeTokens && SWAP.feeTokens[0]) || 'CC'}`, COLOR.bold + COLOR.red) + '\n');
+        process.stdout.write(paint(`SWAP 1x — ${pilih.length} akun · ${amountRaw} ${pr.from}${nilaiUsd != null ? ` (~$${nilaiUsd.toFixed(2)})` : ''} → ${pr.to} · fee ${(SWAP.feeTokens && SWAP.feeTokens[0]) || 'CC'}`, COLOR.bold + COLOR.red) + '\n');
         process.stdout.write(paint('─'.repeat(64), COLOR.yellow) + '\n');
         const conf = (await prompt(paint('Ketik "swap" buat jalan, Enter buat batal: ', COLOR.bold + COLOR.yellow))).trim().toLowerCase();
         if (conf !== 'swap') { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
@@ -7812,7 +7838,7 @@ Usage:
               qty = side === 'sell' ? punya : null;   // buy: qty base dihitung dari harga
               if (side === 'buy') {
                 const px = await clients.sv.getPrice(pr.market).catch(() => null);
-                const rate = Number(px && (px.price || px.value)) || 0;
+                const rate = priceOf(px);
                 if (!(rate > 0)) throw new Error(`harga ${pr.market} gak kebaca buat hitung max`);
                 qty = Math.floor((punya / rate) * 1e6) / 1e6;
               }
@@ -7822,7 +7848,7 @@ Usage:
               if (side === 'sell') qty = n;
               else {
                 const px = await clients.sv.getPrice(pr.market).catch(() => null);
-                const rate = Number(px && (px.price || px.value)) || 0;
+                const rate = priceOf(px);
                 if (!(rate > 0)) throw new Error(`harga ${pr.market} gak kebaca`);
                 qty = Math.floor((n / rate) * 1e6) / 1e6;
               }
