@@ -725,6 +725,9 @@ const M8 = {
   // Ambang nilai USD tempat settlement fee turun ke tier murah (diukur ~$10).
   // 0 = matikan penyesuaian.
   feeTierMinUsd: _m8num(_m8.feeTierMinUsd, 10),
+  // Minimum order value yg DIPAKSA server RFQ ($10 saat diukur). Ini lantai keras,
+  // beda dari minUsd yg cuma ukuran yg diinginkan.
+  rfqMinUsd: _m8num(_m8.rfqMinUsd, 10),
   pair: (_m8.pair && _m8.pair.base && _m8.pair.quote) ? { base: String(_m8.pair.base), quote: String(_m8.pair.quote) } : { base: 'EDELx', quote: 'cETH' },
 };
 // Jam sekarang (0–23) di timezone tz. Pola sama msUntilNext (Intl.DateTimeFormat TZ).
@@ -4272,7 +4275,13 @@ async function tickAccount(state) {
 // Konkurensi login/keep-alive antar-akun. Tiap akun independen (proxy/cookie/
 // privy sendiri) → aman paralel. Batasi biar gak overload proxy/rate-limit.
 const ACCT_CONCURRENCY = Math.max(1, Number((CONFIG.swap || {}).loginConcurrency) || 5);
-async function tickAll(states) { await mapLimit(states, ACCT_CONCURRENCY, s => tickAccount(s)); }
+async function tickAll(states) {
+  // Hormatin only= juga di sini. Tanpa ini, `only=5` tetap nge-login SEMUA akun pas
+  // startup — dan satu akun yg tokennya expired bikin seluruh proses nunggu prompt OTP,
+  // jadi kelihatan nge-hang padahal cuma satu akun yg bermasalah.
+  const pilih = ONLY_ACCOUNTS ? states.filter((_, i) => ONLY_ACCOUNTS.includes(i)) : states;
+  await mapLimit(pilih, ACCT_CONCURRENCY, s => tickAccount(s));
+}
 
 // ============================================================================
 //  Keep-alive token (Privy/Supa + Silvana) — jalan TERUS walau quest selesai.
@@ -5825,7 +5834,15 @@ async function runEdelCethAccount(i) {
         night = mode8IsNight();   // di luar jam siang (dayEndHour..dayStartHour) → trabas: abaikan net + fee gate
         const valE = edelx * usdPerEdelx, valC = ceth * usdPerCeth;
         minQty = floor6(minUsd / usdPerEdelx);
-        if (valC > minUsd) {
+        // LANTAI DUST != minUsd. Minimum order RFQ itu $10 (ditolak server di bawah
+        // itu), sedangkan minUsd cuma ukuran yg DIINGINKAN. Dulu gerbangnya pakai
+        // minUsd 10.5, jadi akun bersaldo $10.1-$10.4 dinyatakan dust dan sesi
+        // berhenti 0 swap padahal swap segitu sah. Karena saldo menyusut tiap ronde
+        // (loss + fee), akun makin lama pasti mendarat di celah itu dan mandek.
+        // Margin: haircut max-dump (0.5%) + 0.2% buat gerak harga.
+        const rfqMin = Math.max(0, Number(M8.rfqMinUsd) || 10);
+        const dustFloor = rfqMin * (1 + (Number(M8.haircut) || 0) + 0.002);
+        if (valC > dustFloor) {
           // cETH → EDELx (buy), dump SEMUA cETH. Order dibayar cETH di bestAsk×(1+orderCross).
           // Size di harga ORDER dari ORDERBOOK (bukan cross-rate USD: feed itu meleset ~3.6%,
           // bikin qty overshoot → "Insufficient cETH" → retry −1% tiap swap). Book gagal →
@@ -5839,7 +5856,7 @@ async function runEdelCethAccount(i) {
           deliveredUsd = valC;
           isMaxDump = true;   // dump penuh cETH → pre-reduce haircut buffer
           logActivity(`[${tag}] deliver cETH MAX ${floor6(ceth)} (~$${valC.toFixed(2)}) → ${edelxQty} EDELx`, COLOR.gray);
-        } else if (valE > minUsd) {
+        } else if (valE > dustFloor) {
           // EDELx → cETH (sell), sebesar usdAmount (atau max EDELx kalau worth < usdAmount).
           deliver = P8.base;
           // TIER FEE: di bawah ~$10 settlement fee 3x lebih mahal. Diukur live pada
@@ -5857,7 +5874,7 @@ async function runEdelCethAccount(i) {
           isMaxDump = swapUsd >= valE - 1e-9;   // haircut cuma kalau dump SEMUA EDELx (bukan leg fixed-$)
           logActivity(`[${tag}] deliver EDELx $${swapUsd.toFixed(2)} → ${edelxQty} EDELx @ $${usdPerEdelx.toFixed(6)}`, COLOR.gray);
         } else {
-          logActivity(`[${tag}] EDELx $${valE.toFixed(2)} & cETH $${valC.toFixed(2)} dust (<$${minUsd}) → selesai`, COLOR.green);
+          logActivity(`[${tag}] modal kurang — EDELx $${valE.toFixed(2)} & cETH $${valC.toFixed(2)}, dua-duanya di bawah minimum order $${dustFloor.toFixed(2)} → stop, top-up`, COLOR.yellow);
           break;
         }
       }
