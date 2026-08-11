@@ -7803,12 +7803,14 @@ Usage:
             if (rate > 0) nilaiUsd = Number(amountRaw) * rate;
           } catch (_) { }
         }
+        // PERINGATAN, bukan penghalang. Ambang $10 itu diukur di EDELx-cETH; market
+        // lain bisa beda dan cuma server yg tau pasti. Swap 1x itu manual — biar user
+        // yg mutusin, jangan diblokir sepihak.
         const rfqMin = Math.max(0, Number(M8.rfqMinUsd) || 10);
         if (nilaiUsd != null && nilaiUsd < rfqMin) {
-          process.stdout.write('\n' + paint(`${amountRaw} ${pr.from} ≈ $${nilaiUsd.toFixed(2)} — di BAWAH minimum order $${rfqMin}.`, COLOR.red) + '\n');
           const perlu = (rfqMin / (nilaiUsd / Number(amountRaw))).toFixed(4);
-          process.stdout.write(paint(`  Server bakal nolak semua. Minimal sekitar ${perlu} ${pr.from}.\n`, COLOR.yellow));
-          continue;
+          process.stdout.write('\n' + paint(`⚠ ${amountRaw} ${pr.from} ≈ $${nilaiUsd.toFixed(2)} — di bawah minimum order $${rfqMin} yg terukur di market lain.`, COLOR.yellow) + '\n');
+          process.stdout.write(paint(`  Kalau market ini ikut aturan yg sama, server bakal nolak (butuh ~${perlu} ${pr.from}). Lanjut kalau mau tetap coba.\n`, COLOR.gray));
         }
         process.stdout.write('\n' + paint('─'.repeat(64), COLOR.yellow) + '\n');
         process.stdout.write(paint(`SWAP 1x — ${pilih.length} akun · ${amountRaw} ${pr.from}${nilaiUsd != null ? ` (~$${nilaiUsd.toFixed(2)})` : ''} → ${pr.to} · fee ${(SWAP.feeTokens && SWAP.feeTokens[0]) || 'CC'}`, COLOR.bold + COLOR.red) + '\n');
