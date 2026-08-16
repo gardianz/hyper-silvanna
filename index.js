@@ -211,6 +211,19 @@ async function walleyHoldings(w, proxy = null) {
 
 // Party operator Silvana — tujuan Op_CreateUserServiceRequest. Diambil dari bundle
 // web Silvana (onboardingStore), bukan tebakan.
+// getMultiCall makan ~10 detik tiap panggil (diukur), padahal config-nya nyaris
+// gak berubah. Di-cache per proses dengan TTL; kalau contract-nya diganti server,
+// prepare bakal nolak dan cache di-invalidate lewat clearMultiCallCache().
+let _mcCache = null;
+const MC_TTL_MS = 10 * 60000;
+async function getMultiCallCached(sv) {
+  if (_mcCache && Date.now() - _mcCache.t < MC_TTL_MS) return _mcCache.v;
+  const v = await getMultiCallCached(sv);
+  if (v && v.contractId) _mcCache = { t: Date.now(), v };
+  return v;
+}
+function clearMultiCallCache() { _mcCache = null; }
+
 const SILVANA_OPERATOR = 'silvana-orderbook::1220997446016f1e96be9215bab224eace372752853ef99175c332307489bccbb07b';
 
 // Cid UTXO Amulet unlocked milik party Walley — dipakai jadi inputHoldings MultiCall
@@ -368,6 +381,9 @@ class WalleyCantonClient {
     } catch (e) {
       logDebug('walley prepare REQUEST', this._toWalley(body));
       logDebug('walley prepare ERROR', (e && e.message) || String(e));
+      // Kontrak MultiCall di cache bisa udah gak aktif (server ganti) — buang cache
+      // biar percobaan berikutnya ngambil yg baru.
+      if (/CONTRACT_NOT_FOUND|not found|disclosed/i.test((e && e.message) || '')) clearMultiCallCache();
       throw e;
     }
     const tx = prep && prep.transaction;
@@ -2722,7 +2738,7 @@ async function swapOnce(ctx, direction, quantityCC) {
     throw new Error(`poll: dvpProposalCid timeout (last=${JSON.stringify(lastPoll).slice(0, 200)})`);
   }
 
-  const multiCall = await sv.swapAction(A.getMultiCall, ['supa']);
+  const multiCall = await getMultiCallCached(sv);
   if (!multiCall || !multiCall.contractId) throw new Error('getMultiCall gagal');
 
   // Ambil DvpProposal ASLI dari ledger (active_contracts, filter by templateId
@@ -3410,21 +3426,44 @@ async function swapOnceAtomic(ctx, side, baseQty) {
   // USDCx), akun tanpa CC sama sekali tetap sah — dulu cek ini gak bersyarat jadi
   // semua akun ber-fee-USDCx mental di sini dengan pesan "top-up CC" yg menyesatkan.
   const _feeTok = (ctx.feeTokens != null ? ctx.feeTokens : SWAP.feeTokens) || [];
-  const _feeId = _feeTok.length ? feeInstrumentOf(_feeTok[0]) : 'Amulet';
-  if (!holdOf(_feeId).length) {
-    const e = new Error(`gak ada holding ${_feeId} buat bayar fee`);
-    e.insufficientFunds = true; throw e;
+  if (_feeTok.length) {
+    // Coba id terpetakan DULU, lalu simbol mentah — id registry bisa berupa UUID
+    // (USD8) dan pemetaannya bisa basi kalau server ganti. Jangan gagalin swap cuma
+    // gara-gara nama; kalau dua-duanya kosong barulah memang gak punya.
+    const cari = [feeInstrumentOf(_feeTok[0]), String(_feeTok[0])];
+    if (!cari.some(x => holdOf(x).length)) {
+      const e = new Error(`gak ada holding ${_feeTok[0]} buat bayar fee`);
+      e.insufficientFunds = true; throw e;
+    }
+  } else if (!holdOf('Amulet').length) {
+    const e = new Error('gak ada CC buat bayar fee'); e.insufficientFunds = true; throw e;
   }
 
   // 4. Konteks transfer per instrument. Sisi PENGIRIM yang nyetor holding.
   const refs = env.utilityAcceptRefs || [];
-  const refOf = (id) => refs.find(r => String(r.instrumentId).toUpperCase() === String(id).toUpperCase());
+  // instrumentId di utilityAcceptRefs GAK SELALU simbol. Terpantau live di market
+  // cETH-USD8: ref-nya ["cETH", "8694894e-f159-42e1-80c9-ed14b94365b7"] — USD8
+  // terdaftar pakai UUID. Nyocokin lewat simbol doang bikin "utilityAcceptRefs gak
+  // punya USD8" padahal ref-nya ada.
+  // Strategi: cocokin simbol dulu; sisa ref yg gak keklaim otomatis jadi leg satunya
+  // (RFQ selalu 2 leg, jadi eliminasi ini aman).
+  const bySym = (id) => refs.find(r => String(r.instrumentId).toUpperCase() === String(id).toUpperCase());
+  const refBase = bySym(baseId);
+  const refQuote = bySym(quoteId2);
+  const sisa = refs.filter(r => r !== refBase && r !== refQuote);
+  const refFor = (id) => {
+    const direct = bySym(id);
+    if (direct) return direct;
+    if (sisa.length === 1) return sisa[0];   // satu-satunya yg belum keklaim
+    return null;
+  };
   const lp = env.lpPartyId;
   const mkCtx = async (id, amount, weSend) => {
-    const ref = refOf(id);
-    if (!ref) throw new Error(`utilityAcceptRefs gak punya ${id}`);
+    const ref = refFor(id);
+    if (!ref) throw new Error(`utilityAcceptRefs gak punya ${id} (isi: ${refs.map(r => r.instrumentId).join(', ')})`);
     const c = await utilityTransferCtx(sv, {
-      admin: ref.instrumentAdmin, id, amount,
+      // Pakai instrumentId dari REF, bukan simbol — registry ngenalnya lewat id itu.
+      admin: ref.instrumentAdmin, id: ref.instrumentId, amount,
       sender: weSend ? partyId : lp, receiver: weSend ? lp : partyId,
       holdingCids: weSend ? userHoldings.slice(0, 8) : (env.lpInputHoldingCids || []),
       altHoldingCids: weSend ? (env.lpInputHoldingCids || []) : userHoldings.slice(0, 8),
@@ -3634,7 +3673,7 @@ async function settleTerminalProposal(ctx, proposal, consumedSet) {
   }
 
   // 3. getMultiCall + DvpProposal ASLI dari ledger (terms verbatim).
-  const multiCall = await sv.swapAction(A.getMultiCall, ['supa']);
+  const multiCall = await getMultiCallCached(sv);
   if (!multiCall || !multiCall.contractId) throw new Error('getMultiCall gagal');
   let dvp = null, unburied = false, lastCount = 0;
   for (let i = 0; i < SWAP.pollMaxTries; i++) {
@@ -3961,8 +4000,11 @@ function feeUnitNow() { return (SWAP.feeTokens && SWAP.feeTokens[0]) || 'CC'; }
 // "tf-usdt". Kalau dicari pakai "TUSDT" holdingnya gak ketemu dan swap ditolak
 // dgn alasan yg salah. CC -> Amulet juga beda nama.
 // Yg didukung server (diuji): CC, USDCx, TUSDT. USD8 & EDELx ditolak (gak ada quote).
-const FEE_TOKEN_IDS = ['CC', 'USDCx', 'TUSDT'];
-const FEE_TOKEN_INSTRUMENT = { CC: 'Amulet', AMULET: 'Amulet', USDCX: 'USDCx', TUSDT: 'tf-usdt' };
+const FEE_TOKEN_IDS = ['CC', 'USDCx', 'TUSDT', 'USD8'];
+// USD8 kedaftar pakai UUID di registry, bukan simbolnya (kebaca dari settlementFee
+// waktu feeTokens ["USD8"] dan dari utilityAcceptRefs market cETH-USD8). Kalau UUID
+// ini berubah, cocokinnya jatuh ke simbol lewat fallback di holdFeeOf().
+const FEE_TOKEN_INSTRUMENT = { CC: 'Amulet', AMULET: 'Amulet', USDCX: 'USDCx', TUSDT: 'tf-usdt', USD8: '8694894e-f159-42e1-80c9-ed14b94365b7' };
 // Alias umum: nama token di market/menu -> instrumentId di holdings.
 // Bukan cuma urusan fee — menu swap juga perlu, karena CC itu instrument "Amulet"
 // dan TUSDT itu "tf-usdt". Nyari pakai nama menu bikin saldo kebaca 0 padahal ada.
@@ -6771,7 +6813,7 @@ Usage:
         P(`  wallet  : link → ${lr.status} ${JSON.stringify(lr.body).slice(0, 140)}`, lr.ok ? COLOR.green : COLOR.red);
         if (!lr.ok) die('penautan wallet gagal — lihat pesan di atas (409 = party udah nempel di akun lain)');
       }
-      const mc = await sv.swapAction(SWAP.actionIds.getMultiCall, ['supa']);
+      const mc = await getMultiCallCached(sv);
       if (!mc || !mc.contractId) die('getMulticallConfigAction gagal');
       // Guard CC ditaruh SETELAH link: penautan wallet sama sekali gak butuh CC,
       // jadi jangan diblokir cuma karena party-nya masih kosong.
@@ -8007,7 +8049,7 @@ Usage:
         if (sub[0] === 1) {
           // Token fee. Ditulis ke config.json biar kepakai juga pas headless/pm2.
           const now = Array.isArray((CONFIG.swap || {}).feeTokens) ? CONFIG.swap.feeTokens : [];
-          const ket = { CC: 'default — fee dari saldo CC', USDCx: 'fee dari USDCx, CC gak kepotong', TUSDT: 'fee dari TUSDT (instrument tf-usdt)' };
+          const ket = { CC: 'default — fee dari saldo CC', USDCx: 'fee dari USDCx, CC gak kepotong', TUSDT: 'fee dari TUSDT (instrument tf-usdt)', USD8: 'fee dari USD8 (instrument UUID di registry)' };
           const pk = await pickList({
             title: `Token buat bayar settlement fee (sekarang: ${now.length ? now.join(',') : 'CC'}):`,
             items: FEE_TOKEN_IDS.map(t => ({ label: String(t).padEnd(8), detail: paint(ket[t] || '', COLOR.gray) })),
