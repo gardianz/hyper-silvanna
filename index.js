@@ -3567,7 +3567,12 @@ async function swapOnceAtomic(ctx, side, baseQty) {
               : f),
           },
           quoteSignature: env.quoteSignature,
-          ticketCid: q.ticketId ? q.ticketId : null,
+          // ticketCid HARUS ContractId Canton (hex, diawali "00"), sedangkan q.ticketId
+          // kadang berisi UUID/ULID — terpantau di market cETH-USD8: ledger nolak
+          // 'cannot parse ContractId "019ffc5b-43ef-..."'. Field ini nullable, jadi
+          // kalau bentuknya bukan ContractId lebih baik dikosongin daripada dikirim
+          // dan bikin seluruh transaksi ditolak.
+          ticketCid: (typeof q.ticketId === 'string' && /^00[0-9a-f]{16,}$/i.test(q.ticketId)) ? q.ticketId : null,
           lpInputHoldingCids: env.lpInputHoldingCids || [],
           // GABUNGAN holding token yg kita kirim + UTXO CC buat fee. Daml-nya ngambil
           // fee dari "pool" yg sama; kalau CC gak ikut → "no pool holdings for fee
@@ -6677,7 +6682,7 @@ async function runRegister() {
 const argv = process.argv.slice(2);
 // buildSwapClients/SWAP/transferCC ikut diekspor biar bisa diprobe dari skrip luar
 // tanpa nyalain bot (require aman: runMain kegate `require.main === module`).
-module.exports = { balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
+module.exports = { swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
 
 if (require.main === module) {
   if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
