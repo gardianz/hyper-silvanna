@@ -331,6 +331,18 @@ Yang perlu diketahui sebelum mengubahnya:
 - **Swap terakhir menguras habis** — tapi HANYA kalau yang dikirim sisi bukan hub. Kalau yang
   dikirim justru hub, menguras berarti melempar seluruh modal ke token lawan lalu menariknya
   kembali: dua swap raksasa, spread dua kali.
+- **Menguras lewat arah BELI tidak boleh disizing dari harga USD silang.** Saat yang dipegang
+  token quote, `qty` diminta dalam satuan base, dan menghitungnya lewat harga USD kedua token
+  meleset sebesar spread market — terukur di `HECTO-EDELx` melesetnya 1.7 %, jauh di atas
+  bantalan 0.3 %, sehingga LP menagih 1491.67 EDELx padahal saldo 1466.82 dan swap terakhir
+  gagal di 9/10. Sizing memakai **harga eksekusi terakhir di market itu, dikunci per arah**
+  (`memo.px["<market>|buy"]`): harga jual dan harga beli berbeda persis sebesar spread, jadi
+  memakai harga jual untuk menyusun beli overshoot lebih parah lagi (dihitung ulang dengan
+  angka asli: 1525.09 vs 1463.48 yang muat).
+  Cadangannya `e.insufficientBalance` yang membawa `tokenNeeded`/`tokenHave` — rasionya
+  dipakai mengecilkan `qty` secara **persis** lalu langkah diulang (maks 3×). Kegagalan ini
+  terjadi **sebelum penandatanganan**, jadi tidak ada proposal nyangkut dan tidak ada fee
+  terbuang; menggugurkan akun karenanya adalah reaksi yang salah.
 - **Satu swap punya batas waktu** (`strategy1.swapTimeoutSec`, default 240 dtk). Tanpa itu
   RFQ/settle yang diam membekukan akun tanpa satu baris log pun dan dari luar terlihat macet.
   Lewat batas ditandai `transient` sehingga langkah yang sama diulang, bukan akun digugurkan.

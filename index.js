@@ -2497,7 +2497,8 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
   // Kandidat fee dibawa sebagai DAFTAR sampai ke quote — server yg memutuskan.
   // `ctx.s1fee` dipakai bersama antar task: fee yg teramat di task sebelumnya
   // langsung memperbaiki urutan di task berikutnya.
-  const memo = ctx.s1fee || (ctx.s1fee = { usd: {}, jml: {} });
+  const memo = ctx.s1fee || (ctx.s1fee = { usd: {}, jml: {}, px: {} });
+  if (!memo.px) memo.px = {};
   const semua = (Array.isArray(kandidatFee) ? kandidatFee : [kandidatFee]).filter(Boolean);
   let feeTok = semua[0];   // dipakai buat pelaporan; nilai sebenarnya dari quote
 
@@ -2558,7 +2559,7 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
     }
   }
 
-  let langkah = 0, dibatalin = false, alasan = '', gagalProxy = 0;
+  let langkah = 0, dibatalin = false, alasan = '', gagalProxy = 0, gagalSizing = 0, qtyPaksa = 0;
   // Akuntansi biaya.
   //
   // Spread TIDAK diukur dgn menilai tiap swap pakai harga pasar: `getPrice` itu harga
@@ -2636,9 +2637,24 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
     // pakai saldo persisnya (nol sisa); kalau yg dikirim quote, sisakan 0.3% karena
     // harga eksekusi RFQ bisa geser dikit dan kelebihan minta = insufficient funds.
     let qty;
-    if (kurasHabis && deliver === mk.base) qty = floor6(get(mk.base));
-    else if (kurasHabis) qty = floor6((kirimUsd / pxB) * 0.997);
-    else qty = floor6(kirimUsd / pxB);
+    if (kurasHabis && deliver === mk.base) {
+      qty = floor6(get(mk.base));                      // jual habis: jumlahnya persis
+    } else if (kurasHabis) {
+      // Menguras lewat arah BELI: yg kita punya token quote, sementara qty diminta dalam
+      // satuan base. Menghitungnya lewat harga USD silang MELESET sebesar spread market —
+      // di HECTO-EDELx (spread 4%) melesetnya 1.7%, jauh di atas bantalan 0.3%, dan LP
+      // menagih lebih dari yang kita punya. Pakai harga EKSEKUSI terakhir di market yg
+      // sama (dicatat dari quote sebelumnya); itu sudah termasuk spread.
+      // Kunci per ARAH. Harga jual dan harga beli berbeda persis sebesar spread —
+      // memakai harga jual terakhir buat menyusun BELI overshoot sebesar spread penuh
+      // (di HECTO-EDELx 4%), justru kegagalan yang mau dihindari.
+      const pxPasar = memo.px[`${mk.id}|buy`];
+      const punyaQuote = get(mk.quote);
+      qty = pxPasar > 0
+        ? floor6((punyaQuote / pxPasar) * 0.999)
+        : floor6((kirimUsd / pxB) * 0.99);
+    } else qty = floor6(kirimUsd / pxB);
+    if (qtyPaksa > 0) { qty = qtyPaksa; qtyPaksa = 0; }
     log(`  ${st.cur}/${st.tgt} · kirim ${deliver} ~$${kirimUsd.toFixed(2)}${kurasHabis ? ' (terakhir — dikuras habis)' : ''}`);
     // Token fee ditentukan DI SINI, saat quote: kirim daftar kandidat berurutan
     // (termurah dulu, sudah dibuang yg saldonya tak sanggup bayar sekali fee lagi),
@@ -2667,12 +2683,25 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
         await sleep(3000);
         continue;                       // langkah TIDAK dinaikkan: swapnya belum terjadi
       }
+      // "LP ngutip lebih gede dari sizing": errornya membawa butuh/punya, jadi ukurannya
+      // bisa dikoreksi PERSIS, bukan ditebak lagi. Gagal di sini terjadi SEBELUM
+      // penandatanganan, jadi tidak ada proposal nyangkut dan tidak ada fee terbuang —
+      // aman diulang. Dulu ini langsung menggugurkan akun di swap terakhir.
+      if (e && e.insufficientBalance && e.tokenNeeded > 0 && e.tokenHave > 0 && gagalSizing < 3) {
+        gagalSizing++;
+        qtyPaksa = floor6(qty * (e.tokenHave / e.tokenNeeded) * 0.998);
+        log(`  LP minta ${e.tokenNeeded.toFixed(4)} tapi punya ${e.tokenHave.toFixed(4)} — ukuran dikecilin ke ${qtyPaksa} (${gagalSizing}/3)`);
+        continue;                       // langkah TIDAK naik: swapnya belum terjadi
+      }
       if (e && (e.noLiquidity || e.transient)) { log(`  ${(e.message || '').slice(0, 70)} — ulang`); await sleep(5000); langkah++; continue; }
       throw e;
     }
-    gagalProxy = 0;
+    gagalProxy = 0; gagalSizing = 0;
     // Belajar dari fee yg benar-benar ditagih: nilai USD-nya menentukan urutan
     // kandidat berikutnya, jumlahnya menentukan kapan token itu dianggap habis.
+    // Harga eksekusi (quote per base) disimpan per market: dipakai menyusun ukuran
+    // swap kuras berikutnya tanpa menebak lewat harga USD silang.
+    if (hasil && Number.isFinite(hasil.price) && hasil.price > 0) memo.px[`${mk.id}|${hasil.direction}`] = hasil.price;
     if (hasil && hasil.feeSym && Number.isFinite(hasil.feeCC)) {
       const fs = hasil.feeSym.toUpperCase();
       memo.jml[fs] = hasil.feeCC;
