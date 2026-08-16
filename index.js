@@ -2472,7 +2472,7 @@ function s1FeeSiap(kandidat, get, teramatJml) {
 //   swap tengah      : stepUsd   (yg penting tetap di atas minimum order)
 //   swap TERAKHIR    : SELURUH saldo — biar gak nyisain token di token lawan
 async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled) {
-  const { sv, partyId } = ctx;   // ctx di-reassign di bawah buat nyetel batas fee
+  const { partyId } = ctx;   // sv SELALU dibaca lewat ctx.sv — bisa ditukar saat rotasi proxy
   // Kandidat fee dibawa sebagai DAFTAR sampai ke quote — server yg memutuskan.
   // `ctx.s1fee` dipakai bersama antar task: fee yg teramat di task sebelumnya
   // langsung memperbaiki urutan di task berikutnya.
@@ -2485,14 +2485,16 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
   const capUsd = Number(cfg.maxFeeUsd) > 0 ? Number(cfg.maxFeeUsd) : 0;
   if (capUsd > 0) {
     let pxTermurah = 0;
-    for (const t of semua) { const px = await usdPriceOf(sv, t).catch(() => 0); if (px > pxTermurah) pxTermurah = px; }
-    if (pxTermurah > 0) ctx = { ...ctx, maxFeeCC: capUsd / pxTermurah };
+    for (const t of semua) { const px = await usdPriceOf(ctx.sv, t).catch(() => 0); if (px > pxTermurah) pxTermurah = px; }
+    // Ditulis ke objek yang SAMA, bukan clone: kalau ctx diganti objek baru, ctx.rebuild()
+    // milik handler (dipakai saat rotasi proxy) menukar klien di objek yang salah.
+    if (pxTermurah > 0) ctx.maxFeeCC = capUsd / pxTermurah;
   }
   const other = String(mk.base).toUpperCase() === String(hub).toUpperCase() ? mk.quote : mk.base;
   const bukanHub = ![mk.base, mk.quote].some(x => String(x).toUpperCase() === String(hub).toUpperCase());
 
   const bacaTask = async () => {
-    const t = await sv.earnTasks(partyId).catch(() => null);
+    const t = await ctx.sv.earnTasks(partyId).catch(() => null);
     const it = s1FindTask(t, task.code);
     return it ? s1Progress(it, task.target) : null;
   };
@@ -2512,13 +2514,13 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
   // Task yg gak nyentuh hub (mis. HECTO-EDELx saat hub cETH): danai dulu dari hub.
   if (bukanHub) {
     const get = await saldo();
-    const pxSeed = await usdPriceOf(sv, mk.base);
+    const pxSeed = await usdPriceOf(ctx.sv, mk.base);
     const punyaUsd = pxSeed > 0 ? get(mk.base) * pxSeed : 0;
     if (punyaUsd < Number(cfg.seedUsd)) {
       // Dana hub harus cukup DULU. Tanpa cek ini swap seed-nya berangkat lalu
       // ditolak insufficient funds, dan akun kosong bikin seluruh strategi
       // dilaporin gagal padahal cuma kurang modal.
-      const pxHub = await usdPriceOf(sv, hub);
+      const pxHub = await usdPriceOf(ctx.sv, hub);
       const hubUsd = pxHub > 0 ? get(hub) * pxHub : 0;
       if (hubUsd < Number(cfg.seedUsd)) {
         log(`saldo ${hub} cuma $${hubUsd.toFixed(2)}, butuh $${cfg.seedUsd} buat danai ${mk.base} — task dilewati`);
@@ -2535,7 +2537,7 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
     }
   }
 
-  let langkah = 0, dibatalin = false, alasan = '';
+  let langkah = 0, dibatalin = false, alasan = '', gagalProxy = 0;
   // Akuntansi biaya.
   //
   // Spread TIDAK diukur dgn menilai tiap swap pakai harga pasar: `getPrice` itu harga
@@ -2558,28 +2560,49 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
   // market lain. Harga di-snapshot sekali supaya gerak pasar gak kebaca sebagai biaya.
   const tokenTerlibat = [...new Set([hub, mk.base, mk.quote].map(x => String(x)))];
   const pxSnap = {};
-  for (const t of tokenTerlibat) pxSnap[t] = await usdPriceOf(sv, t).catch(() => 0);
+  for (const t of tokenTerlibat) pxSnap[t] = await usdPriceOf(ctx.sv, t).catch(() => 0);
   const nilaiTotal = (get) => tokenTerlibat.reduce((a2, t) => a2 + get(t) * (pxSnap[t] || 0), 0);
   const totalAwal = nilaiTotal(getAwal);
   const maxLangkah = (st.tgt - st.cur) + 8;   // ruang buat retry, bukan loop tanpa batas
-  while (st.cur < st.tgt && langkah < maxLangkah) {
+  let putaran = 0;   // pengaman terpisah: retry proxy tidak menaikkan `langkah`
+  while (st.cur < st.tgt && langkah < maxLangkah && putaran++ < maxLangkah * 4) {
     if (isCancelled && isCancelled()) { log('distop user — saldo tetap dibalikin ke hub dulu'); dibatalin = true; break; }
     const get = await saldo();
-    // Kirim token yg saldonya paling gede di antara dua sisi market.
-    const pxB = await usdPriceOf(sv, mk.base), pxQ = await usdPriceOf(sv, mk.quote);
+    const pxB = await usdPriceOf(ctx.sv, mk.base), pxQ = await usdPriceOf(ctx.sv, mk.quote);
     const valB = get(mk.base) * pxB, valQ = get(mk.quote) * pxQ;
-    const deliver = valB >= valQ ? mk.base : mk.quote;
-    const pxD = deliver === mk.base ? pxB : pxQ;
-    const punyaUsd = Math.max(valB, valQ);
-    if (!(pxD > 0)) throw new Error(`harga USD ${deliver} gak kebaca`);
-
+    const rfqMin = Math.max(0, Number(M8.rfqMinUsd) || 10);
     const sisa = st.tgt - st.cur;
     const terakhir = sisa <= 1;
-    const targetUsd = langkah === 0 ? Number(cfg.firstUsd) : Number(cfg.stepUsd);
-    let kirimUsd = terakhir ? punyaUsd : Math.min(targetUsd, punyaUsd);
-    if (!terakhir && kirimUsd < Number(cfg.stepUsd) && punyaUsd >= Number(cfg.stepUsd)) kirimUsd = Number(cfg.stepUsd);
 
-    const rfqMin = Math.max(0, Number(M8.rfqMinUsd) || 10);
+    // Pemilihan arah. Aturan lama "kirim sisi yang saldonya paling besar" bikin bot
+    // MENUMPUK: modal $94 semuanya di hub, tiap beli cuma memindah $12, jadi hub tetap
+    // lebih besar sampai sisi lawan melewati separuh — terlihat sebagai 4x beli
+    // berturut-turut, lalu posisi lawan menggunung ~$50 dan harus dikuras di swap
+    // terakhir. Spread itu proporsional, jadi menguras $50 memang mahal.
+    //
+    // Aturan sekarang: tahan posisi lawan seukuran SATU langkah saja — kalau sisi bukan
+    // hub sudah cukup untuk diswap, jual balik; kalau belum, beli. Hasilnya beli-jual
+    // bergantian, jumlah swap sama persis, tapi yang tersisa di akhir jauh lebih kecil.
+    let deliver;
+    if (!bukanHub) {
+      const valNon = other === mk.base ? valB : valQ;
+      deliver = valNon >= rfqMin ? other : hub;
+    } else {
+      // Dua-duanya bukan hub (HECTO-EDELx): tidak ada sisi "pulang", pakai yg lebih besar.
+      deliver = valB >= valQ ? mk.base : mk.quote;
+    }
+    const pxD = deliver === mk.base ? pxB : pxQ;
+    const punyaUsd = deliver === mk.base ? valB : valQ;
+    if (!(pxD > 0)) throw new Error(`harga USD ${deliver} gak kebaca`);
+
+    // Swap terakhir menguras habis HANYA kalau yang dikirim sisi bukan hub — di situ
+    // menguras sekaligus memulangkan dana. Kalau yang dikirim justru hub, menguras
+    // berarti melempar SELURUH modal ke token lawan dan harus ditarik balik lagi:
+    // dua swap raksasa, spread dua kali. Jadi tetap seukuran langkah biasa.
+    const kurasHabis = terakhir && (bukanHub || deliver !== hub);
+    const targetUsd = langkah === 0 ? Number(cfg.firstUsd) : Number(cfg.stepUsd);
+    let kirimUsd = kurasHabis ? punyaUsd : Math.min(targetUsd, punyaUsd);
+    if (!kurasHabis && kirimUsd < Number(cfg.stepUsd) && punyaUsd >= Number(cfg.stepUsd)) kirimUsd = Number(cfg.stepUsd);
     if (kirimUsd < rfqMin) {
       log(`sisa ${deliver} cuma $${punyaUsd.toFixed(2)} — di bawah minimum $${rfqMin}, task dihentikan (dust dibiarkan)`);
       alasan = langkah ? `sisa $${punyaUsd.toFixed(2)} < min $${rfqMin}` : `modal kurang ($${punyaUsd.toFixed(2)})`;
@@ -2592,10 +2615,10 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
     // pakai saldo persisnya (nol sisa); kalau yg dikirim quote, sisakan 0.3% karena
     // harga eksekusi RFQ bisa geser dikit dan kelebihan minta = insufficient funds.
     let qty;
-    if (terakhir && deliver === mk.base) qty = floor6(get(mk.base));
-    else if (terakhir) qty = floor6((kirimUsd / pxB) * 0.997);
+    if (kurasHabis && deliver === mk.base) qty = floor6(get(mk.base));
+    else if (kurasHabis) qty = floor6((kirimUsd / pxB) * 0.997);
     else qty = floor6(kirimUsd / pxB);
-    log(`  ${st.cur}/${st.tgt} · kirim ${deliver} ~$${kirimUsd.toFixed(2)}${terakhir ? ' (terakhir — semua)' : ''}`);
+    log(`  ${st.cur}/${st.tgt} · kirim ${deliver} ~$${kirimUsd.toFixed(2)}${kurasHabis ? ' (terakhir — dikuras habis)' : ''}`);
     // Token fee ditentukan DI SINI, saat quote: kirim daftar kandidat berurutan
     // (termurah dulu, sudah dibuang yg saldonya tak sanggup bayar sekali fee lagi),
     // server memilih yg pertama didukung market ini.
@@ -2611,15 +2634,28 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
     try {
       hasil = await s1Swap(ctx, mk, deliver, qty, siap);
     } catch (e) {
+      // Proxy mati/diblokir itu masalah JARINGAN, bukan masalah akun. Dulu langsung
+      // dilempar ke atas sehingga satu timeout menggugurkan seluruh akun di tengah task
+      // (kejadian: 7/10 lalu "GAGAL: proxy connect timeout"). Sekarang IP dirotasi,
+      // klien dibangun ulang, dan langkah yang sama diulang — bukan dilewati.
+      if (isProxyErr(e) || isIpBlockErr(e)) {
+        gagalProxy++;
+        if (gagalProxy > 5) { log(`  proxy gagal ${gagalProxy}x berturut — menyerah`); throw e; }
+        log(`  ${(e.message || '').slice(0, 50)} — rotasi proxy (${gagalProxy}/5), ulangi langkah ini`);
+        if (typeof ctx.rebuild === 'function') { await ctx.rebuild().catch(er => log(`  rebuild gagal: ${(er.message || '').slice(0, 40)}`)); }
+        await sleep(3000);
+        continue;                       // langkah TIDAK dinaikkan: swapnya belum terjadi
+      }
       if (e && (e.noLiquidity || e.transient)) { log(`  ${(e.message || '').slice(0, 70)} — ulang`); await sleep(5000); langkah++; continue; }
       throw e;
     }
+    gagalProxy = 0;
     // Belajar dari fee yg benar-benar ditagih: nilai USD-nya menentukan urutan
     // kandidat berikutnya, jumlahnya menentukan kapan token itu dianggap habis.
     if (hasil && hasil.feeSym && Number.isFinite(hasil.feeCC)) {
       const fs = hasil.feeSym.toUpperCase();
       memo.jml[fs] = hasil.feeCC;
-      const pxf = await usdPriceOf(sv, hasil.feeSym).catch(() => 0);
+      const pxf = await usdPriceOf(ctx.sv, hasil.feeSym).catch(() => 0);
       if (pxf > 0) memo.usd[fs] = hasil.feeCC * pxf;
       feeTok = hasil.feeSym;
     }
@@ -2657,7 +2693,7 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
   for (const t of semua) {
     const dipakai = Math.max(0, (feeAwal[t] || 0) - getAkhir(t));
     if (dipakai <= 1e-9) continue;
-    const px = await usdPriceOf(sv, t).catch(() => 0);
+    const px = await usdPriceOf(ctx.sv, t).catch(() => 0);
     feePakai.push({ tok: t, jml: dipakai, usd: px > 0 ? dipakai * px : null });
     if (px > 0) feeUsd += dipakai * px;
   }
@@ -8696,9 +8732,18 @@ Usage:
             if (!usc) { const pty = await clients.sv.recoverParty(clients.partyId).catch(() => null); if (pty) { usc = pty.userServiceCid; patchAcctSession(a.email, { userServiceCid: usc }); } }
             if (!usc) throw new Error('userServiceCid gak ada — party belum onboard?');
             const segar = (get) => { if (get && get.raw) st2.balances = get.raw; };
+            // Dipakai s1RunTask waktu kena proxy timeout / IP diblokir: ganti IP lalu
+            // tukar klien DI OBJEK ctx YANG SAMA, supaya swap berikutnya pakai koneksi
+            // baru tanpa mengulang task dari awal.
+            const rebuild = async () => {
+              rotateProxy(a.email);
+              const c2 = await buildSwapClients(st2);
+              Object.assign(ctx, c2);
+            };
             const ctx = {
               ...clients, email: a.email, label: tag, userServiceCid: usc, minUsd: M8.minUsd,
               log: () => { },
+              rebuild: () => rebuild(),
               onProgress: (p) => {
                 st2.s1.task = String(p.task || '').replace(/_DAY_TRADER$/, '');
                 st2.s1.cur = p.cur != null ? p.cur : st2.s1.cur;

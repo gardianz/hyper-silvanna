@@ -319,7 +319,25 @@ Yang perlu diketahui sebelum mengubahnya:
 - **`maxFeeCC` satuannya ikut token fee**, sehingga batas 5 (wajar untuk CC yang fee-nya
   ~6.66) sama sekali tidak mengikat untuk TUSDT yang fee-nya ~0.15. `strategy1.maxFeeUsd`
   dipatok dalam USD lalu dikonversi ke satuan token terpilih di awal tiap task.
-- **Swap terakhir menguras habis.** Saat sisa target tinggal 1 (9/10), seluruh saldo
+- **Arah swap: tahan posisi lawan seukuran satu langkah, jangan menumpuk.** Aturan naif
+  "kirim sisi yang saldonya paling besar" membuat bot membeli berkali-kali berturut-turut
+  (modal $94 di hub, tiap beli hanya memindah $12, jadi hub tetap lebih besar sampai sisi
+  lawan melewati separuh — terlihat 4x beli beruntun), lalu meninggalkan ~$50 di token lawan
+  yang harus dipulangkan lewat satu swap tambahan. Aturan sekarang: jual balik begitu sisi
+  bukan hub sudah di atas `rfqMinUsd`, kalau belum baru beli — hasilnya beli/jual bergantian.
+  Jumlah swap tugas sama, tapi volume turun $172 → $124 per task dan swap pemulangan hilang:
+  terhitung **$0.93/akun/hari** lebih murah pada dua task yang menyentuh hub. Task yang kedua
+  sisinya bukan hub (HECTO-EDELx) tetap memakai aturan sisi terbesar — tidak ada sisi "pulang".
+- **Swap terakhir menguras habis** — tapi HANYA kalau yang dikirim sisi bukan hub. Kalau yang
+  dikirim justru hub, menguras berarti melempar seluruh modal ke token lawan lalu menariknya
+  kembali: dua swap raksasa, spread dua kali.
+- **Error proxy bukan alasan menggugurkan akun.** `proxy connect timeout` / IP diblokir
+  dirotasi (`rotateProxy`) lalu klien dibangun ulang lewat `ctx.rebuild()` dan langkah yang
+  sama diulang — `langkah` sengaja tidak dinaikkan karena swapnya belum terjadi. Sebelumnya
+  satu timeout mematikan akun di tengah task (terlihat sebagai "7/10 lalu GAGAL").
+  Karena itu `ctx` tidak boleh di-clone di dalam `s1RunTask` dan `sv` selalu dibaca lewat
+  `ctx.sv`: kalau tidak, rebuild menukar klien di objek yang salah dan retry-nya sia-sia.
+- **Detail lama swap terakhir.** Saat sisa target tinggal 1 (9/10), seluruh saldo
   dilepas: kalau yang dikirim base dipakai saldo persisnya sehingga benar-benar nol; kalau
   yang dikirim quote disisakan 0.3% karena harga eksekusi RFQ bisa bergeser dan meminta
   lebih dari yang dipunya berakhir insufficient funds. Sisa di bawah `rfqMinUsd` dibiarkan
