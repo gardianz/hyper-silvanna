@@ -3389,6 +3389,19 @@ async function swapOnceAtomic(ctx, side, baseQty) {
     const e = new Error(`requestQuotesV2: ${(rq && (rq.error || rq.message)) || 'gak ada quote'}`); e.noLiquidity = true; throw e;
   }
   // quoteQuantity terbaik: sell → paling BANYAK diterima; buy → paling SEDIKIT dibayar.
+  // Kuotasi BERTIKET dibuang. Kalau quote.ticketId keisi, Daml WAJIB dikasih
+  // ticketCid (ContractId tiketnya), dan kita gak punya cara dapetin kontrak itu —
+  // hasilnya ditolak "quote requires a ticket". Capture UI nunjukkin swap yg sukses
+  // selalu ticketId kosong + ticketCid null, jadi kuotasi tanpa tiket emang normal
+  // dan cukup dilewatin yg bertiket.
+  const adaTiket = quotes.filter(x => x && x.ticketId);
+  if (adaTiket.length) log(`${adaTiket.length} quote bertiket dilewati (butuh ticketCid yg gak bisa kita dapetin)`);
+  const bebasTiket = quotes.filter(x => !(x && x.ticketId));
+  if (!bebasTiket.length) {
+    const e = new Error(`semua ${quotes.length} quote bertiket — gak bisa disettle`);
+    e.noLiquidity = true; throw e;
+  }
+  quotes.length = 0; quotes.push(...bebasTiket);
   quotes.sort((a, b) => side === 'sell' ? Number(b.quoteQuantity) - Number(a.quoteQuantity) : Number(a.quoteQuantity) - Number(b.quoteQuantity));
 
   // 2. Accept → envelope bertanda tangan LP. LP kadang OVER-QUOTE (nawarin lebih dari
