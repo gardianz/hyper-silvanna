@@ -2260,6 +2260,31 @@ function prompt(question) {
   });
 }
 
+// Tunggu yg BISA DIBATALIN: tekan q (atau Esc) buat berhenti, Ctrl+C keluar.
+// Dipakai waktu nungguin fee turun — user gak boleh kejebak nunggu tanpa jalan keluar.
+function sleepInterruptible(ms) {
+  if (!process.stdin.isTTY) return sleep(ms).then(() => 'timeout');
+  try { if (_rl) { _rl.close(); _rl = null; } } catch (_) { }
+  return new Promise((resolve) => {
+    let done = false;
+    const cleanup = () => {
+      try { process.stdin.setRawMode(false); } catch (_) { }
+      process.stdin.removeListener('keypress', onKey);
+      process.stdin.pause();
+    };
+    const finish = (v) => { if (done) return; done = true; clearTimeout(t); cleanup(); resolve(v); };
+    const onKey = (str, key) => {
+      if (key && key.ctrl && key.name === 'c') { cleanup(); process.stdout.write('\n' + paint('bye 👋', COLOR.gray) + '\n'); process.exit(0); }
+      if (str === 'q' || str === 'Q' || (key && key.name === 'escape')) finish('cancel');
+    };
+    const t = setTimeout(() => finish('timeout'), ms);
+    readline.emitKeypressEvents(process.stdin);
+    try { process.stdin.setRawMode(true); } catch (_) { }
+    process.stdin.resume();
+    process.stdin.on('keypress', onKey);
+  });
+}
+
 // Pilih pasangan token DUA TAHAP: token asal dulu, baru token tujuan yg beneran
 // punya market sama dia. Lebih enak daripada nyodorin belasan "EDELx-cETH" mentah
 // yg maksa user mikir sendiri mana base mana quote.
@@ -7854,8 +7879,35 @@ Usage:
           process.stdout.write('\n' + paint(`⚠ ${amountRaw} ${pr.from} ≈ $${nilaiUsd.toFixed(2)} — di bawah minimum order $${rfqMin} yg terukur di market lain.`, COLOR.yellow) + '\n');
           process.stdout.write(paint(`  Kalau market ini ikut aturan yg sama, server bakal nolak (butuh ~${perlu} ${pr.from}). Lanjut kalau mau tetap coba.\n`, COLOR.gray));
         }
+        // FEE SEKARANG: kutip sekali biar user tau angkanya sebelum mutusin.
+        const feeUnit = (SWAP.feeTokens && SWAP.feeTokens[0]) || 'CC';
+        const feeCap = effFeeCap(null);
+        let feeNow = null;
+        try {
+          const probeQty = side === 'sell' ? Number(amountRaw) : null;
+          const rq0 = await sv0.swapAction(SWAP.actionIds.requestQuotesV2, [{
+            partyId: (await buildSwapClients(states[pilih[0]])).partyId,
+            marketId: pr.market, direction: side,
+            quantity: String(probeQty && probeQty > 0 ? probeQty : 1),
+            ...(SWAP.feeTokens && SWAP.feeTokens.length ? { feeTokens: SWAP.feeTokens } : {}),
+          }]).catch(() => null);
+          const f0 = rq0 && rq0.quotes && rq0.quotes[0] && rq0.quotes[0].settlementFee;
+          if (f0) feeNow = Number(f0.amount);
+        } catch (_) { }
+        process.stdout.write('\n' + paint(`Fee sekarang: ${feeNow != null ? feeNow + ' ' + feeUnit : '(gak kebaca)'}  ·  batas: ${feeCap} ${feeUnit}`, feeNow != null && feeNow > feeCap ? COLOR.yellow : COLOR.cyan) + '\n');
+        const modePk = await pickList({
+          title: 'Kalau fee di atas batas, mau gimana?',
+          items: [
+            { label: 'Tunggu turun', detail: paint('ulangi terus sampai fee ≤ batas · tekan q buat stop', COLOR.gray) },
+            { label: 'Bypass batas', detail: paint(`jalan berapa pun fee-nya (plafon mutlak ${SWAP.hardMaxFeeCC} tetap berlaku)`, COLOR.gray) },
+            { label: 'Stop kalau lewat', detail: paint('gagalkan akun itu, lanjut ke akun berikutnya', COLOR.gray) },
+          ],
+        });
+        if (!modePk.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
+        const feeMode = ['wait', 'bypass', 'stop'][modePk[0]];
+
         process.stdout.write('\n' + paint('─'.repeat(64), COLOR.yellow) + '\n');
-        process.stdout.write(paint(`SWAP 1x — ${pilih.length} akun · ${amountRaw} ${pr.from}${nilaiUsd != null ? ` (~$${nilaiUsd.toFixed(2)})` : ''} → ${pr.to} · fee ${(SWAP.feeTokens && SWAP.feeTokens[0]) || 'CC'}`, COLOR.bold + COLOR.red) + '\n');
+        process.stdout.write(paint(`SWAP 1x — ${pilih.length} akun · ${amountRaw} ${pr.from}${nilaiUsd != null ? ` (~$${nilaiUsd.toFixed(2)})` : ''} → ${pr.to} · fee ${feeUnit} (${feeMode === 'wait' ? 'tunggu turun' : feeMode === 'bypass' ? 'bypass batas' : 'stop kalau lewat'})`, COLOR.bold + COLOR.red) + '\n');
         process.stdout.write(paint('─'.repeat(64), COLOR.yellow) + '\n');
         const conf = (await prompt(paint('Ketik "swap" buat jalan, Enter buat batal: ', COLOR.bold + COLOR.yellow))).trim().toLowerCase();
         if (conf !== 'swap') { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
@@ -7899,7 +7951,23 @@ Usage:
             }
             if (!(qty > 0)) throw new Error('jumlah hasil hitung nol');
             const ctx = { ...clients, email: a.email, label: tag, userServiceCid, leg, minUsd: M8.minUsd, log: (m) => process.stdout.write(paint(`  [${tag}] ${m}\n`, COLOR.gray)) };
-            const r = await swapOnceAtomic(ctx, side, fmt10(String(qty)));
+            if (feeMode === 'bypass') ctx.maxFeeCC = Infinity;   // plafon mutlak tetap nempel
+            let r = null, batalUser = false;
+            for (let att = 1; ; att++) {
+              try { r = await swapOnceAtomic(ctx, side, fmt10(String(qty))); break; }
+              catch (e) {
+                // Fee di atas batas + mode tunggu → ulangi sampai turun. Bisa distop q.
+                if (e && e.feeSpike && feeMode === 'wait') {
+                  const w = Math.max(15, Number(SWAP.feeSpikeWaitSec) || 60);
+                  process.stdout.write(paint(`  [${tag}] fee ${e.feeCC} > batas ${feeCap} ${feeUnit} — tunggu ${w}s lalu coba lagi (#${att}) · tekan q buat stop`, COLOR.yellow) + '\n');
+                  const res = await sleepInterruptible(w * 1000);
+                  if (res === 'cancel') { batalUser = true; break; }
+                  continue;
+                }
+                throw e;
+              }
+            }
+            if (batalUser) { process.stdout.write(paint(`  ⊘ ${tag} — distop user pas nunggu fee`, COLOR.gray) + '\n'); break; }
             if (r && r.ok) { ok++; process.stdout.write(paint(`  ✓ ${tag} — ${qty} ${pr.base} (${side}) fee ${r.feeCC}`, COLOR.green) + '\n'); }
             else { gagal++; process.stdout.write(paint(`  ✗ ${tag} — gagal tanpa keterangan`, COLOR.red) + '\n'); }
           } catch (e) { gagal++; process.stdout.write(paint(`  ✗ ${tag} — ${(e && e.message) || e}`, COLOR.red) + '\n'); }
