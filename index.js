@@ -4537,10 +4537,19 @@ function renderAccountsTable(states) {
     { title: 'FEE/SN', prio: 2, cap: 11, cell: s => [fmtSeason(s.feeSeason), COLOR.mag] },
     // Kolom fee token NON-CC cuma nongol kalau emang ada — biar layout lama gak
     // berubah buat akun yg fee-nya masih CC.
-    ...((Array.isArray(states) && states.some(x => Number(x && x.feeTokSeason) > 0))
-      ? [{ title: 'FEE-TOK', prio: 2, cap: 12, cell: s => [Number(s.feeTokSeason) > 0 ? `${fmtSeason(s.feeTokSeason)} ${s.feeTokUnit || ''}`.trim() : '-', Number(s.feeTokSeason) > 0 ? COLOR.cyan : COLOR.gray] }]
-      : []),
-    { title: 'LOSS$/hr', prio: 3, cap: 9, cell: s => [Number(s.spreadToday) > 0 ? '$' + Number(s.spreadToday).toFixed(2) : '$0', COLOR.red] },
+    // FEE-TOK (fee non-CC season) cuma relevan di engine yg fee-nya campur CC + token.
+    // Di strategi 1 kolom FEE/hr sudah menampilkan ember token yg sama, jadi FEE-TOK
+    // cuma mengulang informasi; tempatnya dipakai SPREAD/HARI — biaya spread hari ini,
+    // yg sebelumnya ada di LOSS$/hr tapi prio 3 sehingga hampir selalu kedrop duluan.
+    ...(SESSION_ENGINE === 'strategi1'
+      ? [{ title: 'SPREAD/HARI', prio: 2, cap: 11, cell: s => [Number(s.spreadToday) > 0 ? '$' + Number(s.spreadToday).toFixed(2) : '$0', COLOR.red] }]
+      : ((Array.isArray(states) && states.some(x => Number(x && x.feeTokSeason) > 0))
+        ? [{ title: 'FEE-TOK', prio: 2, cap: 12, cell: s => [Number(s.feeTokSeason) > 0 ? `${fmtSeason(s.feeTokSeason)} ${s.feeTokUnit || ''}`.trim() : '-', Number(s.feeTokSeason) > 0 ? COLOR.cyan : COLOR.gray] }]
+        : [])),
+    // Di strategi 1 angka ini sudah tampil sebagai SPREAD/HARI; jangan dobel.
+    ...(SESSION_ENGINE === 'strategi1' ? [] : [
+      { title: 'LOSS$/hr', prio: 3, cap: 9, cell: s => [Number(s.spreadToday) > 0 ? '$' + Number(s.spreadToday).toFixed(2) : '$0', COLOR.red] },
+    ]),
     // LOSS SEASON = total spread loss USD seumur season (mirror SEASON fee). Reset barengan.
     { title: 'LOSS/SN', prio: 2, cap: 11, cell: s => [Number(s.spreadSeason) > 0 ? '$' + fmtSeason(s.spreadSeason) : '$0', COLOR.red] },
     { title: 'SILV', prio: 2, cap: 8, cell: s => expParts(s.silvanaExpMs) },

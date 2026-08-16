@@ -426,6 +426,12 @@ Empat kolom itu dipakai bersama semua engine dan gampang disalahartikan:
 | `FEE-TOK` | fee **non-CC** season (TUSDT/USD8) + satuannya | manual, sama |
 | `LOSS$/hr` / `LOSS/SN` | spread USD harian / season | 07:00 WIB / manual |
 
+Di `strategi1` susunannya berbeda: `FEE-TOK` dibuang (isinya sudah sama dengan `FEE/hr` yang
+di mode itu menampilkan ember token), tempatnya dipakai `SPREAD/HARI` = `spreadToday`.
+Kolom itu memang sudah ada sebagai `LOSS$/hr`, tapi prionya 3 sehingga hampir selalu didrop
+duluan saat terminal sempit; di `strategi1` ia naik ke prio 2 dan `LOSS$/hr` disembunyikan
+supaya tidak dobel.
+
 `persistDaily` memisahkan ember CC (`feeToday`/`feeSeason`) dari ember non-CC
 (`feeTokToday`/`feeTokSeason` + `feeTokUnit`) supaya angkanya tidak tertimbun jadi satu.
 Konsekuensinya: strategi 1 membayar TUSDT/USD8, jadi kolom CC-nya **selalu 0** dan yang
