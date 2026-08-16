@@ -4422,7 +4422,7 @@ function statusInfo(state) {
   const d = state.dayTrader;
   const o = state.overcap;
   if (SESSION_ENGINE === 'strategi1' && state.s1) {
-    const m = { tunggu: ['○ Antre', COLOR.gray], jalan: ['● Swap', COLOR.yellow], selesai: ['● Selesai', COLOR.green], lewat: ['● Lewat', COLOR.gray], batal: ['● Batal', COLOR.yellow], gagal: ['● Error', COLOR.red] };
+    const m = { tunggu: ['○ Antre', COLOR.gray], nunggu: ['◷ Tunggu', COLOR.cyan], jalan: ['● Swap', COLOR.yellow], selesai: ['● Selesai', COLOR.green], lewat: ['● Lewat', COLOR.gray], batal: ['● Batal', COLOR.yellow], gagal: ['● Error', COLOR.red] };
     if (m[state.s1.status]) return m[state.s1.status];
   }
   if (state.status === 'error') return ['● Error', COLOR.red];
@@ -8784,7 +8784,7 @@ Usage:
         // SAMA dengan mode ping-pong: render() = header + tabel COLS + footer + panel log
         // per akun (↑/↓ ganti akun). Bukan tabel bikinan sendiri — supaya perilakunya
         // (drop kolom saat sempit, sorot baris, nav log) persis sama.
-        const mkAll = await fetchMarkets((await buildSwapClients(states[pilihAkun[0]])).sv);
+        let mkAll = await fetchMarkets((await buildSwapClients(states[pilihAkun[0]])).sv);
         SESSION_ENGINE = 'strategi1';
         S1TOKENS = [...new Set([hub, ...tasks.flatMap(t => String(t.market).split('-')), ...kandidatUrut].map(String))];
         // Dashboard cuma menampilkan akun yg dipilih — kalau semua akun ikut, barisnya
@@ -8802,6 +8802,24 @@ Usage:
         const timerUI = setInterval(() => render(global.__states), 1000);
 
         const conc = Math.max(1, Number((CONFIG.swap || {}).loginConcurrency) || 5);
+        // Task earn-hub RESET tiap hari 07:00 WIB, jadi strategi ini pekerjaan harian:
+        // selesai satu putaran bukan berarti berhenti, tapi menunggu reset berikutnya.
+        // Token Silvana/Privy umurnya ~1 jam sedangkan tunggunya belasan jam — makanya
+        // keep-alive & refresh token ikut jalan selama menunggu, kalau tidak putaran
+        // besok mulai dengan sesi mati.
+        const KA_MS = Math.max(60, Number((CONFIG.dashboard || {}).keepAliveSec) || 120) * 1000;
+        const TW_MS = Math.max(15, Number((CONFIG.dashboard || {}).tokenWatchSec) || 30) * 1000;
+        const timerKA = setInterval(() => { keepAliveAll(dstates).catch(() => { }); }, KA_MS);
+        const timerTW = setInterval(() => { refreshExpiringTokens(dstates).catch(() => { }); }, TW_MS);
+        let putaranHari = 0;
+        for (; ;) {
+        putaranHari++;
+        if (putaranHari > 1) {
+          for (const st3 of dstates) st3.s1 = { status: 'tunggu', taskIdx: 0, taskTotal: tasks.length, swap: 0, cur: 0, tgt: 0 };
+          // Daftar market bisa berubah antar hari (market baru / dinonaktifkan).
+          mkAll = await fetchMarkets((await buildSwapClients(states[pilihAkun[0]])).sv).catch(() => mkAll);
+          logActivity(`putaran ${putaranHari} mulai — task harian sudah reset`, COLOR.cyan);
+        }
         let sukses = 0, gagal = 0;
         await mapLimit(pilihAkun, conc, async (i) => {
           const a = ACCOUNTS[i], tag = a.label || a.email;
@@ -8877,10 +8895,32 @@ Usage:
           }
           st2.s1.jalan = false;
         });
+        logActivity(`putaran ${putaranHari} selesai — ${sukses} akun beres, ${gagal} gagal`, gagal ? COLOR.yellow : COLOR.green);
+        if (batal.cancelled()) break;
+
+        // Tunggu sampai jadwal harian berikutnya (schedule.hour/minute, default 07:00 WIB
+        // = jam reset task). Ditunggu potong-potong supaya q tetap responsif dan sisa
+        // waktunya kelihatan di dashboard, bukan satu sleep panjang yang membisu.
+        const jamJadwal = `${String(SCHED.hour).padStart(2, '0')}:${String(SCHED.minute).padStart(2, '0')}`;
+        let sisaMs = msUntilNext(Number(SCHED.hour) || 7, Number(SCHED.minute) || 0, SCHED.timezone || 'Asia/Jakarta');
+        logActivity(`nunggu reset task berikutnya ${jamJadwal} ${SCHED.timezone || 'Asia/Jakarta'} — ${Math.round(sisaMs / 60000)} menit lagi · q buat berhenti`, COLOR.cyan);
+        const habisPada = Date.now() + sisaMs;
+        while (Date.now() < habisPada) {
+          if (batal.cancelled()) break;
+          const sisa = habisPada - Date.now();
+          const j = Math.floor(sisa / 3600000), m = Math.floor(sisa / 60000) % 60;
+          for (const st3 of dstates) { st3.s1.status = 'nunggu'; st3.s1.task = `${j}j${String(m).padStart(2, '0')}m lagi`; st3.s1.jalan = false; }
+          await sleep(Math.min(30000, Math.max(1000, sisa)));
+        }
+        if (batal.cancelled()) break;
+        }
+
         clearInterval(timerUI);
+        clearInterval(timerKA);
+        clearInterval(timerTW);
         batal.stop();
         render(global.__states);
-        process.stdout.write('\n' + paint(`strategi selesai — ${sukses} akun beres, ${gagal} gagal`, gagal ? COLOR.yellow : COLOR.green) + '\n');
+        process.stdout.write('\n' + paint('strategi dihentikan', COLOR.yellow) + '\n');
         global.__states = null;
         SESSION_ENGINE = 'daytrader';
         await prompt(paint('Enter buat balik ke menu…', COLOR.gray));

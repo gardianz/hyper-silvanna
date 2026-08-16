@@ -366,6 +366,14 @@ Yang perlu diketahui sebelum mengubahnya:
 Biaya terukur satu putaran penuh 3 task pada satu akun: 29 swap, fee 4.35 TUSDT (29 × 0.15,
 flat), modal cETH susut $77.70 → $73.48 termasuk spread. Durasi ~21 menit.
 
+Menu 1 **tidak berhenti** setelah semua task penuh: task earn-hub reset tiap hari 07:00 WIB,
+jadi setelah satu putaran bot menunggu sampai `schedule.hour`/`minute` berikutnya lalu jalan
+lagi. Yang harus ikut hidup selama menunggu adalah `keepAliveAll` dan `refreshExpiringTokens`
+— token Silvana/Privy umurnya ~1 jam sedangkan tunggunya belasan jam, jadi tanpa itu putaran
+besok mulai dengan sesi mati. Tunggunya dipotong 30 detikan supaya `q` tetap responsif dan
+sisa waktunya tampil di kolom TASK; satu `sleep` panjang membuat dashboard membisu dan tidak
+bisa dihentikan. Daftar market di-fetch ulang tiap putaran karena bisa berubah antar hari.
+
 Akun dijalankan **paralel** (`swap.loginConcurrency`) dan progresnya tampil di dashboard yang
 **sama persis** dengan mode ping-pong: `SESSION_ENGINE = 'strategi1'` lalu `render(states)` —
 `renderHeader` + `renderAccountsTable` + `renderFooter` + `renderActivityLog`. Jangan bikin
