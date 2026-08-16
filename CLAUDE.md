@@ -291,6 +291,74 @@ That is why `cleanup` used to report 0 forever while early-stage settlements pil
 &lt; 5 (`SETTLEMENT_STATUS_PENDING`) needs the REST sweep that `cleanup` and `terminalSwapOnce`
 step 0 now perform. Note `createdAt` there is a protobuf `{seconds, nanos}`, not an ISO string.
 
+### Strategi 1 (menu 1) — rantai task harian dari satu token hub
+
+Silvana sekarang punya beberapa DAY_TRADER harian sekaligus (`CETH_EDELX_DAY_TRADER`,
+`HECTO_CETH_DAY_TRADER`, `HECTO_EDELX_DAY_TRADER`, plus `DAY_TRADER` umum yang ikut terisi
+oleh swap apa pun). `s1RunTask` mengerjakannya berurutan dan selalu pulang ke satu token
+**hub** (default cETH), jadi modal tidak tercecer di banyak token.
+
+Yang perlu diketahui sebelum mengubahnya:
+
+- **Progres task itu STRING.** `GET /api/earn-hub/tasks` mengembalikan `progress: "3/10"`,
+  bukan `current`/`target` numerik. Membaca `it.current` menghasilkan `0` selamanya dan
+  loop tidak pernah berhenti — `s1Progress()` mem-parse string itu seperti `parseDayTrader`.
+- **Probe kuotasi fee harus bernilai di atas minimum order.** `feeQuotesUsd()` dulu
+  bertanya dengan `quantity: '1'`; 1 EDELx ≈ $0.007 sehingga server tidak menjawab sama
+  sekali dan semua kandidat tampak "gak ada quote". Ukurannya sekarang dihitung dari nilai
+  USD dibagi harga base.
+- **Token fee dipilih PER MARKET, bukan sekali di awal.** Ketersediaannya berbeda: diukur
+  live di `HECTO-EDELx` TUSDT tidak menghasilkan quote sementara USD8 menghasilkan. Kandidat
+  juga disaring dulu ke token yang benar-benar dipegang akun — quote tetap keluar walau
+  saldonya nol.
+- **`maxFeeCC` satuannya ikut token fee**, sehingga batas 5 (wajar untuk CC yang fee-nya
+  ~6.66) sama sekali tidak mengikat untuk TUSDT yang fee-nya ~0.15. `strategy1.maxFeeUsd`
+  dipatok dalam USD lalu dikonversi ke satuan token terpilih di awal tiap task.
+- **Swap terakhir menguras habis.** Saat sisa target tinggal 1 (9/10), seluruh saldo
+  dilepas: kalau yang dikirim base dipakai saldo persisnya sehingga benar-benar nol; kalau
+  yang dikirim quote disisakan 0.3% karena harga eksekusi RFQ bisa bergeser dan meminta
+  lebih dari yang dipunya berakhir insufficient funds. Sisa di bawah `rfqMinUsd` dibiarkan
+  jadi dust — memaksanya hanya membuat quote ditolak.
+- **Task yang tidak menyentuh hub didanai lebih dulu** (`seedUsd`) dan setelah selesai
+  **dua-duanya** dikembalikan ke hub, bukan hanya sisi lawan.
+
+Biaya terukur satu putaran penuh 3 task pada satu akun: 29 swap, fee 4.35 TUSDT (29 × 0.15,
+flat), modal cETH susut $77.70 → $73.48 termasuk spread. Durasi ~21 menit.
+
+### Spread: proporsional, sedangkan fee flat — ini yang menentukan ukuran swap
+
+`rfqSpread()` mengukurnya tanpa biaya: mengutip **dua arah** pada ukuran base yang sama
+persis lalu membandingkan harganya (`node index.js spread [market|all|strategi] [usd]`).
+Ini spread **RFQ**, bukan `bestBid`/`bestAsk` orderbook — jalur strategi 1 dan swap 1x
+lewat RFQ dan harga LP bisa jauh berbeda dari book.
+
+Jangan mengukur spread dengan menilai tiap swap memakai harga pasar. `getPrice` memberi
+harga `last` (dan untuk market `cross_rate` malah `"Calculated"`), dan diukur live harga
+`last` EDELx praktis **sama dengan harga ask RFQ** — sehingga satu swap $12 yang jelas
+merugi terbaca **rugi $0.00**. Acuannya sendiri bias. Yang dipakai `s1RunTask` adalah
+biaya **bolak-balik dalam satuan hub**: di awal dan akhir task seluruh dana ada di hub,
+jadi selisihnya biaya nyata dan tidak butuh harga acuan sama sekali.
+
+Diukur live di `EDELx-cETH`, spread persentase **tidak berubah** terhadap ukuran
+sementara fee tetap flat:
+
+| ukuran | spread | biaya spread | fee | total/swap |
+| --- | --- | --- | --- | --- |
+| $10.5 | 2.020 % | $0.106 | $0.300 | **$0.406** |
+| $12 | 2.020 % | $0.121 | $0.300 | $0.421 |
+| $14 | 1.954 % | $0.137 | $0.300 | $0.437 |
+
+Jadi dua gaya biaya itu tarik-menarik: **fee** menghukum swap kecil (flat, dan 3× lebih
+mahal di bawah ambang ~$10), **spread** menghukum swap besar (proporsional). Titik
+termurah adalah ukuran **sekecil mungkin yang masih di atas ambang tier $10** — bukan
+swap besar seperti yang disarankan logika fee sendirian.
+
+Spread berbeda jauh antar market, jadi memilih market itu keputusan biaya: diukur
+bersamaan, `HECTO-cETH` 0.61 %, `EDELx-cETH` 2.02 %, `HECTO-EDELx` 4.05 %.
+
+Model ini sudah dicocokkan dengan realisasi: satu putaran penuh 3 task diprediksi
+9×$0.121 + 9×$0.037 + 11×$0.243 = **$4.10**, realisasinya **$4.22** (selisih 3 %).
+
 ### Resilience patterns worth preserving
 
 Errors are tagged rather than string-matched at the call site: `e.transient`, `e.unauthorized`,

@@ -42,6 +42,37 @@
     "rfqMinUsd": 10,
     "_help_feeTierMinUsd": "Ambang nilai USD tempat settlement fee turun ke tier murah. Diukur live di EDELx-cETH: swap $9.5 kena 19.97 CC / 1.8 USDCx / 0.9 TUSDT, sedangkan $10.5 cuma 6.66 / 0.6 / 0.3 — tiga kali lebih murah. Kalau nilai swap di bawah ambang dan saldo cukup, jumlahnya dinaikkan supaya tidak jatuh ke tier mahal. 0 = matikan.",
     "feeTierMinUsd": 10,
+    "_help_strategy1": "Strategi 1 — selesaikan task harian berurutan mulai dan berakhir di token pangkalan (hub). Urutan task dijalankan apa adanya. Tiap task ping-pong sampai targetnya penuh. Swap PERTAMA tiap task memakai firstUsd (default 14 = minimum 10 + sisa 4 supaya nilai tidak jatuh di bawah minimum setelah kena fee dan spread). Swap berikutnya memakai stepUsd. Swap TERAKHIR tiap task (saat sisa 1 lagi) memakai seluruh saldo supaya tidak menyisakan token. Sisa dust setelah itu dibiarkan, tidak diswap. Task yang butuh token bukan hub (misal HECTO-EDELx saat hub cETH) otomatis didanai dulu dari hub sebesar seedUsd, lalu seluruhnya dikembalikan ke hub setelah task selesai.",
+    "strategy1": {
+      "_help_hub": "Token pangkalan strategi 1. Semua task dimulai dan diakhiri di sini, jadi setelah satu putaran saldo kembali utuh ke token ini. Default cETH karena semua market task (EDELx-cETH, HECTO-cETH) memakai cETH sebagai quote.",
+      "hub": "cETH",
+      "_help_firstUsd": "Nilai USD swap PERTAMA tiap task. Default 14 = minimum order 10 ditambah bantalan 4, supaya setelah kena fee dan spread nilainya tidak jatuh di bawah minimum order pada swap balikan berikutnya.",
+      "firstUsd": 14,
+      "_help_stepUsd": "Nilai USD swap-swap berikutnya dalam satu task. Harus di atas rfqMinUsd (10). Angka yang lebih besar tidak menaikkan fee karena fee bersifat flat per settlement di atas ambang tier ~$10.",
+      "stepUsd": 12,
+      "_help_seedUsd": "Modal awal yang dibelanjakan dari hub untuk task yang tidak menyentuh hub sama sekali (mis. HECTO-EDELx saat hub cETH). Bot swap hub ke token base task sebesar nilai ini dulu, lalu mengembalikan seluruh sisanya ke hub setelah task selesai.",
+      "seedUsd": 16,
+      "_help_maxFeeUsd": "Batas settlement fee per swap strategi 1, dihitung dalam USD. Dipakai karena maxFeeCC satuannya ikut token fee yang terpilih: batas 5 masuk akal untuk CC (fee ~6.66) tapi jauh terlalu longgar untuk TUSDT (fee ~0.15). Bot mengonversinya ke satuan token fee terpilih sebelum dipakai.",
+      "maxFeeUsd": 1,
+      "_help_tasks": "Urutan task earn-hub yang dikerjakan. `code` harus persis kode dari GET /api/earn-hub/tasks (cek: CETH_EDELX_DAY_TRADER, HECTO_CETH_DAY_TRADER, HECTO_EDELX_DAY_TRADER), `market` adalah market_id Silvana, `target` cuma cadangan kalau field progress tidak terbaca. Progres dibaca ulang dari server tiap swap sehingga tidak mungkin kelebihan.",
+      "tasks": [
+        {
+          "code": "CETH_EDELX_DAY_TRADER",
+          "market": "EDELx-cETH",
+          "target": 10
+        },
+        {
+          "code": "HECTO_CETH_DAY_TRADER",
+          "market": "HECTO-cETH",
+          "target": 10
+        },
+        {
+          "code": "HECTO_EDELX_DAY_TRADER",
+          "market": "HECTO-EDELx",
+          "target": 10
+        }
+      ]
+    },
     "_help_pair": "Pasangan token ping-pong mode 8. base/quote harus cocok dengan market_id Silvana (\"<base>-<quote>\"). Kirim base = sell, kirim quote = buy. Daftar market aktif: node index.js markets.",
     "pair": {
       "base": "EDELx",
@@ -67,7 +98,7 @@
     },
     "_help_feeTokens": "Token untuk membayar settlement fee swap RFQ. [] atau dikosongkan = CC (Amulet). [\"USDCx\"] = bayar pakai USDCx, jauh lebih murah kalau CC sedang mahal. Nama parameternya feeTokens (jamak, array) sesuai request UI. Fee non-Amulet dibayar lewat Utility transfer factory, bukan factory Amulet.",
     "feeTokens": [
-      "USDCx"
+      "USD8"
     ],
     "_help_hardMaxFeeCC": "PLAFON MUTLAK fee per swap (CC). Beda dari maxFeeCC: maxFeeCC itu gate 'tunggu sampai fee turun' yang SENGAJA dibypass di mode8 malam (trabas biar task kelar sebelum reset 07:00) dan opsi 7 (force dump) -> di situ batasnya jadi tanpa batas. hardMaxFeeCC berlaku di SEMUA jalur dan TIDAK bisa dibypass, jadi satu fee spike gak bisa ngebakar CC sebanyak apa pun. Fee normal 1.23 CC (RFQ) / 4.3 CC (terminal). 0 = matikan (gak disaranin).",
     "hardMaxFeeCC": 15,
