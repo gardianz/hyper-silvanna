@@ -3438,9 +3438,13 @@ async function swapOnceAtomic(ctx, side, baseQty) {
   const bal = await canton.balances();
   const toks = (bal && bal.tokens) || [];
   const holdOf = (id) => { const t = toks.find(x => String((x.instrumentId && x.instrumentId.id) || '').toUpperCase() === String(id).toUpperCase()); return ((t && t.unlockedUtxos) || []).map(u => u.contractId).filter(Boolean); };
-  const sendId = weSendBase ? baseId : quoteId2;
-  const userHoldings = holdOf(sendId);
-  if (!userHoldings.length) { const e = new Error(`gak ada holding ${sendId}`); e.insufficientBalance = true; throw e; }
+  // sendId itu SIMBOL dari market id; di holdings instrumentnya bisa beda nama
+  // (CC->Amulet, TUSDT->tf-usdt, USD8->UUID). Nyari pakai simbol bikin "gak ada
+  // holding USD8" padahal saldonya ada.
+  const sendSym = weSendBase ? baseId : quoteId2;
+  const sendId = instrumentIdOf(sendSym);
+  const userHoldings = holdOf(sendId).length ? holdOf(sendId) : holdOf(sendSym);
+  if (!userHoldings.length) { const e = new Error(`gak ada holding ${sendSym}`); e.insufficientBalance = true; throw e; }
   // CEK SANGGUP KIRIM. LP boleh ngutip lebih gede dari yg kita sizing — harga gerak
   // antara sizing dan quote. Kalau gak dicek, prepare-nya baru nolak jauh di belakang
   // dengan "input holdings do not cover leg amount", dan itu gak kebaca sebagai
@@ -3452,7 +3456,7 @@ async function swapOnceAtomic(ctx, side, baseQty) {
       return t ? Number(t.totalUnlockedBalance || 0) : 0;
     };
     const kirim = Number(weSendBase ? q.baseAmount : q.quoteAmount) || 0;
-    const punya = sumOf(sendId);
+    const punya = sumOf(sendId) || sumOf(sendSym);
     if (kirim > 0 && punya > 0 && kirim > punya + 1e-12) {
       const e = new Error(`${sendId} kurang buat leg: butuh ${kirim} punya ${punya} (LP ngutip lebih gede dari sizing)`);
       e.insufficientBalance = true; e.tokenNeeded = kirim; e.tokenHave = punya;
@@ -7902,11 +7906,18 @@ Usage:
         const feeCap = effFeeCap(null);
         let feeNow = null;
         try {
-          const probeQty = side === 'sell' ? Number(amountRaw) : null;
+          // Quantity RFQ selalu dalam satuan BASE. Buat arah buy, jumlah yg diketik user
+          // itu satuan QUOTE — harus dikonversi dulu, kalau nggak probe-nya minta qty
+          // ngawur dan servernya gak ngasih quote (fee jadi "gak kebaca").
+          let probeQty = Number(amountRaw);
+          if (!/^(max|all|semua)$/i.test(amountRaw) && side === 'buy') {
+            const rate = priceOf(await sv0.getPrice(pr.market).catch(() => null));
+            probeQty = rate > 0 ? Math.floor((Number(amountRaw) / rate) * 1e6) / 1e6 : 0;
+          } else if (/^(max|all|semua)$/i.test(amountRaw)) probeQty = 0;
           const rq0 = await sv0.swapAction(SWAP.actionIds.requestQuotesV2, [{
             partyId: (await buildSwapClients(states[pilih[0]])).partyId,
             marketId: pr.market, direction: side,
-            quantity: String(probeQty && probeQty > 0 ? probeQty : 1),
+            quantity: String(probeQty > 0 ? probeQty : 1),
             ...(SWAP.feeTokens && SWAP.feeTokens.length ? { feeTokens: SWAP.feeTokens } : {}),
           }]).catch(() => null);
           const f0 = rq0 && rq0.quotes && rq0.quotes[0] && rq0.quotes[0].settlementFee;
