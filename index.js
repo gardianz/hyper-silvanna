@@ -4686,8 +4686,14 @@ function fmtForToken(idUpper) {
   if (id === 'USDCX') return fmtUSDC;
   if (id === 'CETH') return fmtCeth;
   if (id === 'EDELX') return fmtEdelx;
+  if (id === 'AMULET' || id === 'CC') return fmtCC;
+  // HECTO ~$0.0022 jadi jumlahnya ribuan — desimal cuma bikin kolom melebar.
+  if (id === 'HECTO') return fmtEdelx;
+  // Stabil ~$1: 2 desimal cukup, 6 desimal (fmtTok6) bikin kolom kebanyakan nol.
+  if (id === 'TF-USDT' || id === 'TUSDT' || /^8694894E-/.test(id) || id === 'USD8') return fmtUSD2;
   return fmtTok6;
 }
+function fmtUSD2(n) { const x = Number(n); return Number.isFinite(x) ? x.toFixed(2) : '-'; }
 // Unclaimed Points dari earn-hub (mis. 1,780.00). Cari di root + nested, robust ke nama field.
 function extractUnclaimedPoints(tasks) {
   if (!tasks || typeof tasks !== 'object') return null;
@@ -6670,6 +6676,11 @@ function balanceOf(state, tokenId) {
   return { unlocked, locked: Math.max(0, total - unlocked) };
 }
 // ── Balance monitor (opsi 2): tabel + grand total, auto-refresh periodik ──────
+// Token inti: SELALU dapat kolom walau saldonya nol di semua akun, dan urutannya
+// tetap supaya kolom tidak lompat-lompat tiap refresh. Token di luar daftar ini
+// muncul otomatis begitu ada akun yang memegangnya.
+const BAL_CORE = ['AMULET', 'USDCX', 'CETH', 'EDELX', 'HECTO', 'TF-USDT', '8694894E-F159-42E1-80C9-ED14B94365B7'];
+const BAL_WARNA = [COLOR.mag, COLOR.cyan, COLOR.yellow, COLOR.green, COLOR.blue, COLOR.cyan, COLOR.mag];
 // Cell balance: unlocked (hijau) + "+locked" (abu) kalau ada. visLen strip ANSI →
 // pad align bener walau string udah diwarnai.
 // Warna per token biar kolom gampang dibedain, dan angka NOL diredupkan supaya
@@ -6695,44 +6706,72 @@ function renderBalanceTable(states, intervalMin, okCount, logBuf) {
     const [hint, fp] = String(pid).split('::');
     return `${String(hint || '?').slice(0, 16)}…${String(fp || '').slice(-6)}`;
   };
+  // Kolom token DINAMIS. Dulu dipatok empat (CC/USDCx/cETH/EDELx) sehingga token
+  // yang belakangan dipakai — HECTO, TUSDT, USD8 — tidak pernah kelihatan sama
+  // sekali walau saldonya ada. Sekarang kolomnya disusun dari instrumentId yang
+  // benar-benar muncul di saldo, jadi token baru langsung ikut tanpa ganti kode.
+  const dipegang = new Map();     // ID_UPPER → label tampil
+  for (const s of states) {
+    for (const toks of [s._balSupa, s._balWalley]) {
+      for (const t of (toks || [])) {
+        const id = String((t.instrumentId && t.instrumentId.id) || '');
+        if (!id) continue;
+        const isi = Number(t.totalBalance ?? t.totalUnlockedBalance ?? 0) > 1e-8;
+        if (!isi && !BAL_CORE.includes(id.toUpperCase())) continue;   // sembunyikan token nol yang bukan inti
+        dipegang.set(id.toUpperCase(), symbolOfInstrument(id) || id);
+      }
+    }
+  }
+  for (const id of BAL_CORE) if (!dipegang.has(id)) dipegang.set(id, symbolOfInstrument(id) || id);
+  // Urutan: token inti dulu (urutan tetap biar kolom tidak lompat tiap refresh),
+  // sisanya menyusul urut abjad.
+  const kolom = [
+    ...BAL_CORE.filter(id => dipegang.has(id)),
+    ...[...dipegang.keys()].filter(id => !BAL_CORE.includes(id)).sort(),
+  ].map(id => ({ id, label: dipegang.get(id), fmt: fmtForToken(id), color: BAL_WARNA[BAL_CORE.indexOf(id) >= 0 ? BAL_CORE.indexOf(id) % BAL_WARNA.length : (BAL_CORE.length + [...dipegang.keys()].indexOf(id)) % BAL_WARNA.length] }));
+
   const cellsOf = (toks) => {
     const fake = { balances: toks || [] };
-    return {
-      cc: _balCell(balanceOf(fake, 'amulet'), fmtCC, COLOR.mag), usdcx: _balCell(balanceOf(fake, 'usdcx'), fmtUSDC, COLOR.cyan),
-      ceth: _balCell(balanceOf(fake, 'ceth'), fmtCeth, COLOR.yellow), edelx: _balCell(balanceOf(fake, 'edelx'), fmtEdelx, COLOR.green),
-    };
+    const o = {};
+    for (const k of kolom) o[k.id] = _balCell(balanceOf(fake, k.id.toLowerCase()), k.fmt, k.color);
+    return o;
   };
   const rows = [];
   for (const s of states) {
     const nm = s.label || s.email;
     const aktif = ((acctSession(s.email) || {}).wallet || {}).kind || 'supanova';
-    if (s._balErr) { rows.push({ label: nm, wallet: paint('err', COLOR.red), pid: '', cc: paint('err', COLOR.red), usdcx: '', ceth: '', edelx: '' }); continue; }
+    if (s._balErr) {
+      const r = { label: nm, wallet: paint('err', COLOR.red), pid: paint(String(s._balErr).slice(0, 24), COLOR.red) };
+      for (const k of kolom) r[k.id] = paint('-', COLOR.gray);
+      rows.push(r); continue;
+    }
     if (s._balSupa) rows.push({ label: nm, wallet: paint('supa' + (aktif === 'supanova' ? '*' : ' '), aktif === 'supanova' ? COLOR.cyan : COLOR.gray), pid: paint(shortPid(s._pidSupa), COLOR.gray), ...cellsOf(s._balSupa) });
     if (s._balWalley) rows.push({ label: s._balSupa ? '' : nm, wallet: paint('walley' + (aktif === 'walley' ? '*' : ' '), aktif === 'walley' ? COLOR.cyan : COLOR.gray), pid: paint(shortPid(s._pidWalley), COLOR.gray), ...cellsOf(s._balWalley) });
   }
-  const tot = { cc: { u: 0, l: 0 }, usdcx: { u: 0, l: 0 }, ceth: { u: 0, l: 0 }, edelx: { u: 0, l: 0 } };
+  const tot = {};
+  for (const k of kolom) tot[k.id] = { u: 0, l: 0 };
   for (const s of states) {
     if (s._balErr) continue;
     for (const toks of [s._balSupa, s._balWalley]) {
       if (!toks) continue;
       const fake = { balances: toks };
-      const cc = balanceOf(fake, 'amulet'), ux = balanceOf(fake, 'usdcx'), ce = balanceOf(fake, 'ceth'), ed = balanceOf(fake, 'edelx');
-      tot.cc.u += cc.unlocked; tot.cc.l += cc.locked; tot.usdcx.u += ux.unlocked; tot.usdcx.l += ux.locked; tot.ceth.u += ce.unlocked; tot.ceth.l += ce.locked; tot.edelx.u += ed.unlocked; tot.edelx.l += ed.locked;
+      for (const k of kolom) { const b = balanceOf(fake, k.id.toLowerCase()); tot[k.id].u += b.unlocked; tot[k.id].l += b.locked; }
     }
   }
-  const totalRow = { label: `TOTAL (${okCount}/${states.length})`, wallet: '', pid: '', cc: _balCell({ unlocked: tot.cc.u, locked: tot.cc.l }, fmtCC, COLOR.mag), usdcx: _balCell({ unlocked: tot.usdcx.u, locked: tot.usdcx.l }, fmtUSDC, COLOR.cyan), ceth: _balCell({ unlocked: tot.ceth.u, locked: tot.ceth.l }, fmtCeth, COLOR.yellow), edelx: _balCell({ unlocked: tot.edelx.u, locked: tot.edelx.l }, fmtEdelx, COLOR.green) };
-  const head = { label: 'AKUN', wallet: 'WALLET', pid: 'PARTY', cc: 'CC', usdcx: 'USDCx', ceth: 'cETH', edelx: 'EDELx' };
+  const totalRow = { label: `TOTAL (${okCount}/${states.length})`, wallet: '', pid: '' };
+  for (const k of kolom) totalRow[k.id] = _balCell({ unlocked: tot[k.id].u, locked: tot[k.id].l }, k.fmt, k.color);
+  const head = { label: 'AKUN', wallet: 'WALLET', pid: 'PARTY' };
+  for (const k of kolom) head[k.id] = k.label;
   const all = [head, ...rows, totalRow];
   const wl = Math.max(...all.map(r => visLen(r.label)));
   const ww = Math.max(...all.map(r => visLen(r.wallet || '')));
   const wp = Math.max(...all.map(r => visLen(r.pid || '')));
-  const wc = Math.max(...all.map(r => visLen(r.cc)));
-  const wu = Math.max(...all.map(r => visLen(r.usdcx)));
-  const we = Math.max(...all.map(r => visLen(r.ceth)));
-  const wd = Math.max(...all.map(r => visLen(r.edelx)));
+  const wk = {};
+  for (const k of kolom) wk[k.id] = Math.max(...all.map(r => visLen(r[k.id] || '')));
   const GAP = '  ';
   const mkRow = (r, style) => {
-    const body = pad(r.label, wl, 'right') + GAP + pad(r.wallet || '', ww, 'right') + GAP + pad(r.pid || '', wp, 'right') + GAP + pad(r.cc, wc, 'left') + GAP + pad(r.usdcx, wu, 'left') + GAP + pad(r.ceth, we, 'left') + GAP + pad(r.edelx, wd, 'left');
+    let body = pad(r.label, wl, 'right') + GAP + pad(r.wallet || '', ww, 'right') + GAP + pad(r.pid || '', wp, 'right');
+    for (const k of kolom) body += GAP + pad(r[k.id] || '', wk[k.id], 'left');
     return row(style ? paint(body, style) : body);
   };
   const out = [line()];
@@ -7083,7 +7122,7 @@ async function runRegister() {
 const argv = process.argv.slice(2);
 // buildSwapClients/SWAP/transferCC ikut diekspor biar bisa diprobe dari skrip luar
 // tanpa nyalain bot (require aman: runMain kegate `require.main === module`).
-module.exports = { rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
+module.exports = { renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
 
 if (require.main === module) {
   if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
@@ -8225,7 +8264,7 @@ Usage:
       const MENU = [
         ['s', 'swap 1x (RFQ)', 'swap sekali: pilih token asal → tujuan, pilih akun'],
         ['1', 'strategi 1', 'selesaiin task harian berurutan, balik ke token hub'],
-        ['2', 'check balance', 'tabel CC/USDCx/cETH/EDELx + total, auto-refresh'],
+        ['2', 'check balance', 'tabel semua token yang dipegang + total, auto-refresh'],
         ['3', 'run (OTP urut)', 'login akun 1-per-1 lalu run USDCx'],
         ['4', 'change wallet', 'ganti wallet supa 1 akun'],
         ['5', 'maintenance', 'cleanup DvpProposal stale / reset season'],
