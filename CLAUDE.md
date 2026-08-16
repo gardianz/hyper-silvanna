@@ -330,9 +330,17 @@ Yang perlu diketahui sebelum mengubahnya:
 Biaya terukur satu putaran penuh 3 task pada satu akun: 29 swap, fee 4.35 TUSDT (29 × 0.15,
 flat), modal cETH susut $77.70 → $73.48 termasuk spread. Durasi ~21 menit.
 
-Akun dijalankan **paralel** (`swap.loginConcurrency`, seperti mode ping-pong) dan progresnya
-tampil di dashboard `s1RenderUI()` — satu baris per akun, log aktivitas bertanda akun di
-bawahnya. Versi berurutan + cetak baris membuat 15 akun berarti 15 × ~20 menit dan hanya akun
+Akun dijalankan **paralel** (`swap.loginConcurrency`) dan progresnya tampil di dashboard yang
+**sama persis** dengan mode ping-pong: `SESSION_ENGINE = 'strategi1'` lalu `render(states)` —
+`renderHeader` + `renderAccountsTable` + `renderFooter` + `renderActivityLog`. Jangan bikin
+tabel sendiri; yang didapat gratis dari jalur ini adalah drop kolom otomatis saat terminal
+sempit (`prio`), sorot baris terpilih, panel log per akun dengan navigasi ↑/↓, dan total
+season di footer. Kolom khusus strategi (TASK/SWAP/TAHAP/TOTAL) ditambahkan lewat cabang
+`SESSION_ENGINE === 'strategi1'` di `renderAccountsTable`, kolom saldonya dari `S1TOKENS`
+(hub + kedua sisi tiap market task + token fee). POIN/ΔPOIN/STREAK disembunyikan di mode ini
+karena strategi tidak menarik earn-hub stats tiap tick. Fee dan spread dibukukan lewat
+`bumpDaily`, ember yang sama dengan engine lain, sehingga FEE/SN, FEE-TOK dan LOSS/SN terisi
+tanpa jalur akuntansi kedua. Versi berurutan + cetak baris membuat 15 akun berarti 15 × ~20 menit dan hanya akun
 yang sedang jalan yang terlihat. Harga USD di-cache 30 detik (`usdPriceOf`): tiap swap butuh
 harga base dan quote, jadi tanpa cache satu putaran menembak ~64 request harga yang jawabannya
 praktis sama.

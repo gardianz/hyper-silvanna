@@ -2350,7 +2350,11 @@ async function s1Balances(ctx) {
     const id = String((t.instrumentId && t.instrumentId.id) || t.instrumentId || '').toUpperCase();
     if (id) m[id] = Number(t.totalUnlockedBalance || 0);
   }
-  return (sym) => m[String(instrumentIdOf(sym)).toUpperCase()] || m[String(sym).toUpperCase()] || 0;
+  const get = (sym) => m[String(instrumentIdOf(sym)).toUpperCase()] || m[String(sym).toUpperCase()] || 0;
+  // Array mentahnya dibawa serta: dashboard (balOf) baca dari state.balances, bukan
+  // dari getter ini, jadi tanpa `raw` harus request saldo dua kali.
+  get.raw = b.tokens || [];
+  return get;
 }
 
 // Balikin SELURUH saldo satu token ke hub. Sisa di bawah minimum order dibiarkan
@@ -2631,7 +2635,9 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
       if (s2 && s2.cur > st.cur) { st = s2; break; }
       if (s2) st = s2;
     }
-    lapor({ langkah, cur: st.cur, tgt: st.tgt, feeTok });
+    // Saldo ikut dilaporkan supaya kolom token di dashboard hidup tiap swap. `get.raw`
+    // itu hasil baca saldo di awal iterasi ini — tidak ada permintaan tambahan.
+    lapor({ langkah, cur: st.cur, tgt: st.tgt, feeTok, raw: get.raw });
   }
 
   // Pulang ke hub. Task yg gak nyentuh hub (HECTO-EDELx saat hub cETH) nyisain DUA
@@ -2642,6 +2648,7 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
   }
 
   const getAkhir = await saldo().catch(() => (() => 0));
+  lapor({ langkah, raw: getAkhir.raw });
   const totalAkhir = nilaiTotal(getAkhir);
   const biayaTask = totalAwal - totalAkhir;   // termasuk seed + balik ke hub
   // Fee dijumlah PER TOKEN — dalam satu task bisa berpindah token kalau yg pertama habis.
@@ -2671,80 +2678,6 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
     spreadUsd: biayaTask, volumeUsd, feeUsd, biayaTask,
     totalUsd: biayaTask + feeUsd,
   };
-}
-
-// ── Dashboard strategi 1 ────────────────────────────────────────────────────
-// Gaya sama dengan monitor saldo & mode ping-pong: satu kotak, satu baris per akun,
-// log aktivitas di bawah. Dipakai supaya jalannya strategi kelihatan sekaligus untuk
-// semua akun — versi cetak-baris sebelumnya cuma menampilkan akun yang lagi jalan
-// dan sisanya kelihatan seperti menggantung.
-const S1UI = { rows: [], log: [], mulai: 0, judul: '' };
-function s1LogUI(msg, color) {
-  S1UI.log.push(paint(new Date().toLocaleTimeString('id-ID') + ' ', COLOR.gray) + (color ? paint(msg, color) : msg));
-  if (S1UI.log.length > 300) S1UI.log.splice(0, S1UI.log.length - 300);
-}
-function s1RenderUI() {
-  if (!S1UI.rows.length) return;
-  computeLayout(); clearScreen();
-  const durasi = S1UI.mulai ? Math.round((Date.now() - S1UI.mulai) / 1000) : 0;
-  const jam = `${String(Math.floor(durasi / 3600)).padStart(2, '0')}:${String(Math.floor(durasi / 60) % 60).padStart(2, '0')}:${String(durasi % 60).padStart(2, '0')}`;
-
-  const warnaStatus = { tunggu: COLOR.gray, jalan: COLOR.cyan, selesai: COLOR.green, gagal: COLOR.red, batal: COLOR.yellow, lewat: COLOR.yellow };
-  const cell = (r) => ({
-    akun: r.label,
-    status: paint(r.status, warnaStatus[r.status] || COLOR.white),
-    task: paint(r.taskPendek || '-', r.status === 'jalan' ? COLOR.bold : COLOR.gray),
-    progres: r.tgt ? paint(`${r.cur}/${r.tgt}`, r.cur >= r.tgt ? COLOR.green : COLOR.white) : paint('-', COLOR.gray),
-    // Task ke berapa dari total, biar kelihatan sisa pekerjaannya.
-    tahap: paint(`${r.taskIdx}/${r.taskTotal}`, COLOR.gray),
-    swap: paint(String(r.swap || 0), COLOR.white),
-    hub: paint(r.hubUsd != null ? '$' + r.hubUsd.toFixed(2) : '-', COLOR.yellow),
-    fee: paint(r.feeStr || '-', COLOR.mag),
-    spread: paint(r.spreadUsd ? '$' + r.spreadUsd.toFixed(2) : '-', COLOR.cyan),
-    total: paint(r.totalUsd ? '$' + r.totalUsd.toFixed(2) : '-', r.totalUsd ? COLOR.red : COLOR.gray),
-    ket: paint(truncVis(r.ket || '', 34), COLOR.gray),
-  });
-  const head = {
-    akun: 'AKUN', status: 'STATUS', task: 'TASK', progres: 'PROGRES', tahap: 'TAHAP',
-    swap: 'SWAP', hub: 'HUB', fee: 'FEE', spread: 'SPREAD', total: 'BIAYA', ket: 'KETERANGAN',
-  };
-  const rows = S1UI.rows.map(cell);
-  // Baris TOTAL: yang dilihat user pertama kali itu berapa habisnya, jadi dijumlahkan.
-  const tot = S1UI.rows.reduce((a, r) => ({
-    swap: a.swap + (r.swap || 0), spread: a.spread + (r.spreadUsd || 0),
-    total: a.total + (r.totalUsd || 0), selesai: a.selesai + (r.status === 'selesai' ? 1 : 0),
-  }), { swap: 0, spread: 0, total: 0, selesai: 0 });
-  const totalRow = {
-    akun: `TOTAL (${tot.selesai}/${S1UI.rows.length})`, status: '', task: '', progres: '', tahap: '',
-    swap: paint(String(tot.swap), COLOR.bold), hub: '',
-    fee: '', spread: paint('$' + tot.spread.toFixed(2), COLOR.cyan), total: paint('$' + tot.total.toFixed(2), COLOR.red), ket: '',
-  };
-  const all = [head, ...rows, totalRow];
-  const KEYS = Object.keys(head);
-  const w = {};
-  for (const k of KEYS) w[k] = Math.max(...all.map(r => visLen(r[k] || '')));
-  const GAP = '  ';
-  const mk = (r, style) => {
-    const body = KEYS.map((k, i) => pad(r[k] || '', w[k], i === 0 || k === 'ket' ? 'right' : 'left')).join(GAP);
-    return row(style ? paint(body, style) : body);
-  };
-  const out = [line()];
-  out.push(row(paint(` ${S1UI.judul || 'Strategi 1'} — ${jam} berjalan `, COLOR.bold + COLOR.cyan)));
-  out.push(row(paint(new Date().toLocaleString('id-ID') + '   ·   q berhenti setelah swap berjalan   ·   Ctrl+C paksa', COLOR.gray)));
-  out.push(sep());
-  out.push(mk(head, COLOR.bold + COLOR.gray));
-  out.push(sep());
-  for (const r of rows) out.push(mk(r));
-  out.push(sep());
-  out.push(mk(totalRow, COLOR.bold));
-  out.push(sep());
-  out.push(row(paint('▎ aktivitas', COLOR.bold + COLOR.cyan)));
-  const avail = Math.max(MIN_ACTIVITY_LINES, ROWS - out.length - 2);
-  const slice = S1UI.log.slice(-avail);
-  if (!slice.length) out.push(row(paint('(belum ada)', COLOR.gray)));
-  else slice.forEach(l => out.push(row(l)));
-  out.push(endl());
-  process.stdout.write(out.join('\n') + '\n');
 }
 
 // Tunggu yg BISA DIBATALIN: tekan q (atau Esc) buat berhenti, Ctrl+C keluar.
@@ -4402,6 +4335,10 @@ function renderHeader() {
 function statusInfo(state) {
   const d = state.dayTrader;
   const o = state.overcap;
+  if (SESSION_ENGINE === 'strategi1' && state.s1) {
+    const m = { tunggu: ['○ Antre', COLOR.gray], jalan: ['● Swap', COLOR.yellow], selesai: ['● Selesai', COLOR.green], lewat: ['● Lewat', COLOR.gray], batal: ['● Batal', COLOR.yellow], gagal: ['● Error', COLOR.red] };
+    if (m[state.s1.status]) return m[state.s1.status];
+  }
   if (state.status === 'error') return ['● Error', COLOR.red];
   // Pas overcap, task penuh 10/10 BUKAN berarti kelar — patokannya target overcap.
   // Tanpa ini semua baris nampilin "Selesai" padahal masih nge-swap.
@@ -4442,7 +4379,15 @@ function renderAccountsTable(states) {
   const tokCell = (idUpper, ft) => (s) => { const b = balOf(s, idUpper); return [b ? ft(b.unlocked) + (b.locked > 1e-8 ? '+' + ft(b.locked) : '') : '-', COLOR.green]; };
   const tokenCols = SESSION_ENGINE === 'pingpong'
     ? [{ title: 'cETH', prio: 1, cap: 12, cell: tokCell('CETH', fmtCeth) }, { title: 'EDELx', prio: 1, cap: 12, cell: tokCell('EDELX', fmtEdelx) }]
-    : [{ title: SWAP.tokenLabel, prio: 1, cap: 12, cell: tokCell(SWAP.tokenId, fmtForToken(SWAP.tokenId)) }];
+    : SESSION_ENGINE === 'strategi1'
+      // Strategi 1 menyentuh banyak token (cETH/EDELx/HECTO + token fee), dan yg mau
+      // dipastikan user justru token lawan benar-benar terkuras di swap terakhir.
+      // Daftarnya disiapkan handler menu di S1TOKENS.
+      ? (S1TOKENS || []).map((t, i) => ({
+        title: t, prio: i < 3 ? 1 : 2, cap: 12,
+        cell: tokCell(String(instrumentIdOf(t)).toUpperCase(), fmtForToken(instrumentIdOf(t))),
+      }))
+      : [{ title: SWAP.tokenLabel, prio: 1, cap: 12, cell: tokCell(SWAP.tokenId, fmtForToken(SWAP.tokenId)) }];
   // Kolom OVERCAP cuma muncul kalau overcap emang lagi jalan — kolom SWAP mentok di
   // task earn-hub (10/10) jadi pas overcap progres sebenernya (mis. 22/50) gak keliatan
   // sama sekali. prio 0 = jangan didrop pas terminal sempit; percuma nyalain overcap
@@ -4459,10 +4404,22 @@ function renderAccountsTable(states) {
   const COLS = [
     { title: 'AKUN', prio: 0, cap: 16, align: 'l', cell: s => [truncVis(s.label || '-', 16), COLOR.bold] },
     { title: 'STATUS', prio: 1, cap: 10, cell: s => statusInfo(s) },
-    { title: 'SWAP', prio: 0, cap: 7, cell: s => [s.dayTrader ? `${s.dayTrader.count}/${s.dayTrader.target}` : '-', s.dayTrader && s.dayTrader.count >= s.dayTrader.target ? COLOR.green : COLOR.white] },
+    ...(SESSION_ENGINE === 'strategi1' ? [
+      // TASK = task yg lagi dikerjain, TAHAP = task ke berapa dari total, SWAP = progres
+      // task itu. Tanpa TAHAP, akun yg lagi di task ke-3 tak bisa dibedakan dari yg ke-1.
+      { title: 'TASK', prio: 1, cap: 12, cell: s => [(s.s1 && s.s1.task) || '-', s.s1 && s.s1.jalan ? COLOR.cyan : COLOR.gray] },
+      { title: 'SWAP', prio: 0, cap: 7, cell: s => [(s.s1 && s.s1.tgt) ? `${s.s1.cur}/${s.s1.tgt}` : '-', (s.s1 && s.s1.cur >= s.s1.tgt) ? COLOR.green : COLOR.white] },
+      { title: 'TAHAP', prio: 1, cap: 6, cell: s => [(s.s1 && s.s1.taskTotal) ? `${s.s1.taskIdx}/${s.s1.taskTotal}` : '-', COLOR.gray] },
+      { title: 'TOTAL', prio: 2, cap: 6, cell: s => [(s.s1 && s.s1.swap) ? String(s.s1.swap) : '0', COLOR.white] },
+    ] : [
+      { title: 'SWAP', prio: 0, cap: 7, cell: s => [s.dayTrader ? `${s.dayTrader.count}/${s.dayTrader.target}` : '-', s.dayTrader && s.dayTrader.count >= s.dayTrader.target ? COLOR.green : COLOR.white] },
+    ]),
     ...overcapCols,
     { title: 'CC', prio: 1, cap: 12, cell: s => { const b = balOf(s, 'AMULET'); return [b ? fmtCC(b.unlocked) + (b.locked > 1e-8 ? '+' + fmtCC(b.locked) : '') : '-', COLOR.green]; } },
     ...tokenCols,
+    // POIN/ΔPOIN/STREAK cuma diisi engine yg memang menarik earn-hub stats tiap tick.
+    // Strategi 1 tidak, jadi kolomnya kosong melompong — disembunyikan saja.
+    ...(SESSION_ENGINE === 'strategi1' ? [] : [
     { title: 'POIN', prio: 3, cap: 9, cell: s => [s.points != null ? fmtThousand(s.points) : '-', COLOR.mag] },
     // ΔPOIN = gain poin harian (segitiga ▲ naik / ▼ turun). Reset 0 tiap 07 WIB, persist.
     {
@@ -4475,6 +4432,7 @@ function renderAccountsTable(states) {
       }
     },
     { title: 'STREAK', prio: 4, cap: 6, cell: s => [s.streak != null ? String(s.streak) : '-', COLOR.yellow] },
+    ]),
     { title: 'FEE/hr', prio: 3, cap: 8, cell: s => [Number(s.feeToday) > 0 ? Number(s.feeToday).toFixed(1) : '0', COLOR.yellow] },
     // SEASON = total fee CC kebakar seumur season (gak roll harian). Persist di
     // session.json → survive re-run. Reset cuma manual: menu 5 → b) reset season.
@@ -6788,6 +6746,10 @@ async function runEdelCethSession(reason) {
 // Engine sesi swap: 'daytrader' (opsi 0/1, CC↔token) | 'pingpong' (opsi 8, EDELx↔cETH).
 // Di-set opsi 8 sebelum runMain. runMain + dashboard-trigger + scheduler lewat sini.
 let SESSION_ENGINE = 'daytrader';
+// Token yg dipakai strategi 1 — jadi kolom saldo di dashboard.
+let S1TOKENS = [];
+// Dipakai dari luar modul (uji tampilan) tanpa mengekspor variabelnya langsung.
+function setSessionEngine(v, tokens) { SESSION_ENGINE = v; if (Array.isArray(tokens)) S1TOKENS = tokens; }
 async function runSwapSession(reason) {
   return SESSION_ENGINE === 'pingpong' ? runEdelCethSession(reason) : runDayTraderSession(reason);
 }
@@ -7281,7 +7243,7 @@ async function runRegister() {
 const argv = process.argv.slice(2);
 // buildSwapClients/SWAP/transferCC ikut diekspor biar bisa diprobe dari skrip luar
 // tanpa nyalain bot (require aman: runMain kegate `require.main === module`).
-module.exports = { s1RenderUI, S1UI, s1LogUI, renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
+module.exports = { setSessionEngine, renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
 
 if (require.main === module) {
   if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
@@ -8699,86 +8661,97 @@ Usage:
         const conf = (await prompt(paint(`\nKetik "go" buat jalan (${pilihAkun.length} akun), Enter batal: `, COLOR.bold + COLOR.yellow))).trim().toLowerCase();
         if (conf !== 'go') { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
 
-        // 5) jalan — akun DIPARALELKAN. Sebelumnya berurutan, sehingga 15 akun berarti
-        // 15 × ~20 menit; sekarang sebatas swap.loginConcurrency seperti mode ping-pong.
+        // 5) jalan — akun DIPARALELKAN (swap.loginConcurrency), tampil di dashboard yg
+        // SAMA dengan mode ping-pong: render() = header + tabel COLS + footer + panel log
+        // per akun (↑/↓ ganti akun). Bukan tabel bikinan sendiri — supaya perilakunya
+        // (drop kolom saat sempit, sorot baris, nav log) persis sama.
         const mkAll = await fetchMarkets((await buildSwapClients(states[pilihAkun[0]])).sv);
+        SESSION_ENGINE = 'strategi1';
+        S1TOKENS = [...new Set([hub, ...tasks.flatMap(t => String(t.market).split('-')), ...kandidatUrut].map(String))];
+        // Dashboard cuma menampilkan akun yg dipilih — kalau semua akun ikut, barisnya
+        // penuh akun nganggur dan yg penting kedorong.
+        const dstates = pilihAkun.map(i => states[i]);
+        for (const st2 of dstates) { st2.log = []; st2.s1 = { status: 'tunggu', taskIdx: 0, taskTotal: tasks.length, swap: 0, cur: 0, tgt: 0 }; }
+        global.__states = dstates;
+        selView = 0;
+        setupKeyNav();
+        ACTIVITY.length = 0;
+        logActivity(`Strategi 1 — hub ${hub} · fee ${kandidatUrut.join(' → ')} · ${pilihAkun.length} akun`, COLOR.cyan);
+        logActivity('q = berhenti setelah swap yg lagi jalan · ↑/↓ = ganti panel log', COLOR.gray);
         const batal = watchCancelKey();
-        S1UI.rows = pilihAkun.map(i => ({
-          idx: i, label: ACCOUNTS[i].label || ACCOUNTS[i].email, status: 'tunggu',
-          taskIdx: 0, taskTotal: tasks.length, swap: 0, spreadUsd: 0, totalUsd: 0, ket: '',
-        }));
-        S1UI.mulai = Date.now();
-        S1UI.log = [];
-        S1UI.judul = `Strategi 1 — hub ${hub} · fee ${kandidatUrut.join('/')}`;
-        const barisAkun = new Map(S1UI.rows.map(r => [r.idx, r]));
-        const tulis = () => s1RenderUI();
-        const timerUI = setInterval(tulis, 1000);
-        tulis();
+        render(global.__states);
+        const timerUI = setInterval(() => render(global.__states), 1000);
 
         const conc = Math.max(1, Number((CONFIG.swap || {}).loginConcurrency) || 5);
         let sukses = 0, gagal = 0;
         await mapLimit(pilihAkun, conc, async (i) => {
           const a = ACCOUNTS[i], tag = a.label || a.email;
-          const r = barisAkun.get(i);
-          if (batal.cancelled()) { r.status = 'batal'; r.ket = 'dibatalin sebelum mulai'; return; }
-          r.status = 'jalan';
-          const log = (m) => s1LogUI(`[${tag}] ${m}`);
+          const st2 = states[i];
+          const log = (m) => logActivity(`[${tag}] ${m}`);
+          if (batal.cancelled()) { st2.s1.status = 'batal'; return; }
+          st2.s1.status = 'jalan';
           try {
-            const clients = await buildSwapClients(states[i]);
+            const clients = await buildSwapClients(st2);
             let usc = getUserServiceCid(a.email);
             if (!usc) { const pty = await clients.sv.recoverParty(clients.partyId).catch(() => null); if (pty) { usc = pty.userServiceCid; patchAcctSession(a.email, { userServiceCid: usc }); } }
             if (!usc) throw new Error('userServiceCid gak ada — party belum onboard?');
+            const segar = (get) => { if (get && get.raw) st2.balances = get.raw; };
             const ctx = {
               ...clients, email: a.email, label: tag, userServiceCid: usc, minUsd: M8.minUsd,
               log: () => { },
               onProgress: (p) => {
-                r.taskPendek = String(p.task || '').replace(/_DAY_TRADER$/, '');
-                r.market = p.market; r.cur = p.cur; r.tgt = p.tgt;
-                if (p.feeTok) r.feeStr = p.feeTok;
-                if (Number.isFinite(p.langkah)) r.swapTask = p.langkah;
+                st2.s1.task = String(p.task || '').replace(/_DAY_TRADER$/, '');
+                st2.s1.cur = p.cur != null ? p.cur : st2.s1.cur;
+                st2.s1.tgt = p.tgt != null ? p.tgt : st2.s1.tgt;
+                st2.s1.jalan = true;
+                if (p.raw) st2.balances = p.raw;
               },
             };
+            segar(await s1Balances(ctx).catch(() => null));
             const alasanTask = [];
-            const pxHub = await usdPriceOf(clients.sv, hub).catch(() => 0);
-            const get0 = await s1Balances(ctx).catch(() => null);
-            if (get0 && pxHub > 0) r.hubUsd = get0(hub) * pxHub;
-
             for (let ti = 0; ti < tasks.length; ti++) {
-              if (batal.cancelled()) { r.status = 'batal'; break; }
+              if (batal.cancelled()) { st2.s1.status = 'batal'; break; }
               const t = tasks[ti];
-              r.taskIdx = ti + 1;
-              r.taskPendek = t.code.replace(/_DAY_TRADER$/, '');
+              st2.s1.taskIdx = ti + 1;
+              st2.s1.task = t.code.replace(/_DAY_TRADER$/, '');
               const mk = mkAll.find(x => x.id === t.market);
               if (!mk) { log(`market ${t.market} gak ada — dilewati`); continue; }
               const hasil = await s1RunTask(ctx, t, mk, hub, kandidatUrut, S1, log, batal.cancelled);
               alasanTask.push(hasil.alasan || (hasil.skipped ? 'dilewati' : ''));
-              if (hasil.cur != null) { r.cur = hasil.cur; r.tgt = hasil.tgt; }
-              r.swap += hasil.done || 0;
-              r.spreadUsd += hasil.spreadUsd || 0;
-              r.totalUsd += hasil.totalUsd || 0;
-              if (hasil.feePakai && hasil.feePakai.length) r.feeStr = hasil.feePakai.map(f => `${f.jml.toFixed(2)} ${f.tok}`).join('+');
-              if (hasil.cancelled) { r.status = 'batal'; break; }
-              const gp = await s1Balances(ctx).catch(() => null);
-              if (gp && pxHub > 0) r.hubUsd = gp(hub) * pxHub;
+              if (hasil.cur != null) { st2.s1.cur = hasil.cur; st2.s1.tgt = hasil.tgt; }
+              st2.s1.swap += hasil.done || 0;
+              // Fee & spread masuk ember yg SAMA dengan mode lain (persistDaily), jadi
+              // kolom FEE/hr, FEE/SN, LOSS$/hr, LOSS/SN dan footer season langsung isi.
+              if (hasil.done) {
+                // Fee & spread masuk ember yg SAMA dengan mode lain (persistDaily lewat
+                // bumpDaily), jadi kolom FEE/hr, FEE/SN, FEE-TOK, LOSS$/hr, LOSS/SN dan
+                // total season di footer langsung terisi tanpa jalur akuntansi kedua.
+                // Spread dibukukan sekali saja; fee dibukukan per token yg benar-benar
+                // dipakai (bisa lebih dari satu kalau yg pertama habis di tengah task).
+                const fp = hasil.feePakai || [];
+                if (!fp.length) bumpDaily(st2, 0, hasil.spreadUsd || 0, 'CC');
+                fp.forEach((f, k) => bumpDaily(st2, f.jml, k === 0 ? (hasil.spreadUsd || 0) : 0, f.tok));
+              }
+              segar(await s1Balances(ctx).catch(() => null));
+              if (hasil.cancelled) { st2.s1.status = 'batal'; break; }
             }
-            if (r.status !== 'batal') {
-              // "selesai" hanya kalau memang ada yg dikerjakan atau semua task sudah
-              // penuh. Akun tanpa modal dulu ikut dilabeli selesai — menyesatkan.
-              const adaHambatan = alasanTask.filter(x => x && x !== 'penuh');
-              if (!r.swap && adaHambatan.length) { r.status = 'lewat'; r.ket = adaHambatan[0]; }
-              else { r.status = 'selesai'; r.ket = r.swap ? `${r.swap} swap` : 'semua task sudah penuh'; sukses++; }
-            } else r.ket = 'dihentikan user';
-            log(r.status === 'batal' ? 'dihentikan' : (r.status === 'lewat' ? `dilewati — ${r.ket}` : 'selesai'));
+            if (st2.s1.status !== 'batal') {
+              const hambatan = alasanTask.filter(x => x && x !== 'penuh');
+              if (!st2.s1.swap && hambatan.length) { st2.s1.status = 'lewat'; log(`dilewati — ${hambatan[0]}`); }
+              else { st2.s1.status = 'selesai'; sukses++; log(st2.s1.swap ? `selesai — ${st2.s1.swap} swap` : 'semua task sudah penuh'); }
+            } else log('dihentikan user');
           } catch (e) {
-            gagal++; r.status = 'gagal'; r.ket = ((e && e.message) || String(e)).slice(0, 34);
+            gagal++; st2.s1.status = 'gagal';
             log(paint(`GAGAL: ${(e && e.message) || e}`, COLOR.red));
           }
-          tulis();
+          st2.s1.jalan = false;
         });
         clearInterval(timerUI);
         batal.stop();
-        tulis();
+        render(global.__states);
         process.stdout.write('\n' + paint(`strategi selesai — ${sukses} akun beres, ${gagal} gagal`, gagal ? COLOR.yellow : COLOR.green) + '\n');
+        global.__states = null;
+        SESSION_ENGINE = 'daytrader';
         await prompt(paint('Enter buat balik ke menu…', COLOR.gray));
         continue;
       }
