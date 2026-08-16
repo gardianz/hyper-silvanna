@@ -2283,10 +2283,20 @@ const floor6 = (n) => Math.floor(Math.max(0, Number(n) || 0) * 1e6) / 1e6;
 // bukan hub (mis. HECTO-EDELx saat hub cETH) didanai dulu dari hub.
 
 // Harga USD sebuah token. USDCx dianggap $1 (itu unit acuan market *-USDCx).
+// Harga di-cache: tiap swap butuh harga base DAN quote, jadi tanpa cache satu
+// putaran 32 swap menembak ~64 request harga yg jawabannya praktis sama. TTL pendek
+// (30 dtk) supaya ukuran swap tetap ikut harga terkini.
+const _PXC = new Map();
+const PX_TTL_MS = 30_000;
 async function usdPriceOf(sv, sym) {
-  if (String(sym).toUpperCase() === 'USDCX') return 1;
+  const key = String(sym).toUpperCase();
+  if (key === 'USDCX') return 1;
+  const c = _PXC.get(key);
+  if (c && Date.now() - c.t < PX_TTL_MS) return c.v;
   const px = await sv.getPrice(`${sym}-USDCx`).catch(() => null);
-  return priceOf(px);
+  const v = priceOf(px);
+  if (v > 0) _PXC.set(key, { v, t: Date.now() });
+  return v;
 }
 
 // Kutip fee tiap kandidat token di satu market, lalu nilai dalam USD.
@@ -2408,14 +2418,47 @@ async function rfqSpread(sv, partyId, market, usdValue, feeTok) {
 
 // Satu langkah swap di sebuah market. `deliver` = simbol token yg DIKIRIM.
 // qtyBase = jumlah dalam satuan BASE market (RFQ selalu minta base).
+// `feeTok` boleh satu simbol ATAU daftar kandidat berurutan. Server memperlakukan
+// `feeTokens` sebagai URUTAN PREFERENSI: dikirim ["TUSDT","USD8","USDCx","CC"] dia
+// menjawab dengan yg pertama didukung market itu (terverifikasi live — kirim 4 token
+// balasannya tetap 2 quote, dua-duanya TUSDT). Jadi token fee tidak perlu dibanding
+// lewat panggilan terpisah: cukup kirim daftarnya, keputusan jatuh di dalam quote.
+// Menghapus token yg saldonya habis dari daftar = otomatis pindah ke token berikutnya.
 async function s1Swap(ctx, mk, deliver, qtyBase, feeTok) {
   const isBase = String(deliver).toUpperCase() === String(mk.base).toUpperCase();
   const leg = {
     market: mk.id, baseIsCC: String(mk.base).toUpperCase() === 'CC', tokenToToken: true,
     tokenId: String(deliver).toUpperCase(), tokenLabel: deliver, tokenAdmin: null,
   };
-  const c = { ...ctx, leg, feeTokens: feeTok && String(feeTok).toUpperCase() !== 'CC' ? [feeTok] : [] };
+  const daftar = (Array.isArray(feeTok) ? feeTok : [feeTok]).filter(Boolean).map(String);
+  // CC = default server kalau feeTokens dikosongkan; kirim ["CC"] sendirian percuma.
+  const ft = (daftar.length === 1 && daftar[0].toUpperCase() === 'CC') ? [] : daftar;
+  const c = { ...ctx, leg, feeTokens: ft };
   return swapOnceAtomic(c, isBase ? 'sell' : 'buy', fmt10(String(qtyBase)));
+}
+
+// Urutan kandidat fee: termurah dulu. Awalnya pakai peringkat statis (stabil dulu —
+// rasio CC:USDCx:TUSDT ~22:2:1, terukur hari ini TUSDT/USD8 $0.15 vs CC/USDCx $0.30),
+// lalu DIKOREKSI dari fee yg benar-benar ditagih tiap quote. Jadi tidak ada satu pun
+// panggilan tambahan cuma buat membandingkan fee.
+const S1_FEE_RANK = { TUSDT: 0, USD8: 1, USDCX: 2, CC: 3 };
+function s1UrutFee(kandidat, teramat) {
+  return kandidat.slice().sort((a, b) => {
+    const ua = teramat[a.toUpperCase()], ub = teramat[b.toUpperCase()];
+    if (ua != null && ub != null && ua !== ub) return ua - ub;
+    if (ua != null && ub == null) return -1;
+    if (ub != null && ua == null) return 1;
+    return (S1_FEE_RANK[a.toUpperCase()] ?? 9) - (S1_FEE_RANK[b.toUpperCase()] ?? 9);
+  });
+}
+// Buang token fee yg saldonya sudah tidak sanggup bayar sekali fee lagi. Tanpa ini
+// swap gagal di tengah jalan padahal masih ada token fee lain yg penuh.
+function s1FeeSiap(kandidat, get, teramatJml) {
+  return kandidat.filter(t => {
+    const perlu = teramatJml[t.toUpperCase()];
+    const saldo = get(t);
+    return perlu != null ? saldo >= perlu * 1.5 : saldo > 0;
+  });
 }
 
 // Jalanin SATU task sampai targetnya penuh, lalu balikin saldo ke hub.
@@ -2426,31 +2469,20 @@ async function s1Swap(ctx, mk, deliver, qtyBase, feeTok) {
 //   swap TERAKHIR    : SELURUH saldo — biar gak nyisain token di token lawan
 async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled) {
   const { sv, partyId } = ctx;   // ctx di-reassign di bawah buat nyetel batas fee
-  // Token fee dipilih PER MARKET. Ketersediaannya beda-beda: di HECTO-EDELx
-  // TUSDT gak dapet quote sementara USD8 dapet, jadi milih sekali di awal bisa
-  // bikin seluruh task gagal.
-  let feeTok = Array.isArray(kandidatFee) ? kandidatFee[0] : kandidatFee;
-  if (Array.isArray(kandidatFee) && kandidatFee.length > 1) {
-    // Buang kandidat yg akun ini gak pegang. Quote tetep keluar walau saldonya nol,
-    // jadi tanpa saringan ini bot bisa milih token termurah yg justru gak bisa dibayar.
-    const getF = await s1Balances(ctx).catch(() => null);
-    let pilihan = kandidatFee;
-    if (getF) {
-      const punya = kandidatFee.filter(t => getF(t) > 0);
-      if (punya.length) pilihan = punya;
-      else log(`gak pegang satu pun token fee (${kandidatFee.join('/')}) — tetep dicoba`);
-    }
-    const q = await feeQuotesUsd(sv, partyId, mk.id, pilihan, cfg.firstUsd).catch(() => []);
-    const v = q.filter(x => x.usd != null).sort((a, b) => a.usd - b.usd);
-    if (v.length) { feeTok = v[0].tok; log(`fee ${mk.id}: ${v.map(x => x.tok + ' $' + x.usd.toFixed(3)).join(' · ')} → pakai ${feeTok}`); }
-    else feeTok = pilihan[0];
-  }
-  // maxFeeCC satuannya IKUT token fee, jadi angka yg wajar buat CC (5) langsung
-  // salah buat TUSDT. Patok batasnya di USD lalu konversi ke satuan token itu.
+  // Kandidat fee dibawa sebagai DAFTAR sampai ke quote — server yg memutuskan.
+  // `ctx.s1fee` dipakai bersama antar task: fee yg teramat di task sebelumnya
+  // langsung memperbaiki urutan di task berikutnya.
+  const memo = ctx.s1fee || (ctx.s1fee = { usd: {}, jml: {} });
+  const semua = (Array.isArray(kandidatFee) ? kandidatFee : [kandidatFee]).filter(Boolean);
+  let feeTok = semua[0];   // dipakai buat pelaporan; nilai sebenarnya dari quote
+
+  // Batas fee dipatok USD lalu dikonversi ke satuan token termurah yg mungkin dipakai.
+  // maxFeeCC satuannya ikut token fee, jadi angka yg wajar buat CC salah buat TUSDT.
   const capUsd = Number(cfg.maxFeeUsd) > 0 ? Number(cfg.maxFeeUsd) : 0;
   if (capUsd > 0) {
-    const pxFee = await usdPriceOf(sv, feeTok).catch(() => 0);
-    if (pxFee > 0) ctx = { ...ctx, maxFeeCC: capUsd / pxFee };
+    let pxTermurah = 0;
+    for (const t of semua) { const px = await usdPriceOf(sv, t).catch(() => 0); if (px > pxTermurah) pxTermurah = px; }
+    if (pxTermurah > 0) ctx = { ...ctx, maxFeeCC: capUsd / pxTermurah };
   }
   const other = String(mk.base).toUpperCase() === String(hub).toUpperCase() ? mk.quote : mk.base;
   const bukanHub = ![mk.base, mk.quote].some(x => String(x).toUpperCase() === String(hub).toUpperCase());
@@ -2461,10 +2493,16 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
     return it ? s1Progress(it, task.target) : null;
   };
   const saldo = () => s1Balances(ctx);
+  // Pengait dashboard. Dipanggil tiap ada kemajuan; kalau ctx.onProgress gak dipasang
+  // (mis. dipanggil dari skrip) semuanya jadi no-op.
+  const lapor = (extra) => {
+    ctx.s1lapor = { task: task.code, market: mk.id, ...(ctx.s1lapor || {}), ...(extra || {}) };
+    if (typeof ctx.onProgress === 'function') { try { ctx.onProgress(ctx.s1lapor); } catch (_) { } }
+  };
 
   let st = await bacaTask();
-  if (!st) { log(`task ${task.code} gak ketemu di earn-hub — dilewati`); return { done: 0, skipped: true }; }
-  if (st.cur >= st.tgt) { log(`${task.code} udah ${st.cur}/${st.tgt} — dilewati`); return { done: 0, skipped: true }; }
+  if (!st) { log(`task ${task.code} gak ketemu di earn-hub — dilewati`); return { done: 0, skipped: true, alasan: 'task gak ada' }; }
+  if (st.cur >= st.tgt) { log(`${task.code} udah ${st.cur}/${st.tgt} — dilewati`); return { done: 0, skipped: true, alasan: 'penuh', cur: st.cur, tgt: st.tgt }; }
   log(`${task.code} ${st.cur}/${st.tgt} di ${mk.id}`);
 
   // Task yg gak nyentuh hub (mis. HECTO-EDELx saat hub cETH): danai dulu dari hub.
@@ -2480,18 +2518,20 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
       const hubUsd = pxHub > 0 ? get(hub) * pxHub : 0;
       if (hubUsd < Number(cfg.seedUsd)) {
         log(`saldo ${hub} cuma $${hubUsd.toFixed(2)}, butuh $${cfg.seedUsd} buat danai ${mk.base} — task dilewati`);
-        return { done: 0, skipped: true };
+        return { done: 0, skipped: true, alasan: `modal ${hub} kurang ($${hubUsd.toFixed(2)})` };
       }
       const seedMk = { id: `${mk.base}-${hub}`, base: mk.base, quote: hub };
       const qty = pxSeed > 0 ? floor6(Number(cfg.seedUsd) / pxSeed) : 0;
       if (!(qty > 0)) throw new Error(`gak bisa hitung seed ${mk.base}`);
       log(`danai ${mk.base} $${cfg.seedUsd} dari ${hub} lewat ${seedMk.id}`);
-      await s1Swap(ctx, seedMk, hub, qty, feeTok);
-      await sleep(4000);
+      const rs = await s1Swap(ctx, seedMk, hub, qty, s1UrutFee(semua, memo.usd));
+      if (rs && rs.feeSym) { memo.jml[rs.feeSym.toUpperCase()] = rs.feeCC; feeTok = rs.feeSym; }
+      lapor({ langkah: (ctx.s1lapor && ctx.s1lapor.langkah) || 0 });
+      await sleep(2500);
     }
   }
 
-  let langkah = 0, dibatalin = false;
+  let langkah = 0, dibatalin = false, alasan = '';
   // Akuntansi biaya.
   //
   // Spread TIDAK diukur dgn menilai tiap swap pakai harga pasar: `getPrice` itu harga
@@ -2503,7 +2543,12 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
   // ada di hub, jadi selisihnya biaya nyata — gak butuh harga acuan sama sekali.
   // Perkiraan sebelum jalan tetap tersedia lewat rfqSpread() yg mengutip dua arah.
   let volumeUsd = 0;
-  const feeAwal = (await saldo())(feeTok);
+  // Fee bisa berpindah token di tengah task (token pertama habis), jadi dicatat per
+  // token, bukan satu angka. Diukur dari selisih saldo supaya yg terhitung benar-benar
+  // yg keluar dari dompet.
+  const getAwal = await saldo();
+  const feeAwal = {};
+  for (const t of semua) feeAwal[t] = getAwal(t);
   // Selain spread per swap di dalam loop, catat juga biaya SATU TASK PENUH: ini yg
   // ikut menghitung swap seed dan swap balik ke hub, yg terjadi di luar loop dan di
   // market lain. Harga di-snapshot sekali supaya gerak pasar gak kebaca sebagai biaya.
@@ -2511,8 +2556,7 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
   const pxSnap = {};
   for (const t of tokenTerlibat) pxSnap[t] = await usdPriceOf(sv, t).catch(() => 0);
   const nilaiTotal = (get) => tokenTerlibat.reduce((a2, t) => a2 + get(t) * (pxSnap[t] || 0), 0);
-  const totalAwal = nilaiTotal(await saldo());
-  const feeDiPasangan = [mk.base, mk.quote].some(x => String(x).toUpperCase() === String(feeTok).toUpperCase());
+  const totalAwal = nilaiTotal(getAwal);
   const maxLangkah = (st.tgt - st.cur) + 8;   // ruang buat retry, bukan loop tanpa batas
   while (st.cur < st.tgt && langkah < maxLangkah) {
     if (isCancelled && isCancelled()) { log('distop user — saldo tetap dibalikin ke hub dulu'); dibatalin = true; break; }
@@ -2534,6 +2578,7 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
     const rfqMin = Math.max(0, Number(M8.rfqMinUsd) || 10);
     if (kirimUsd < rfqMin) {
       log(`sisa ${deliver} cuma $${punyaUsd.toFixed(2)} — di bawah minimum $${rfqMin}, task dihentikan (dust dibiarkan)`);
+      alasan = langkah ? `sisa $${punyaUsd.toFixed(2)} < min $${rfqMin}` : `modal kurang ($${punyaUsd.toFixed(2)})`;
       break;
     }
     // qty SELALU satuan BASE, apa pun arahnya: kirim base = jumlah yg dilepas,
@@ -2547,54 +2592,159 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
     else if (terakhir) qty = floor6((kirimUsd / pxB) * 0.997);
     else qty = floor6(kirimUsd / pxB);
     log(`  ${st.cur}/${st.tgt} · kirim ${deliver} ~$${kirimUsd.toFixed(2)}${terakhir ? ' (terakhir — semua)' : ''}`);
+    // Token fee ditentukan DI SINI, saat quote: kirim daftar kandidat berurutan
+    // (termurah dulu, sudah dibuang yg saldonya tak sanggup bayar sekali fee lagi),
+    // server memilih yg pertama didukung market ini.
+    let siap = s1FeeSiap(semua, get, memo.jml);
+    if (!siap.length) {
+      const habis = semua.join('/');
+      log(`token fee habis semua (${habis}) — task dihentikan`);
+      alasan = `token fee habis (${habis})`;
+      break;
+    }
+    siap = s1UrutFee(siap, memo.usd);
     let hasil = null;
     try {
-      hasil = await s1Swap(ctx, mk, deliver, qty, feeTok);
+      hasil = await s1Swap(ctx, mk, deliver, qty, siap);
     } catch (e) {
-      if (e && (e.noLiquidity || e.transient)) { log(`  ${(e.message || '').slice(0, 70)} — ulang`); await sleep(6000); langkah++; continue; }
+      if (e && (e.noLiquidity || e.transient)) { log(`  ${(e.message || '').slice(0, 70)} — ulang`); await sleep(5000); langkah++; continue; }
       throw e;
+    }
+    // Belajar dari fee yg benar-benar ditagih: nilai USD-nya menentukan urutan
+    // kandidat berikutnya, jumlahnya menentukan kapan token itu dianggap habis.
+    if (hasil && hasil.feeSym && Number.isFinite(hasil.feeCC)) {
+      const fs = hasil.feeSym.toUpperCase();
+      memo.jml[fs] = hasil.feeCC;
+      const pxf = await usdPriceOf(sv, hasil.feeSym).catch(() => 0);
+      if (pxf > 0) memo.usd[fs] = hasil.feeCC * pxf;
+      feeTok = hasil.feeSym;
     }
     langkah++;
     // Volume dari nilai yg BENAR-BENAR dieksekusi (quoteQty × harga quote), bukan dari
     // kirimUsd yg cuma target sebelum quote keluar.
     volumeUsd += (hasil && Number.isFinite(hasil.quoteQty) && pxQ > 0) ? hasil.quoteQty * pxQ : kirimUsd;
-    // Tunggu counter task naik (settle async).
-    for (let i = 0; i < 12; i++) {
-      await sleep(5000);
+    // Tunggu counter task naik (settle async). Polling 2 dtk, bukan 5: counter biasanya
+    // sudah naik dalam ~4 dtk, dan tiap detik nunggu di sini dikali 30-an swap.
+    for (let i = 0; i < 25; i++) {
+      await sleep(2000);
       const s2 = await bacaTask();
       if (s2 && s2.cur > st.cur) { st = s2; break; }
       if (s2) st = s2;
     }
+    lapor({ langkah, cur: st.cur, tgt: st.tgt, feeTok });
   }
 
   // Pulang ke hub. Task yg gak nyentuh hub (HECTO-EDELx saat hub cETH) nyisain DUA
   // token, jadi dua-duanya dibalikin — bukan cuma sisi lawan.
   for (const sym of (bukanHub ? [mk.base, mk.quote] : [other])) {
-    await s1ToHub(ctx, sym, hub, feeTok, log);
+    await s1ToHub(ctx, sym, hub, s1UrutFee(s1FeeSiap(semua, await saldo(), memo.jml), memo.usd), log);
+    lapor({ langkah });
   }
 
   const getAkhir = await saldo().catch(() => (() => 0));
   const totalAkhir = nilaiTotal(getAkhir);
   const biayaTask = totalAwal - totalAkhir;   // termasuk seed + balik ke hub
-  const feeAkhir = getAkhir(feeTok);
-  const feeTerpakai = Math.max(0, feeAwal - feeAkhir);
-  const pxFee2 = await usdPriceOf(sv, feeTok).catch(() => 0);
-  const feeUsd = pxFee2 > 0 ? feeTerpakai * pxFee2 : null;
+  // Fee dijumlah PER TOKEN — dalam satu task bisa berpindah token kalau yg pertama habis.
+  const feePakai = [];
+  let feeUsd = 0;
+  for (const t of semua) {
+    const dipakai = Math.max(0, (feeAwal[t] || 0) - getAkhir(t));
+    if (dipakai <= 1e-9) continue;
+    const px = await usdPriceOf(sv, t).catch(() => 0);
+    feePakai.push({ tok: t, jml: dipakai, usd: px > 0 ? dipakai * px : null });
+    if (px > 0) feeUsd += dipakai * px;
+  }
+  // Kalau token fee kebetulan salah satu sisi market, angka spread kecampur fee.
+  const feeDiPasangan = feePakai.some(f => [mk.base, mk.quote].some(x => String(x).toUpperCase() === String(f.tok).toUpperCase()));
   if (langkah) {
-    // biayaTask = spread saja: fee dibayar token ketiga, jadi gak masuk hitungan ini.
-    // Kalau token fee kebetulan salah satu sisi market, angkanya kecampur — ditandai.
     const pct = volumeUsd > 0 ? (biayaTask / volumeUsd) * 100 : 0;
     log(`ringkas ${task.code}: ${langkah} swap · volume $${volumeUsd.toFixed(2)}`);
     log(`  spread $${biayaTask.toFixed(3)} (${pct.toFixed(3)}% volume, $${(biayaTask / langkah).toFixed(3)}/swap)`
       + `${feeDiPasangan ? ' [kecampur fee: token fee = sisi market]' : ''}`);
-    log(`  fee    ${feeTerpakai.toFixed(4)} ${feeTok}${feeUsd != null ? ` ($${feeUsd.toFixed(2)}, $${(feeUsd / langkah).toFixed(3)}/swap)` : ''}`);
-    log(`  TOTAL  $${(biayaTask + (feeUsd || 0)).toFixed(3)} buat ${langkah} swap`);
+    log(`  fee    ${feePakai.map(f => `${f.jml.toFixed(4)} ${f.tok}`).join(' + ') || '-'}`
+      + `${feeUsd > 0 ? ` ($${feeUsd.toFixed(2)}, $${(feeUsd / langkah).toFixed(3)}/swap)` : ''}`);
+    log(`  TOTAL  $${(biayaTask + feeUsd).toFixed(3)} buat ${langkah} swap`);
   }
   return {
-    done: langkah, cancelled: dibatalin, feeTok,
-    spreadUsd: biayaTask, volumeUsd, feeAmount: feeTerpakai, feeUsd, biayaTask,
-    totalUsd: biayaTask + (feeUsd || 0),
+    done: langkah, cancelled: dibatalin, feeTok, feePakai, alasan,
+    cur: st.cur, tgt: st.tgt,
+    spreadUsd: biayaTask, volumeUsd, feeUsd, biayaTask,
+    totalUsd: biayaTask + feeUsd,
   };
+}
+
+// ── Dashboard strategi 1 ────────────────────────────────────────────────────
+// Gaya sama dengan monitor saldo & mode ping-pong: satu kotak, satu baris per akun,
+// log aktivitas di bawah. Dipakai supaya jalannya strategi kelihatan sekaligus untuk
+// semua akun — versi cetak-baris sebelumnya cuma menampilkan akun yang lagi jalan
+// dan sisanya kelihatan seperti menggantung.
+const S1UI = { rows: [], log: [], mulai: 0, judul: '' };
+function s1LogUI(msg, color) {
+  S1UI.log.push(paint(new Date().toLocaleTimeString('id-ID') + ' ', COLOR.gray) + (color ? paint(msg, color) : msg));
+  if (S1UI.log.length > 300) S1UI.log.splice(0, S1UI.log.length - 300);
+}
+function s1RenderUI() {
+  if (!S1UI.rows.length) return;
+  computeLayout(); clearScreen();
+  const durasi = S1UI.mulai ? Math.round((Date.now() - S1UI.mulai) / 1000) : 0;
+  const jam = `${String(Math.floor(durasi / 3600)).padStart(2, '0')}:${String(Math.floor(durasi / 60) % 60).padStart(2, '0')}:${String(durasi % 60).padStart(2, '0')}`;
+
+  const warnaStatus = { tunggu: COLOR.gray, jalan: COLOR.cyan, selesai: COLOR.green, gagal: COLOR.red, batal: COLOR.yellow, lewat: COLOR.yellow };
+  const cell = (r) => ({
+    akun: r.label,
+    status: paint(r.status, warnaStatus[r.status] || COLOR.white),
+    task: paint(r.taskPendek || '-', r.status === 'jalan' ? COLOR.bold : COLOR.gray),
+    progres: r.tgt ? paint(`${r.cur}/${r.tgt}`, r.cur >= r.tgt ? COLOR.green : COLOR.white) : paint('-', COLOR.gray),
+    // Task ke berapa dari total, biar kelihatan sisa pekerjaannya.
+    tahap: paint(`${r.taskIdx}/${r.taskTotal}`, COLOR.gray),
+    swap: paint(String(r.swap || 0), COLOR.white),
+    hub: paint(r.hubUsd != null ? '$' + r.hubUsd.toFixed(2) : '-', COLOR.yellow),
+    fee: paint(r.feeStr || '-', COLOR.mag),
+    spread: paint(r.spreadUsd ? '$' + r.spreadUsd.toFixed(2) : '-', COLOR.cyan),
+    total: paint(r.totalUsd ? '$' + r.totalUsd.toFixed(2) : '-', r.totalUsd ? COLOR.red : COLOR.gray),
+    ket: paint(truncVis(r.ket || '', 34), COLOR.gray),
+  });
+  const head = {
+    akun: 'AKUN', status: 'STATUS', task: 'TASK', progres: 'PROGRES', tahap: 'TAHAP',
+    swap: 'SWAP', hub: 'HUB', fee: 'FEE', spread: 'SPREAD', total: 'BIAYA', ket: 'KETERANGAN',
+  };
+  const rows = S1UI.rows.map(cell);
+  // Baris TOTAL: yang dilihat user pertama kali itu berapa habisnya, jadi dijumlahkan.
+  const tot = S1UI.rows.reduce((a, r) => ({
+    swap: a.swap + (r.swap || 0), spread: a.spread + (r.spreadUsd || 0),
+    total: a.total + (r.totalUsd || 0), selesai: a.selesai + (r.status === 'selesai' ? 1 : 0),
+  }), { swap: 0, spread: 0, total: 0, selesai: 0 });
+  const totalRow = {
+    akun: `TOTAL (${tot.selesai}/${S1UI.rows.length})`, status: '', task: '', progres: '', tahap: '',
+    swap: paint(String(tot.swap), COLOR.bold), hub: '',
+    fee: '', spread: paint('$' + tot.spread.toFixed(2), COLOR.cyan), total: paint('$' + tot.total.toFixed(2), COLOR.red), ket: '',
+  };
+  const all = [head, ...rows, totalRow];
+  const KEYS = Object.keys(head);
+  const w = {};
+  for (const k of KEYS) w[k] = Math.max(...all.map(r => visLen(r[k] || '')));
+  const GAP = '  ';
+  const mk = (r, style) => {
+    const body = KEYS.map((k, i) => pad(r[k] || '', w[k], i === 0 || k === 'ket' ? 'right' : 'left')).join(GAP);
+    return row(style ? paint(body, style) : body);
+  };
+  const out = [line()];
+  out.push(row(paint(` ${S1UI.judul || 'Strategi 1'} — ${jam} berjalan `, COLOR.bold + COLOR.cyan)));
+  out.push(row(paint(new Date().toLocaleString('id-ID') + '   ·   q berhenti setelah swap berjalan   ·   Ctrl+C paksa', COLOR.gray)));
+  out.push(sep());
+  out.push(mk(head, COLOR.bold + COLOR.gray));
+  out.push(sep());
+  for (const r of rows) out.push(mk(r));
+  out.push(sep());
+  out.push(mk(totalRow, COLOR.bold));
+  out.push(sep());
+  out.push(row(paint('▎ aktivitas', COLOR.bold + COLOR.cyan)));
+  const avail = Math.max(MIN_ACTIVITY_LINES, ROWS - out.length - 2);
+  const slice = S1UI.log.slice(-avail);
+  if (!slice.length) out.push(row(paint('(belum ada)', COLOR.gray)));
+  else slice.forEach(l => out.push(row(l)));
+  out.push(endl());
+  process.stdout.write(out.join('\n') + '\n');
 }
 
 // Tunggu yg BISA DIBATALIN: tekan q (atau Esc) buat berhenti, Ctrl+C keluar.
@@ -2607,7 +2757,13 @@ function watchCancelKey() {
   try { if (_rl) { _rl.close(); _rl = null; } } catch (_) { }
   let hit = false;
   const onKey = (str, key) => {
-    if (key && key.ctrl && key.name === 'c') { try { process.stdin.setRawMode(false); } catch (_) { } process.exit(0); }
+    if (key && key.ctrl && key.name === 'c') {
+      // Di raw mode Ctrl+C TIDAK jadi SIGINT, jadi tanpa pesan ini prosesnya kelihatan
+      // mati sendiri tanpa sebab — persis yg bikin bingung waktu run di VPS berhenti.
+      try { process.stdin.setRawMode(false); } catch (_) { }
+      process.stdout.write('\n' + paint('Ctrl+C — dihentikan paksa. Swap yg lagi jalan tidak ditunggu.', COLOR.yellow) + '\n');
+      process.exit(130);
+    }
     if (str === 'q' || str === 'Q' || (key && key.name === 'escape')) hit = true;
   };
   readline.emitKeypressEvents(process.stdin);
@@ -3995,6 +4151,9 @@ async function swapOnceAtomic(ctx, side, baseQty) {
   // nilai yg BENAR-BENAR dieksekusi, bukan dari perkiraan ukuran sebelum quote keluar.
   return {
     ok: true, direction: side, quoteId: pick.quoteId, feeCC: Number.isFinite(feeCC) ? feeCC : null,
+    // Token fee yg BENAR-BENAR ditagih quote ini. Dipakai strategi 1 buat mengoreksi
+    // urutan kandidat tanpa panggilan pembanding apa pun.
+    feeSym: symbolOfInstrument((q.lpFees && q.lpFees[0] && q.lpFees[0].instrumentId) || 'Amulet'),
     settled: 1, dust: 0, dustEdelx: 0,
     market, baseQty: Number(baseQty), quoteQty: Number(pick.quoteQuantity),
     price: Number(pick.price != null ? pick.price : (Number(pick.quoteQuantity) / Number(baseQty))),
@@ -7122,7 +7281,7 @@ async function runRegister() {
 const argv = process.argv.slice(2);
 // buildSwapClients/SWAP/transferCC ikut diekspor biar bisa diprobe dari skrip luar
 // tanpa nyalain bot (require aman: runMain kegate `require.main === module`).
-module.exports = { renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
+module.exports = { s1RenderUI, S1UI, s1LogUI, renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
 
 if (require.main === module) {
   if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
@@ -8530,79 +8689,97 @@ Usage:
         if (!pilihFee.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
         const kandidat = pilihFee.map(i => kandidatAwal[i]);
 
-        // 4) bot pilih yg TERMURAH dalam USD (nominal antar token beda jauh)
-        process.stdout.write('\n' + paint('Bandingkan fee (nilai USD)…', COLOR.gray) + '\n');
-        let feeTok = kandidat[0];
-        try {
-          const { sv: sv1, partyId: pid1 } = await buildSwapClients(states[pilihAkun[0]]);
-          const q = await feeQuotesUsd(sv1, pid1, tasks[0].market, kandidat, S1.firstUsd);
-          for (const x of q) process.stdout.write(`  ${String(x.tok).padEnd(7)} ${x.amount != null ? String(x.amount).padEnd(10) : '-'.padEnd(10)} ${x.usd != null ? '≈ $' + x.usd.toFixed(4) : x.note}\n`);
-          const valid = q.filter(x => x.usd != null);
-          if (valid.length) { valid.sort((a, b) => a.usd - b.usd); feeTok = valid[0].tok; }
-          process.stdout.write(paint(`  → dipilih ${feeTok}`, COLOR.green) + '\n');
-        } catch (e) { process.stdout.write(paint(`  gagal bandingin (${e.message}) — pakai ${feeTok}`, COLOR.yellow) + '\n'); }
+        // 4) Tidak ada langkah pembanding fee lagi. Server memperlakukan `feeTokens`
+        // sebagai URUTAN PREFERENSI dan menjawab dengan yg pertama didukung market,
+        // jadi keputusan token fee jatuh DI DALAM quote — nol panggilan tambahan, dan
+        // otomatis pindah token begitu yg pertama saldonya habis.
+        const kandidatUrut = s1UrutFee(kandidat, {});
+        process.stdout.write('\n' + paint(`Token fee: ${kandidatUrut.join(' → ')} (termurah dulu; ditentukan saat quote, pindah sendiri kalau habis)`, COLOR.gray) + '\n');
 
-        // 4b) perkiraan biaya sebelum jalan: spread RFQ per market × sisa swap, plus fee.
-        // Spread ini yg bikin modal susut, dan nilainya bisa BERKALI-LIPAT fee —
-        // diukur live HECTO-EDELx 4.05% vs HECTO-cETH 0.61%.
-        try {
-          const { sv: sv2, partyId: pid2 } = await buildSwapClients(states[pilihAkun[0]]);
-          const tArr = await sv2.earnTasks(pid2).catch(() => null);
-          const feeSatu = (() => { const v = (feeTok && kandidat.includes(feeTok)) ? feeTok : kandidat[0]; return v; })();
-          process.stdout.write('\n' + paint('Perkiraan biaya per akun (spread RFQ diukur live):', COLOR.bold) + '\n');
-          let totSpread = 0, totSwap = 0;
-          for (const t of tasks) {
-            const it = s1FindTask(tArr, t.code);
-            const pr = it ? s1Progress(it, t.target) : { cur: 0, tgt: t.target || 10 };
-            const sisa = Math.max(0, pr.tgt - pr.cur);
-            if (!sisa) { process.stdout.write(paint(`  ${t.market.padEnd(13)} udah ${pr.cur}/${pr.tgt} — dilewati\n`, COLOR.gray)); continue; }
-            const r = await rfqSpread(sv2, pid2, t.market, S1.stepUsd, feeSatu).catch(() => null);
-            if (!r || r.err) { process.stdout.write(paint(`  ${t.market.padEnd(13)} spread gak keukur\n`, COLOR.yellow)); continue; }
-            const biaya = r.perSwapUsd * sisa;
-            totSpread += biaya; totSwap += sisa;
-            const warna = r.spreadPct > 3 ? COLOR.red : (r.spreadPct > 1.5 ? COLOR.yellow : COLOR.green);
-            process.stdout.write(`  ${t.market.padEnd(13)} sisa ${String(sisa).padStart(2)} swap · spread `
-              + paint(`${r.spreadPct.toFixed(2)}%`.padEnd(7), warna) + `≈ $${biaya.toFixed(2)}\n`);
-          }
-          const feeQ = await feeQuotesUsd(sv2, pid2, tasks[0].market, [feeSatu], S1.stepUsd).catch(() => []);
-          const feeSwapUsd = (feeQ[0] && feeQ[0].usd) || null;
-          const totFee = feeSwapUsd != null ? feeSwapUsd * totSwap : null;
-          process.stdout.write(paint(`  → ${totSwap} swap: spread ≈ $${totSpread.toFixed(2)}`
-            + (totFee != null ? ` + fee ≈ $${totFee.toFixed(2)} = $${(totSpread + totFee).toFixed(2)}` : '')
-            + ` per akun\n`, COLOR.bold));
-        } catch (e) { process.stdout.write(paint(`  perkiraan biaya gagal: ${e.message}\n`, COLOR.yellow)); }
-
-        const conf = (await prompt(paint(`\nKetik "go" buat jalan (${pilihAkun.length} akun, fee dipilih per-market dari ${kandidat.join('/')}), Enter batal: `, COLOR.bold + COLOR.yellow))).trim().toLowerCase();
+        const conf = (await prompt(paint(`\nKetik "go" buat jalan (${pilihAkun.length} akun), Enter batal: `, COLOR.bold + COLOR.yellow))).trim().toLowerCase();
         if (conf !== 'go') { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
 
-        // 5) jalan
+        // 5) jalan — akun DIPARALELKAN. Sebelumnya berurutan, sehingga 15 akun berarti
+        // 15 × ~20 menit; sekarang sebatas swap.loginConcurrency seperti mode ping-pong.
         const mkAll = await fetchMarkets((await buildSwapClients(states[pilihAkun[0]])).sv);
         const batal = watchCancelKey();
-        process.stdout.write(paint('tekan q kapan saja buat berhenti setelah swap yg lagi jalan\n', COLOR.gray));
+        S1UI.rows = pilihAkun.map(i => ({
+          idx: i, label: ACCOUNTS[i].label || ACCOUNTS[i].email, status: 'tunggu',
+          taskIdx: 0, taskTotal: tasks.length, swap: 0, spreadUsd: 0, totalUsd: 0, ket: '',
+        }));
+        S1UI.mulai = Date.now();
+        S1UI.log = [];
+        S1UI.judul = `Strategi 1 — hub ${hub} · fee ${kandidatUrut.join('/')}`;
+        const barisAkun = new Map(S1UI.rows.map(r => [r.idx, r]));
+        const tulis = () => s1RenderUI();
+        const timerUI = setInterval(tulis, 1000);
+        tulis();
+
+        const conc = Math.max(1, Number((CONFIG.swap || {}).loginConcurrency) || 5);
         let sukses = 0, gagal = 0;
-        for (const i of pilihAkun) {
-          if (batal.cancelled()) { process.stdout.write(paint('distop user — sisa akun dilewati\n', COLOR.yellow)); break; }
+        await mapLimit(pilihAkun, conc, async (i) => {
           const a = ACCOUNTS[i], tag = a.label || a.email;
-          process.stdout.write('\n' + paint(`▎ ${tag}`, COLOR.bold + COLOR.cyan) + '\n');
+          const r = barisAkun.get(i);
+          if (batal.cancelled()) { r.status = 'batal'; r.ket = 'dibatalin sebelum mulai'; return; }
+          r.status = 'jalan';
+          const log = (m) => s1LogUI(`[${tag}] ${m}`);
           try {
             const clients = await buildSwapClients(states[i]);
             let usc = getUserServiceCid(a.email);
             if (!usc) { const pty = await clients.sv.recoverParty(clients.partyId).catch(() => null); if (pty) { usc = pty.userServiceCid; patchAcctSession(a.email, { userServiceCid: usc }); } }
             if (!usc) throw new Error('userServiceCid gak ada — party belum onboard?');
-            const ctx = { ...clients, email: a.email, label: tag, userServiceCid: usc, minUsd: M8.minUsd, log: () => { } };
-            const log = (m) => process.stdout.write(paint(`  ${m}`, COLOR.gray) + '\n');
-            for (const t of tasks) {
+            const ctx = {
+              ...clients, email: a.email, label: tag, userServiceCid: usc, minUsd: M8.minUsd,
+              log: () => { },
+              onProgress: (p) => {
+                r.taskPendek = String(p.task || '').replace(/_DAY_TRADER$/, '');
+                r.market = p.market; r.cur = p.cur; r.tgt = p.tgt;
+                if (p.feeTok) r.feeStr = p.feeTok;
+                if (Number.isFinite(p.langkah)) r.swapTask = p.langkah;
+              },
+            };
+            const alasanTask = [];
+            const pxHub = await usdPriceOf(clients.sv, hub).catch(() => 0);
+            const get0 = await s1Balances(ctx).catch(() => null);
+            if (get0 && pxHub > 0) r.hubUsd = get0(hub) * pxHub;
+
+            for (let ti = 0; ti < tasks.length; ti++) {
+              if (batal.cancelled()) { r.status = 'batal'; break; }
+              const t = tasks[ti];
+              r.taskIdx = ti + 1;
+              r.taskPendek = t.code.replace(/_DAY_TRADER$/, '');
               const mk = mkAll.find(x => x.id === t.market);
               if (!mk) { log(`market ${t.market} gak ada — dilewati`); continue; }
-              if (batal.cancelled()) break;
-              await s1RunTask(ctx, t, mk, hub, kandidat, S1, log, batal.cancelled);
+              const hasil = await s1RunTask(ctx, t, mk, hub, kandidatUrut, S1, log, batal.cancelled);
+              alasanTask.push(hasil.alasan || (hasil.skipped ? 'dilewati' : ''));
+              if (hasil.cur != null) { r.cur = hasil.cur; r.tgt = hasil.tgt; }
+              r.swap += hasil.done || 0;
+              r.spreadUsd += hasil.spreadUsd || 0;
+              r.totalUsd += hasil.totalUsd || 0;
+              if (hasil.feePakai && hasil.feePakai.length) r.feeStr = hasil.feePakai.map(f => `${f.jml.toFixed(2)} ${f.tok}`).join('+');
+              if (hasil.cancelled) { r.status = 'batal'; break; }
+              const gp = await s1Balances(ctx).catch(() => null);
+              if (gp && pxHub > 0) r.hubUsd = gp(hub) * pxHub;
             }
-            sukses++;
-            process.stdout.write(paint(`  ✓ ${tag} selesai`, COLOR.green) + '\n');
-          } catch (e) { gagal++; process.stdout.write(paint(`  ✗ ${tag} — ${(e && e.message) || e}`, COLOR.red) + '\n'); }
-        }
+            if (r.status !== 'batal') {
+              // "selesai" hanya kalau memang ada yg dikerjakan atau semua task sudah
+              // penuh. Akun tanpa modal dulu ikut dilabeli selesai — menyesatkan.
+              const adaHambatan = alasanTask.filter(x => x && x !== 'penuh');
+              if (!r.swap && adaHambatan.length) { r.status = 'lewat'; r.ket = adaHambatan[0]; }
+              else { r.status = 'selesai'; r.ket = r.swap ? `${r.swap} swap` : 'semua task sudah penuh'; sukses++; }
+            } else r.ket = 'dihentikan user';
+            log(r.status === 'batal' ? 'dihentikan' : (r.status === 'lewat' ? `dilewati — ${r.ket}` : 'selesai'));
+          } catch (e) {
+            gagal++; r.status = 'gagal'; r.ket = ((e && e.message) || String(e)).slice(0, 34);
+            log(paint(`GAGAL: ${(e && e.message) || e}`, COLOR.red));
+          }
+          tulis();
+        });
+        clearInterval(timerUI);
         batal.stop();
+        tulis();
         process.stdout.write('\n' + paint(`strategi selesai — ${sukses} akun beres, ${gagal} gagal`, gagal ? COLOR.yellow : COLOR.green) + '\n');
+        await prompt(paint('Enter buat balik ke menu…', COLOR.gray));
         continue;
       }
 

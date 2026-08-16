@@ -307,10 +307,15 @@ Yang perlu diketahui sebelum mengubahnya:
   bertanya dengan `quantity: '1'`; 1 EDELx ≈ $0.007 sehingga server tidak menjawab sama
   sekali dan semua kandidat tampak "gak ada quote". Ukurannya sekarang dihitung dari nilai
   USD dibagi harga base.
-- **Token fee dipilih PER MARKET, bukan sekali di awal.** Ketersediaannya berbeda: diukur
-  live di `HECTO-EDELx` TUSDT tidak menghasilkan quote sementara USD8 menghasilkan. Kandidat
-  juga disaring dulu ke token yang benar-benar dipegang akun — quote tetap keluar walau
-  saldonya nol.
+- **`feeTokens` adalah URUTAN PREFERENSI, bukan daftar untuk dibandingkan.** Dikirim
+  `["TUSDT","USD8","USDCx","CC"]` server menjawab dengan yang **pertama** didukung market itu
+  — terverifikasi live: kirim empat token, balasannya tetap dua quote dan dua-duanya TUSDT;
+  `["USD8","TUSDT"]` menghasilkan USD8. Jadi token fee ditentukan **di dalam quote**, tanpa
+  satu pun panggilan pembanding, dan **membuang token yang saldonya habis dari daftar =
+  otomatis pindah** ke token berikutnya. Urutan awalnya peringkat statis (stabil dulu: rasio
+  CC:USDCx:TUSDT ~22:2:1) lalu dikoreksi dari fee yang benar-benar ditagih tiap quote.
+  Jangan kembalikan pola "kutip tiap kandidat lalu bandingkan" — itu 4 RFQ per market
+  hanya untuk memilih, dan tetap salah begitu saldonya habis di tengah jalan.
 - **`maxFeeCC` satuannya ikut token fee**, sehingga batas 5 (wajar untuk CC yang fee-nya
   ~6.66) sama sekali tidak mengikat untuk TUSDT yang fee-nya ~0.15. `strategy1.maxFeeUsd`
   dipatok dalam USD lalu dikonversi ke satuan token terpilih di awal tiap task.
@@ -324,6 +329,13 @@ Yang perlu diketahui sebelum mengubahnya:
 
 Biaya terukur satu putaran penuh 3 task pada satu akun: 29 swap, fee 4.35 TUSDT (29 × 0.15,
 flat), modal cETH susut $77.70 → $73.48 termasuk spread. Durasi ~21 menit.
+
+Akun dijalankan **paralel** (`swap.loginConcurrency`, seperti mode ping-pong) dan progresnya
+tampil di dashboard `s1RenderUI()` — satu baris per akun, log aktivitas bertanda akun di
+bawahnya. Versi berurutan + cetak baris membuat 15 akun berarti 15 × ~20 menit dan hanya akun
+yang sedang jalan yang terlihat. Harga USD di-cache 30 detik (`usdPriceOf`): tiap swap butuh
+harga base dan quote, jadi tanpa cache satu putaran menembak ~64 request harga yang jawabannya
+praktis sama.
 
 ### Spread: proporsional, sedangkan fee flat — ini yang menentukan ukuran swap
 
