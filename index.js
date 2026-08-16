@@ -755,6 +755,7 @@ const M8 = {
       stepUsd: _m8num(s.stepUsd, 12),
       seedUsd: _m8num(s.seedUsd, 16),
       maxFeeUsd: _m8num(s.maxFeeUsd, 1),
+      swapTimeoutSec: _m8num(s.swapTimeoutSec, 240),
       tasks: Array.isArray(s.tasks) ? s.tasks.filter(t => t && t.code && t.market) : [],
     };
   })(),
@@ -2428,6 +2429,23 @@ async function rfqSpread(sv, partyId, market, usdValue, feeTok) {
 // balasannya tetap 2 quote, dua-duanya TUSDT). Jadi token fee tidak perlu dibanding
 // lewat panggilan terpisah: cukup kirim daftarnya, keputusan jatuh di dalam quote.
 // Menghapus token yg saldonya habis dari daftar = otomatis pindah ke token berikutnya.
+// Satu swap TIDAK boleh menggantung tanpa batas. Kalau RFQ/settle diam (LP hilang,
+// jaringan setengah mati), tanpa batas ini seluruh akun ikut membeku dan dari luar
+// terlihat "stuck" tanpa satu baris log pun. Lewat batas = dianggap transient supaya
+// langkah yang sama diulang, bukan akunnya digugurkan.
+function s1WithTimeout(promise, ms, label) {
+  if (!(ms > 0)) return promise;
+  let t = null;
+  const batas = new Promise((_, rej) => {
+    t = setTimeout(() => {
+      const e = new Error(`${label} lewat ${Math.round(ms / 1000)}s — dilepas`);
+      e.transient = true;
+      rej(e);
+    }, ms);
+  });
+  return Promise.race([promise, batas]).finally(() => { if (t) clearTimeout(t); });
+}
+
 async function s1Swap(ctx, mk, deliver, qtyBase, feeTok) {
   const isBase = String(deliver).toUpperCase() === String(mk.base).toUpperCase();
   const leg = {
@@ -2438,7 +2456,10 @@ async function s1Swap(ctx, mk, deliver, qtyBase, feeTok) {
   // CC = default server kalau feeTokens dikosongkan; kirim ["CC"] sendirian percuma.
   const ft = (daftar.length === 1 && daftar[0].toUpperCase() === 'CC') ? [] : daftar;
   const c = { ...ctx, leg, feeTokens: ft };
-  return swapOnceAtomic(c, isBase ? 'sell' : 'buy', fmt10(String(qtyBase)));
+  const batasMs = Math.max(0, Number((M8.strategy1 || {}).swapTimeoutSec) || 0) * 1000;
+  return s1WithTimeout(
+    swapOnceAtomic(c, isBase ? 'sell' : 'buy', fmt10(String(qtyBase))),
+    batasMs, `swap ${mk.id} kirim ${deliver}`);
 }
 
 // Urutan kandidat fee: termurah dulu. Awalnya pakai peringkat statis (stabil dulu —
@@ -4469,7 +4490,19 @@ function renderAccountsTable(states) {
     },
     { title: 'STREAK', prio: 4, cap: 6, cell: s => [s.streak != null ? String(s.streak) : '-', COLOR.yellow] },
     ]),
-    { title: 'FEE/hr', prio: 3, cap: 8, cell: s => [Number(s.feeToday) > 0 ? Number(s.feeToday).toFixed(1) : '0', COLOR.yellow] },
+    // FEE/hr = fee HARI INI (reset 07:00 WIB), bukan per jam — nama lama dipertahankan
+    // supaya tidak mengubah tampilan engine lain. Di strategi 1 fee dibayar TUSDT/USD8,
+    // yang masuk ember feeTokToday, jadi kolom CC-nya akan selalu 0 dan menyesatkan:
+    // di mode itu yang ditampilkan ember token.
+    (SESSION_ENGINE === 'strategi1'
+      ? {
+        title: 'FEE/hr', prio: 3, cap: 12, cell: s => {
+          const tok = Number(s.feeTokToday) || 0;
+          if (tok > 0) return [`${tok.toFixed(2)} ${s.feeTokUnit || ''}`.trim(), COLOR.yellow];
+          return [Number(s.feeToday) > 0 ? Number(s.feeToday).toFixed(1) : '0', COLOR.yellow];
+        }
+      }
+      : { title: 'FEE/hr', prio: 3, cap: 8, cell: s => [Number(s.feeToday) > 0 ? Number(s.feeToday).toFixed(1) : '0', COLOR.yellow] }),
     // SEASON = total fee CC kebakar seumur season (gak roll harian). Persist di
     // session.json → survive re-run. Reset cuma manual: menu 5 → b) reset season.
     { title: 'FEE/SN', prio: 2, cap: 11, cell: s => [fmtSeason(s.feeSeason), COLOR.mag] },
@@ -4735,6 +4768,18 @@ function logActivity(msg, color) {
   if (DASH_ACTIVITY.length > DASH_ACTIVITY_MAX) DASH_ACTIVITY.splice(0, DASH_ACTIVITY.length - DASH_ACTIVITY_MAX);
   if (global.__states) scheduleRender();
 }
+// Tulis ke panel log SATU akun saja (tidak ke panel SYSTEM). Dipakai buat detail
+// langkah swap: kalau semuanya ikut ke SYSTEM, panel utama tenggelam; kalau dibuang
+// seperti sebelumnya, layar diam berpuluh detik saat swap jalan dan terlihat macet.
+function logAkun(state, msg, color) {
+  if (!state) return;
+  if (!Array.isArray(state.log)) state.log = [];
+  const lineStr = paint(new Date().toLocaleTimeString('id-ID') + ' ', COLOR.gray) + (color ? paint(String(msg), color) : String(msg));
+  state.log.push(lineStr);
+  if (state.log.length > ACCT_LOG_MAX) state.log.splice(0, state.log.length - ACCT_LOG_MAX);
+  if (global.__states) scheduleRender();
+}
+
 function renderActivityLog(maxLines) {
   const st = global.__states || [];
   const n = st.length;
@@ -8742,7 +8787,10 @@ Usage:
             };
             const ctx = {
               ...clients, email: a.email, label: tag, userServiceCid: usc, minUsd: M8.minUsd,
-              log: () => { },
+              // Detail tiap langkah swap masuk panel akun ini (lihat dengan ↑/↓),
+              // bukan ke panel SYSTEM — biar SYSTEM tetap ringkas tapi tidak ada
+              // periode diam tanpa keterangan waktu swap sedang berjalan.
+              log: (m) => logAkun(st2, m),
               rebuild: () => rebuild(),
               onProgress: (p) => {
                 st2.s1.task = String(p.task || '').replace(/_DAY_TRADER$/, '');

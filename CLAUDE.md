@@ -331,6 +331,12 @@ Yang perlu diketahui sebelum mengubahnya:
 - **Swap terakhir menguras habis** — tapi HANYA kalau yang dikirim sisi bukan hub. Kalau yang
   dikirim justru hub, menguras berarti melempar seluruh modal ke token lawan lalu menariknya
   kembali: dua swap raksasa, spread dua kali.
+- **Satu swap punya batas waktu** (`strategy1.swapTimeoutSec`, default 240 dtk). Tanpa itu
+  RFQ/settle yang diam membekukan akun tanpa satu baris log pun dan dari luar terlihat macet.
+  Lewat batas ditandai `transient` sehingga langkah yang sama diulang, bukan akun digugurkan.
+  Detail langkah swap (`ctx.log`) dialirkan ke panel log **akun** lewat `logAkun()`, bukan
+  dibuang dan bukan ke panel SYSTEM: dibuang membuat layar diam berpuluh detik saat swap
+  berjalan, ke SYSTEM membuat panel utama tenggelam.
 - **Error proxy bukan alasan menggugurkan akun.** `proxy connect timeout` / IP diblokir
   dirotasi (`rotateProxy`) lalu klien dibangun ulang lewat `ctx.rebuild()` dan langkah yang
   sama diulang — `langkah` sengaja tidak dinaikkan karena swapnya belum terjadi. Sebelumnya
@@ -396,6 +402,27 @@ bersamaan, `HECTO-cETH` 0.61 %, `EDELx-cETH` 2.02 %, `HECTO-EDELx` 4.05 %.
 
 Model ini sudah dicocokkan dengan realisasi: satu putaran penuh 3 task diprediksi
 9×$0.121 + 9×$0.037 + 11×$0.243 = **$4.10**, realisasinya **$4.22** (selisih 3 %).
+
+### Kolom fee/loss di dashboard: harian vs season, CC vs token
+
+Empat kolom itu dipakai bersama semua engine dan gampang disalahartikan:
+
+| kolom | isi | reset |
+| --- | --- | --- |
+| `FEE/hr` | fee **hari ini** — namanya menyesatkan, bukan per jam | otomatis 07:00 WIB |
+| `FEE/SN` | fee **CC** sejak awal season | manual, menu 5 → b |
+| `FEE-TOK` | fee **non-CC** season (TUSDT/USD8) + satuannya | manual, sama |
+| `LOSS$/hr` / `LOSS/SN` | spread USD harian / season | 07:00 WIB / manual |
+
+`persistDaily` memisahkan ember CC (`feeToday`/`feeSeason`) dari ember non-CC
+(`feeTokToday`/`feeTokSeason` + `feeTokUnit`) supaya angkanya tidak tertimbun jadi satu.
+Konsekuensinya: strategi 1 membayar TUSDT/USD8, jadi kolom CC-nya **selalu 0** dan yang
+bergerak `FEE-TOK`. Karena itu di `SESSION_ENGINE === 'strategi1'` kolom `FEE/hr` menampilkan
+ember token (`feeTokToday` + unit), bukan CC — kalau tidak, kolomnya nol terus dan pembacanya
+menyimpulkan bot tidak membayar fee.
+
+Kolom `FEE/SN` yang besar (ratusan sampai ribuan CC) itu warisan sesi ping-pong/day-trader
+sebelumnya, bukan biaya strategi 1.
 
 ### Resilience patterns worth preserving
 
