@@ -21,3 +21,6 @@ node_modules/
 __MACOSX/
 walley_wallets.jsonl
 party-ids.txt
+
+# Alat inspeksi lokal (Chromium capture). Keluarannya bisa memuat token sesi.
+tools/
