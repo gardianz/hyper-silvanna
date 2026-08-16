@@ -3429,7 +3429,7 @@ async function swapOnceAtomic(ctx, side, baseQty) {
     // Instrumennya dibaca dari q.lpFees — fee0 baru dideklarasi jauh di bawah, jadi
     // nyentuh dia di sini kena TDZ ("Cannot access 'fee0' before initialization").
     const _fi = (q.lpFees && q.lpFees[0] && q.lpFees[0].instrumentId) || 'Amulet';
-    const feeUnit = String(_fi).toUpperCase() === 'AMULET' ? 'CC' : _fi;
+    const feeUnit = symbolOfInstrument(_fi);
     log(`Fee RFQ: ${feeCC} ${feeUnit} (batas ${feeCap})`);
     if (feeCC > feeCap) { const e = new Error(`fee ${feeCC} CC > batas ${feeCap} CC`); e.feeSpike = true; e.feeCC = feeCC; throw e; }
   }
@@ -3606,7 +3606,7 @@ async function swapOnceAtomic(ctx, side, baseQty) {
     }],
     disclosedContracts: disclosed,
   };
-  log(`AtomicDVP_Settle: ${disclosed.length} disclosed · fee ${feeCC} ${(fee0 && fee0.instrumentId && String(fee0.instrumentId).toUpperCase() !== 'AMULET') ? fee0.instrumentId : 'CC'}`);
+  log(`AtomicDVP_Settle: ${disclosed.length} disclosed · fee ${feeCC} ${symbolOfInstrument((fee0 && fee0.instrumentId) || 'Amulet')}`);
 
   // 7. prepare → sign → submit.
   const prep = await canton.prepareTransaction(body);
@@ -4056,6 +4056,20 @@ const FEE_TOKEN_INSTRUMENT = { CC: 'Amulet', AMULET: 'Amulet', USDCX: 'USDCx', T
 // Bukan cuma urusan fee — menu swap juga perlu, karena CC itu instrument "Amulet"
 // dan TUSDT itu "tf-usdt". Nyari pakai nama menu bikin saldo kebaca 0 padahal ada.
 function instrumentIdOf(tok) { return feeInstrumentOf(tok); }
+// Peta BALIK instrumentId -> simbol, khusus buat tampilan. Tanpa ini fee USD8
+// kecetak sebagai UUID mentah "8694894e-f159-..." yg gak ada artinya buat user.
+function symbolOfInstrument(id) {
+  const v = String(id || '');
+  for (const [sym, inst] of Object.entries(FEE_TOKEN_INSTRUMENT)) {
+    if (String(inst).toLowerCase() === v.toLowerCase()) {
+      // Ejaan kanonik diambil dari FEE_TOKEN_IDS — kunci petanya huruf besar semua
+      // ("USDCX"), padahal yg mau ditampilin "USDCx".
+      const kanon = FEE_TOKEN_IDS.find(t => t.toUpperCase() === sym.toUpperCase());
+      return kanon || (sym === 'AMULET' ? 'CC' : sym);
+    }
+  }
+  return v;
+}
 function feeInstrumentOf(tok) {
   const k = String(tok || 'CC').toUpperCase();
   return FEE_TOKEN_INSTRUMENT[k] || String(tok);
@@ -6699,7 +6713,7 @@ async function runRegister() {
 const argv = process.argv.slice(2);
 // buildSwapClients/SWAP/transferCC ikut diekspor biar bisa diprobe dari skrip luar
 // tanpa nyalain bot (require aman: runMain kegate `require.main === module`).
-module.exports = { swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
+module.exports = { symbolOfInstrument, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
 
 if (require.main === module) {
   if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
@@ -7913,7 +7927,16 @@ Usage:
           if (!/^(max|all|semua)$/i.test(amountRaw) && side === 'buy') {
             const rate = priceOf(await sv0.getPrice(pr.market).catch(() => null));
             probeQty = rate > 0 ? Math.floor((Number(amountRaw) / rate) * 1e6) / 1e6 : 0;
-          } else if (/^(max|all|semua)$/i.test(amountRaw)) probeQty = 0;
+          } else if (/^(max|all|semua)$/i.test(amountRaw)) {
+            // `max` = seluruh saldo token asal. Dulu probe-nya dikasih qty 1 yg jauh di
+            // bawah minimum order, jadi server gak ngasih quote dan fee "gak kebaca".
+            const punya = amtOf(pilih[0], pr.from);
+            if (side === 'sell') probeQty = punya;
+            else {
+              const rate = priceOf(await sv0.getPrice(pr.market).catch(() => null));
+              probeQty = rate > 0 ? Math.floor((punya / rate) * 1e6) / 1e6 : 0;
+            }
+          }
           const rq0 = await sv0.swapAction(SWAP.actionIds.requestQuotesV2, [{
             partyId: (await buildSwapClients(states[pilih[0]])).partyId,
             marketId: pr.market, direction: side,
