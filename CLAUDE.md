@@ -316,6 +316,14 @@ Yang perlu diketahui sebelum mengubahnya:
   CC:USDCx:TUSDT ~22:2:1) lalu dikoreksi dari fee yang benar-benar ditagih tiap quote.
   Jangan kembalikan pola "kutip tiap kandidat lalu bandingkan" — itu 4 RFQ per market
   hanya untuk memilih, dan tetap salah begitu saldonya habis di tengah jalan.
+- **Batas fee strategi 1 TERPISAH dari `swap.maxFeeCC`.** Menu `w → Batas max fee` dulu hanya
+  menyetel angka bersatuan token untuk daytrader/ping-pong; strategi 1 tidak membacanya sama
+  sekali, sehingga menyetel `swap.maxFeeCC = 0.16` tidak berpengaruh dan fee 0.3 TUSDT tetap
+  lolos (log-nya jujur: `batas 1`, yaitu `strategy1.maxFeeUsd` default). Menu itu sekarang
+  menerima satu angka **USD**: strategi 1 memakainya apa adanya, engine lain dikonversi ke
+  satuan token fee memakai harga live. Menu juga mengukur fee yang berlaku sekarang untuk
+  tiap kandidat token sebelum bertanya, dan memperingatkan kalau batas barunya di bawah fee
+  termurah saat itu — kalau tidak, semua swap ditolak diam-diam sampai fee turun.
 - **`maxFeeCC` satuannya ikut token fee**, sehingga batas 5 (wajar untuk CC yang fee-nya
   ~6.66) sama sekali tidak mengikat untuk TUSDT yang fee-nya ~0.15. `strategy1.maxFeeUsd`
   dipatok dalam USD lalu dikonversi ke satuan token terpilih di awal tiap task.
