@@ -368,7 +368,10 @@ Yang perlu diketahui sebelum mengubahnya:
   0.15 lalu 0.30 di hari yang sama), jadi swap yang ditolak sekarang biasanya lolos beberapa
   menit kemudian. `e.feeSpike` memicu `s1TungguFeeTurun()` yang **mem-poll fee** tiap
   `strategy1.feePollSec` (default 30 dtk) sampai turun ke bawah `maxFeeUsd`, lalu langkah yang
-  sama diulang — tanpa batas, berhentinya hanya lewat `q`/Ctrl+C. Sebelumnya ini menggugurkan
+  sama diulang. **Tiap poll ditulis ke panel log akun** (`ctx.log`), tonggaknya saja ke SYSTEM:
+  versi yang meredam log jadi 5 menit sekali membuat panel diam belasan menit dan botnya
+  terlihat mati padahal sedang memantau — tapi mengirim semuanya ke SYSTEM juga salah, 15 akun
+  yang sama-sama menunggu membanjiri panel utama tiap 30 detik — tanpa batas, berhentinya hanya lewat `q`/Ctrl+C. Sebelumnya ini menggugurkan
   akun sehingga seluruh putaran batal dan bot menganggur sampai reset besok. Swap di luar loop
   utama (seed dan pulang-ke-hub) memakai `s1SwapTungguFee()` supaya tidak jadi celah yang
   tetap menggugurkan akun.

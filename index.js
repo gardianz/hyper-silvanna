@@ -2397,7 +2397,11 @@ const s1Durasi = (dtk) => (dtk < 90 ? `${Math.round(dtk)} dtk` : `${Math.round(d
 async function s1TungguFeeTurun(ctx, market, kandidatFee, cfg, log, isCancelled, onTotal) {
   const capUsd = Number(cfg.maxFeeUsd) > 0 ? Number(cfg.maxFeeUsd) : Infinity;
   const pollS = Math.max(10, Number(cfg.feePollSec) || 30);
-  let total = 0, lapor = 0;
+  let total = 0, cek = 0;
+  // Baris per-poll ke panel AKUN (ctx.log), tonggaknya ke panel SYSTEM (log). Kalau
+  // semua ke SYSTEM, 15 akun yang sama-sama nunggu membanjiri panel utama tiap 30 dtk.
+  const detail = (typeof ctx.log === 'function') ? ctx.log : log;
+  log(`  mulai pantau fee tiap ${s1Durasi(pollS)} · batas $${capUsd} · ${market}`);
   for (; ;) {
     if (isCancelled && isCancelled()) return false;
     const sampai = Date.now() + pollS * 1000;
@@ -2406,18 +2410,18 @@ async function s1TungguFeeTurun(ctx, market, kandidatFee, cfg, log, isCancelled,
       await sleep(Math.min(2000, Math.max(250, sampai - Date.now())));
     }
     total += pollS;
+    cek++;
     if (typeof onTotal === 'function') onTotal(total);
-    const f = await ctx.sv.feeNow(ctx.partyId, market, kandidatFee).catch(() => null);
-    if (!f || !(f.usd > 0)) continue;              // gagal baca → coba lagi, jangan lanjut buta
+    const f = await ctx.sv.feeNow(ctx.partyId, market, kandidatFee).catch((e) => ({ _err: (e && e.message) || 'gagal' }));
+    // TIAP poll dicatat. Versi sebelumnya cuma nulis tiap 5 menit sekali, jadi panel
+    // log diam belasan menit dan botnya kelihatan mati padahal sedang memantau.
+    if (f && f._err) { detail(`cek fee #${cek} gagal: ${String(f._err).slice(0, 50)} — coba lagi ${s1Durasi(pollS)}`); continue; }
+    if (!f || !(f.usd > 0)) { detail(`cek fee #${cek}: gak kebaca — coba lagi ${s1Durasi(pollS)}`); continue; }
     if (f.usd <= capUsd) {
-      log(`  fee turun ke $${f.usd.toFixed(2)} (${f.amount} ${f.sym}) ≤ batas $${capUsd} — lanjut (nunggu ${s1Durasi(total)})`);
+      log(`  cek fee #${cek}: $${f.usd.toFixed(2)} (${f.amount} ${f.sym}) ≤ batas $${capUsd} — LANJUT (total nunggu ${s1Durasi(total)})`);
       return true;
     }
-    // Jangan spam log tiap poll: cukup tiap ~5 menit sekali.
-    if (total - lapor >= 300) {
-      lapor = total;
-      log(`  fee masih $${f.usd.toFixed(2)} (${f.amount} ${f.sym}) > batas $${capUsd} — nunggu ${s1Durasi(total)}`);
-    }
+    detail(`cek fee #${cek}: $${f.usd.toFixed(2)} (${f.amount} ${f.sym}) > batas $${capUsd} — nunggu ${s1Durasi(total)}, cek lagi ${s1Durasi(pollS)}`);
   }
 }
 
