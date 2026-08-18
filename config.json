@@ -52,8 +52,13 @@
       "stepUsd": 12,
       "_help_seedUsd": "Modal awal yang dibelanjakan dari hub untuk task yang tidak menyentuh hub sama sekali (mis. HECTO-EDELx saat hub cETH). Bot swap hub ke token base task sebesar nilai ini dulu, lalu mengembalikan seluruh sisanya ke hub setelah task selesai.",
       "seedUsd": 16,
-      "_help_maxFeeUsd": "Batas settlement fee per swap strategi 1, dihitung dalam USD. Dipakai karena maxFeeCC satuannya ikut token fee yang terpilih: batas 5 masuk akal untuk CC (fee ~6.66) tapi jauh terlalu longgar untuk TUSDT (fee ~0.15). Bot mengonversinya ke satuan token fee terpilih sebelum dipakai.",
-      "maxFeeUsd": 1,
+      "_help_maxFeeTok": "Batas fee per swap, DIPISAH PER TOKEN. Satu angka tidak pernah bisa benar karena pada beban jaringan yang sama fee itu sekitar 6.66 CC / 0.6 USDCx / 0.3 TUSDT / 0.3 USD8 — angka yang ketat untuk TUSDT mustahil dipenuhi CC. Bot membaca nilai yang cocok dengan token yang benar-benar ditagih quote. Atur lewat menu w -> Batas max fee (menu menampilkan fee yang berlaku sekarang per token). Kalau kosong, bot jatuh balik ke maxFeeCC lama yang satu angka.",
+      "maxFeeTok": {
+        "CC": 8,
+        "USDCx": 0.8,
+        "TUSDT": 0.4,
+        "USD8": 0.4
+      },
       "_help_swapTimeoutSec": "Batas waktu satu swap strategi 1 (detik). Kalau RFQ atau settle diam lebih lama dari ini, swap dilepas dan langkah yang sama diulang, bukan akunnya digugurkan. Tanpa batas ini satu swap yang menggantung membekukan seluruh akun tanpa satu baris log pun sehingga dari luar terlihat macet. Swap normal selesai 20-40 detik.",
       "swapTimeoutSec": 240,
       "_help_feePollSec": "Selang pengecekan fee saat menunggu fee turun (detik). Yang dipanggil estimateAtomicFeeAction — endpoint yang dipakai UI Silvana untuk menampilkan fee walau kolom jumlahnya masih 0, jadi mengecek fee tidak membuat RFQ sama sekali dan boleh sering. Begitu fee turun swap langsung disambung, tidak menunggu sisa jeda.",
@@ -82,7 +87,14 @@
       "base": "EDELx",
       "quote": "cETH"
     },
-    "dailySwapCount": 10
+    "dailySwapCount": 10,
+    "_help_maxFeeTok": "Batas fee per swap, DIPISAH PER TOKEN. Satu angka tidak pernah bisa benar karena pada beban jaringan yang sama fee itu sekitar 6.66 CC / 0.6 USDCx / 0.3 TUSDT / 0.3 USD8 — angka yang ketat untuk TUSDT mustahil dipenuhi CC. Bot membaca nilai yang cocok dengan token yang benar-benar ditagih quote. Atur lewat menu w -> Batas max fee (menu menampilkan fee yang berlaku sekarang per token). Kalau kosong, bot jatuh balik ke maxFeeCC lama yang satu angka.",
+    "maxFeeTok": {
+      "CC": 8,
+      "USDCx": 0.8,
+      "TUSDT": 0.4,
+      "USD8": 0.4
+    }
   },
   "swap": {
     "mode": "minmax",
@@ -128,7 +140,21 @@
     "concurrency": 4,
     "_help_edelCeth": "Setelan sizing Mode 8 (ping-pong EDELx<->cETH) SUDAH PINDAH ke section 'mode8' di atas (usdAmount, minUsd, dst). Yg di bawah ini cuma buat swap-back opsi 6/9.",
     "_help_edelCethSwapBackDustCC": "Swap-back EDELx->CC (opsi 6/9): sisa EDELx senilai < ini (CC) = dust, skip. Default 10 (min-swap Silvana tinggi, sisa kecil gak bisa di-swap).",
-    "edelCethSwapBackDustCC": 10
+    "edelCethSwapBackDustCC": 10,
+    "_help_maxFeeTok": "Batas fee per swap, DIPISAH PER TOKEN. Satu angka tidak pernah bisa benar karena pada beban jaringan yang sama fee itu sekitar 6.66 CC / 0.6 USDCx / 0.3 TUSDT / 0.3 USD8 — angka yang ketat untuk TUSDT mustahil dipenuhi CC. Bot membaca nilai yang cocok dengan token yang benar-benar ditagih quote. Atur lewat menu w -> Batas max fee (menu menampilkan fee yang berlaku sekarang per token). Kalau kosong, bot jatuh balik ke maxFeeCC lama yang satu angka.",
+    "maxFeeTok": {
+      "CC": 8,
+      "USDCx": 0.8,
+      "TUSDT": 0.4,
+      "USD8": 0.4
+    },
+    "_help_hardMaxFeeTok": "Plafon mutlak per token: berlaku walau batas per mode disetel lebih longgar atau ditrabas mode malam. Angka default kira-kira 3x fee beban normal.",
+    "hardMaxFeeTok": {
+      "CC": 20,
+      "USDCx": 2,
+      "TUSDT": 1,
+      "USD8": 1
+    }
   },
   "dashboard": {
     "refreshSec": 300,

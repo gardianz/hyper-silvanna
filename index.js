@@ -578,6 +578,10 @@ const SWAP = {
   // berlaku di SEMUA jalur, gak bisa di-bypass ctx.maxFeeCC. Fee normal 1.23 CC (RFQ)
   // / 4.3 CC (terminal), jadi 15 itu ~3x skenario terburuk. 0 = matikan (gak disaranin).
   hardMaxFeeCC: Number((CONFIG.swap || {}).hardMaxFeeCC) || 15,
+  // Batas per token (menggantikan maxFeeCC yang satu angka). Kosong = jatuh balik
+  // ke maxFeeCC/hardMaxFeeCC lama, jadi config lama tetap jalan.
+  maxFeeTok: ((CONFIG.swap || {}).maxFeeTok && typeof (CONFIG.swap || {}).maxFeeTok === 'object') ? (CONFIG.swap || {}).maxFeeTok : null,
+  hardMaxFeeTok: ((CONFIG.swap || {}).hardMaxFeeTok && typeof (CONFIG.swap || {}).hardMaxFeeTok === 'object') ? (CONFIG.swap || {}).hardMaxFeeTok : null,
   feeSpikeWaitSec: Number((CONFIG.swap || {}).feeSpikeWaitSec) || 300,
   // === ANTI-DEADLOCK ===
   // Loop sync (tunggu counter earn-hub naik) dulu default 0 = TANPA batas. Fatal pas
@@ -683,6 +687,7 @@ const M8 = {
   timezone: _m8.timezone || (CONFIG.schedule || {}).timezone || 'Asia/Jakarta',
   nightForce: _m8.nightForce !== false,
   maxFeeCC: _m8num(_m8.maxFeeCC, _m8num(_m8sw.maxFeeCC, 3.5)),
+  maxFeeTok: (_m8.maxFeeTok && typeof _m8.maxFeeTok === 'object') ? _m8.maxFeeTok : null,
   // minNetUsd: null/'' = gate mati. NEGATIF = allowed-loss, POSITIF = cari profit, 0 = break-even.
   minNetUsd: (_m8.minNetUsd === '' || _m8.minNetUsd == null || Number.isNaN(Number(_m8.minNetUsd))) ? null : Number(_m8.minNetUsd),
   netWaitSec: _m8num(_m8.netWaitSec, _m8num(_m8sw.feeSpikeWaitSec, 300)),
@@ -754,7 +759,7 @@ const M8 = {
       firstUsd: _m8num(s.firstUsd, 14),
       stepUsd: _m8num(s.stepUsd, 12),
       seedUsd: _m8num(s.seedUsd, 16),
-      maxFeeUsd: _m8num(s.maxFeeUsd, 1),
+      maxFeeTok: (s.maxFeeTok && typeof s.maxFeeTok === 'object') ? s.maxFeeTok : null,
       swapTimeoutSec: _m8num(s.swapTimeoutSec, 240),
       feePollSec: _m8num(s.feePollSec, 30),
       tasks: Array.isArray(s.tasks) ? s.tasks.filter(t => t && t.code && t.market) : [],
@@ -1442,10 +1447,36 @@ async function supaBalances(token, proxy) {
 // Plafon fee efektif buat SATU swap = min(batas per-call, plafon mutlak).
 // ctx.maxFeeCC dipakai mode 8 buat override per-call (malam = Infinity). Plafon
 // mutlak SWAP.hardMaxFeeCC tetap nempel biar override itu gak jadi "tanpa batas".
-function effFeeCap(ctxCap) {
-  const soft = ctxCap != null ? Number(ctxCap) : Number(SWAP.maxFeeCC);
-  const hard = Number(SWAP.hardMaxFeeCC);
-  return hard > 0 ? Math.min(soft, hard) : soft;
+// Batas fee disimpan PER TOKEN, bukan satu angka. Satu angka tidak pernah bisa benar:
+// pada beban jaringan yang sama fee itu 6.66 CC / 0.6 USDCx / 0.3 TUSDT / 0.3 USD8,
+// jadi "0.16" ketat sekali buat TUSDT tapi mustahil dipenuhi CC. Bentuknya
+// { CC: 8, USDCx: 0.8, TUSDT: 0.4, USD8: 0.4 }.
+function capFromMap(m, unit) {
+  if (!m || typeof m !== 'object') return null;
+  const u = String(unit || '').toUpperCase();
+  for (const k of Object.keys(m)) {
+    if (String(k).toUpperCase() === u) { const n = Number(m[k]); return Number.isFinite(n) ? n : null; }
+  }
+  return null;
+}
+// Plafon fee efektif buat SATU swap = min(batas per-call, plafon mutlak), keduanya
+// dibaca menurut TOKEN yang benar-benar dipakai bayar fee.
+// ctxCap boleh: angka (override per-call, mode 8 malam = Infinity), map per-token,
+// atau null (pakai setelan global).
+function effFeeCap(ctxCap, unit) {
+  const u = unit || (SWAP.feeTokens && SWAP.feeTokens[0]) || 'CC';
+  let soft = null;
+  if (ctxCap != null && typeof ctxCap === 'object') soft = capFromMap(ctxCap, u);
+  else if (ctxCap != null) soft = Number(ctxCap);
+  // NaN = tidak keisi. Infinity JANGAN dianggap kosong — itu override sengaja dari
+  // mode 8 malam yang artinya "tanpa batas lunak", dan tetap dipotong plafon mutlak
+  // di baris terakhir. Sempat salah: Infinity ikut jatuh ke setelan global sehingga
+  // mode malam justru jadi lebih ketat dari mode siang.
+  if (soft == null || Number.isNaN(soft)) soft = capFromMap(SWAP.maxFeeTok, u);
+  if (soft == null) soft = Number(SWAP.maxFeeCC);        // setelan lama, satu angka
+  const hard = capFromMap(SWAP.hardMaxFeeTok, u);
+  const hardN = hard != null ? hard : Number(SWAP.hardMaxFeeCC);
+  return hardN > 0 ? Math.min(soft, hardN) : soft;
 }
 
 // ── Gate traffic-credit sequencer Canton ────────────────────────────────────
@@ -2395,13 +2426,13 @@ const s1Durasi = (dtk) => (dtk < 90 ? `${Math.round(dtk)} dtk` : `${Math.round(d
 // begitu fee turun swapnya langsung disambung (bukan nunggu sisa jeda 5 menit).
 // Balikin true = fee sudah aman, false = dibatalin user.
 async function s1TungguFeeTurun(ctx, market, kandidatFee, cfg, log, isCancelled, onTotal) {
-  const capUsd = Number(cfg.maxFeeUsd) > 0 ? Number(cfg.maxFeeUsd) : Infinity;
   const pollS = Math.max(10, Number(cfg.feePollSec) || 30);
+  const capFor = (unit) => effFeeCap(cfg.maxFeeTok || null, unit);
   let total = 0, cek = 0;
   // Baris per-poll ke panel AKUN (ctx.log), tonggaknya ke panel SYSTEM (log). Kalau
   // semua ke SYSTEM, 15 akun yang sama-sama nunggu membanjiri panel utama tiap 30 dtk.
   const detail = (typeof ctx.log === 'function') ? ctx.log : log;
-  log(`  mulai pantau fee tiap ${s1Durasi(pollS)} · batas $${capUsd} · ${market}`);
+  log(`  mulai pantau fee tiap ${s1Durasi(pollS)} · ${market} · batas ${kandidatFee.map(t => `${capFor(t)} ${t}`).join(' / ')}`);
   for (; ;) {
     if (isCancelled && isCancelled()) return false;
     const sampai = Date.now() + pollS * 1000;
@@ -2417,11 +2448,13 @@ async function s1TungguFeeTurun(ctx, market, kandidatFee, cfg, log, isCancelled,
     // log diam belasan menit dan botnya kelihatan mati padahal sedang memantau.
     if (f && f._err) { detail(`cek fee #${cek} gagal: ${String(f._err).slice(0, 50)} — coba lagi ${s1Durasi(pollS)}`); continue; }
     if (!f || !(f.usd > 0)) { detail(`cek fee #${cek}: gak kebaca — coba lagi ${s1Durasi(pollS)}`); continue; }
-    if (f.usd <= capUsd) {
-      log(`  cek fee #${cek}: $${f.usd.toFixed(2)} (${f.amount} ${f.sym}) ≤ batas $${capUsd} — LANJUT (total nunggu ${s1Durasi(total)})`);
+    // Dibandingkan dalam SATUAN TOKEN yang bakal ditagih, bukan nilai USD-nya.
+    const cap = capFor(f.sym);
+    if (f.amount <= cap) {
+      log(`  cek fee #${cek}: ${f.amount} ${f.sym} ≤ batas ${cap} ${f.sym} — LANJUT (total nunggu ${s1Durasi(total)})`);
       return true;
     }
-    detail(`cek fee #${cek}: $${f.usd.toFixed(2)} (${f.amount} ${f.sym}) > batas $${capUsd} — nunggu ${s1Durasi(total)}, cek lagi ${s1Durasi(pollS)}`);
+    detail(`cek fee #${cek}: ${f.amount} ${f.sym} (≈$${f.usd.toFixed(2)}) > batas ${cap} ${f.sym} — nunggu ${s1Durasi(total)}, cek lagi ${s1Durasi(pollS)}`);
   }
 }
 
@@ -2588,14 +2621,12 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
 
   // Batas fee dipatok USD lalu dikonversi ke satuan token termurah yg mungkin dipakai.
   // maxFeeCC satuannya ikut token fee, jadi angka yg wajar buat CC salah buat TUSDT.
-  const capUsd = Number(cfg.maxFeeUsd) > 0 ? Number(cfg.maxFeeUsd) : 0;
-  if (capUsd > 0) {
-    let pxTermurah = 0;
-    for (const t of semua) { const px = await usdPriceOf(ctx.sv, t).catch(() => 0); if (px > pxTermurah) pxTermurah = px; }
-    // Ditulis ke objek yang SAMA, bukan clone: kalau ctx diganti objek baru, ctx.rebuild()
-    // milik handler (dipakai saat rotasi proxy) menukar klien di objek yang salah.
-    if (pxTermurah > 0) ctx.maxFeeCC = capUsd / pxTermurah;
-  }
+  // Batas fee dibawa sebagai MAP per token; effFeeCap membaca yang cocok dengan token
+  // fee yang benar-benar ditagih quote. Dulu ini satu angka USD yang dikonversi ke
+  // satuan token pakai harga live — bikin batasnya bergeser ikut harga dan tidak bisa
+  // diatur per token. Ditulis ke objek ctx yang SAMA, bukan clone: kalau ctx diganti
+  // objek baru, ctx.rebuild() milik handler (rotasi proxy) menukar klien di objek salah.
+  if (cfg.maxFeeTok) ctx.maxFeeCC = cfg.maxFeeTok;
   const other = String(mk.base).toUpperCase() === String(hub).toUpperCase() ? mk.quote : mk.base;
   const bukanHub = ![mk.base, mk.quote].some(x => String(x).toUpperCase() === String(hub).toUpperCase());
 
@@ -4067,8 +4098,11 @@ async function swapOnceAtomic(ctx, side, baseQty) {
     const feeUnit = symbolOfInstrument(_fi);
     // Satuan WAJIB ikut token fee. Dulu pesannya selalu menulis "CC" padahal feenya
     // TUSDT/USD8, jadi terbaca seolah batasnya salah pasang.
-    log(`Fee RFQ: ${feeCC} ${feeUnit} (batas ${feeCap} ${feeUnit})`);
-    if (feeCC > feeCap) { const e = new Error(`fee ${feeCC} ${feeUnit} > batas ${feeCap} ${feeUnit}`); e.feeSpike = true; e.feeCC = feeCC; e.feeUnit = feeUnit; throw e; }
+    // Batas dibaca menurut token fee yang BENAR-BENAR ditagih quote ini, bukan
+    // menurut token yang kebetulan aktif di config.
+    const capUnit = effFeeCap(ctx.maxFeeCC, feeUnit);
+    log(`Fee RFQ: ${feeCC} ${feeUnit} (batas ${capUnit} ${feeUnit})`);
+    if (feeCC > capUnit) { const e = new Error(`fee ${feeCC} ${feeUnit} > batas ${capUnit} ${feeUnit}`); e.feeSpike = true; e.feeCC = feeCC; e.feeUnit = feeUnit; throw e; }
   }
 
   // 3. Holding kita + CC utk fee.
@@ -6760,7 +6794,7 @@ async function runEdelCethAccount(i) {
         const useRfq = mode8ShouldUseRfq();
         logActivity(`[${tag}] ping-pong #${swaps + 1}: ${direction} ${deliver}→${String(deliver).toUpperCase() === P8.baseId ? P8.quote : P8.base} (${q} ${P8.base}${adj ? ` adj#${adj}` : ''})${useRfq ? ` [RFQ — sisa ${hoursUntilDailyReset()}j ke reset]` : ''}`, COLOR.cyan);
         try {
-          const swapCtx = { ...clients, email: state.email, label: tag, userServiceCid, leg, maxFeeCC: night ? Infinity : M8.maxFeeCC, minUsd, usdPerEdelx, maxDeliverCeth: (String(deliver).toUpperCase() === P8.quoteId ? ceth : 0), log: (m) => logActivity(`[${tag}] ${m}`, COLOR.gray), onWalletPicked: (id) => { try { patchAcctSession(state.email, { privyWalletId: id }); } catch (_) { } } };
+          const swapCtx = { ...clients, email: state.email, label: tag, userServiceCid, leg, maxFeeCC: night ? Infinity : (M8.maxFeeTok || M8.maxFeeCC), minUsd, usdPerEdelx, maxDeliverCeth: (String(deliver).toUpperCase() === P8.quoteId ? ceth : 0), log: (m) => logActivity(`[${tag}] ${m}`, COLOR.gray), onWalletPicked: (id) => { try { patchAcctSession(state.email, { privyWalletId: id }); } catch (_) { } } };
           // RFQ pakai qty BASE yg sama (EDELx) + ctx.leg yg sama → aman buat token↔token.
           const res = useRfq
             ? await swapOnceAtomic(swapCtx, direction, q)
@@ -7463,7 +7497,7 @@ async function runRegister() {
 const argv = process.argv.slice(2);
 // buildSwapClients/SWAP/transferCC ikut diekspor biar bisa diprobe dari skrip luar
 // tanpa nyalain bot (require aman: runMain kegate `require.main === module`).
-module.exports = { s1TungguFeeTurun, setSessionEngine, renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
+module.exports = { effFeeCap, capFromMap, s1TungguFeeTurun, setSessionEngine, renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
 
 if (require.main === module) {
   if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
@@ -8023,7 +8057,7 @@ Usage:
       const VIA_RFQ = argv.includes('rfq');
       process.stdout.write(paint(`→ ${side.toUpperCase()} ${edelxQty} EDELx (deliver ${deliver}, sizing $${M8.usdAmount}, minUsd $${M8.minUsd})${VIA_RFQ ? '  [jalur RFQ /swap]' : '  [jalur CLOB /terminal]'}\n`, COLOR.cyan));
       if (!GO) { process.stdout.write(paint(`[DRY] gak submit. Tambah 'go' buat live${VIA_RFQ ? '' : ', atau `rfq` buat lewat jalur /swap'}.\n`, COLOR.yellow)); process.exit(0); }
-      const swapCtx = { ...clients, email: a.email, label: a.label || a.email, userServiceCid, leg, maxFeeCC: M8.maxFeeCC, minUsd: M8.minUsd, usdPerEdelx, maxDeliverCeth: (side === 'buy' ? ceth : 0), log: (m) => process.stdout.write(paint('  ' + m + '\n', COLOR.gray)), onWalletPicked: (id) => { try { patchAcctSession(a.email, { privyWalletId: id }); } catch (_) { } } };
+      const swapCtx = { ...clients, email: a.email, label: a.label || a.email, userServiceCid, leg, maxFeeCC: (M8.maxFeeTok || M8.maxFeeCC), minUsd: M8.minUsd, usdPerEdelx, maxDeliverCeth: (side === 'buy' ? ceth : 0), log: (m) => process.stdout.write(paint('  ' + m + '\n', COLOR.gray)), onWalletPicked: (id) => { try { patchAcctSession(a.email, { privyWalletId: id }); } catch (_) { } } };
       const res = VIA_RFQ
         ? await swapOnceAtomic(swapCtx, side, edelxQty)
         : await terminalSwapOnce(swapCtx, side, edelxQty);
@@ -9037,7 +9071,7 @@ Usage:
             { label: 'Token fee swap   ', detail: paint('bayar settlement fee pakai CC atau USDCx', COLOR.gray) },
             { label: 'Tautkan Walley   ', detail: paint('hubungin wallet Walley ke akun Silvana (sekali per akun)', COLOR.gray) },
             { label: 'Daftar party ID  ', detail: paint('tabel partyId Supanova & Walley per akun (buat kirim bulk)', COLOR.gray) },
-            { label: 'Batas max fee    ', detail: paint('tolak swap kalau fee lewat batas — set dalam USD, lihat fee yg berlaku sekarang', COLOR.gray) },
+            { label: 'Batas max fee    ', detail: paint('batas fee per token per mode — lihat fee yg berlaku sekarang', COLOR.gray) },
           ],
         });
         if (!sub.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
@@ -9088,101 +9122,97 @@ Usage:
         }
 
         if (sub[0] === 4) {
-          // Batas fee. Dulu menu ini cuma menyetel angka bersatuan TOKEN, jadi harus
-          // ganti token fee dulu supaya angkanya masuk akal (5 ketat buat CC yg feenya
-          // ~20, tapi longgar banget buat TUSDT yg feenya ~0.3). Lebih parah: strategi 1
-          // sama sekali tidak membaca swap.maxFeeCC — dia punya batas sendiri dalam USD
-          // (mode8.strategy1.maxFeeUsd), sehingga menyetel swap.maxFeeCC = 0.16 tidak
-          // berpengaruh apa pun di sana dan fee 0.3 tetap lolos.
-          //
-          // Sekarang satu angka dalam USD menyetel semuanya: strategi 1 memakai apa
-          // adanya, engine lain dikonversi ke satuan token fee yg sedang dipakai.
-          const S1c = M8.strategy1 || {};
-          const unit = (SWAP.feeTokens && SWAP.feeTokens[0]) || 'CC';
-          process.stdout.write('\n' + paint('Batas fee per swap', COLOR.bold + COLOR.cyan) + '\n');
-          process.stdout.write(paint(`  strategi 1   : $${S1c.maxFeeUsd}  (USD — dipakai menu 1)`, COLOR.gray) + '\n');
-          process.stdout.write(paint(`  swap 1x/daytrader: ${SWAP.maxFeeCC} ${unit}`, COLOR.gray) + '\n');
-          process.stdout.write(paint(`  ping-pong    : ${M8.maxFeeCC} ${unit}`, COLOR.gray) + '\n');
-          process.stdout.write(paint(`  plafon mutlak: ${SWAP.hardMaxFeeCC} ${unit}  (gak bisa ditrabas)`, COLOR.gray) + '\n');
+          // Batas fee disimpan PER TOKEN dan PER MODE. Satu angka tidak pernah bisa
+          // benar: pada beban jaringan yang sama fee itu 6.66 CC / 0.6 USDCx / 0.3 TUSDT
+          // / 0.3 USD8, jadi angka yang ketat buat TUSDT mustahil dipenuhi CC.
+          const MODES = [
+            { key: 's1', label: 'Strategi 1', path: ['mode8', 'strategy1', 'maxFeeTok'], get: () => (M8.strategy1 || {}).maxFeeTok, set: (m) => { M8.strategy1.maxFeeTok = m; } },
+            { key: 'swap', label: 'Swap 1x & daytrader', path: ['swap', 'maxFeeTok'], get: () => SWAP.maxFeeTok, set: (m) => { SWAP.maxFeeTok = m; } },
+            { key: 'm8', label: 'Ping-pong (mode 8)', path: ['mode8', 'maxFeeTok'], get: () => M8.maxFeeTok, set: (m) => { M8.maxFeeTok = m; } },
+            { key: 'hard', label: 'Plafon mutlak', path: ['swap', 'hardMaxFeeTok'], get: () => SWAP.hardMaxFeeTok, set: (m) => { SWAP.hardMaxFeeTok = m; } },
+          ];
+          const tampil = (m) => FEE_TOKEN_IDS.map(t => {
+            const v = capFromMap(m, t);
+            return `${t} ${v == null ? '-' : v}`;
+          }).join(' · ');
 
-          // Fee yg BERLAKU SEKARANG buat tiap kandidat token, diukur live. Tanpa ini
-          // user harus menebak angka yg wajar, dan fee memang bergeser ikut beban
-          // jaringan (terukur 0.15 lalu 0.30 di hari yg sama).
-          process.stdout.write('\n' + paint('Ngukur fee sekarang…', COLOR.gray) + '\n');
-          const pasar = (S1c.tasks && S1c.tasks[0] && S1c.tasks[0].market) || 'EDELx-cETH';
-          let feeSekarang = [];
+          process.stdout.write('\n' + paint('Batas fee per swap — disimpan per token', COLOR.bold + COLOR.cyan) + '\n');
+          for (const md of MODES) process.stdout.write(paint(`  ${md.label.padEnd(20)} ${tampil(md.get())}`, COLOR.gray) + '\n');
+
+          // Fee yang BERLAKU SEKARANG per token, lewat estimateAtomicFeeAction (tanpa
+          // RFQ). Tanpa angka acuan ini penyetelannya cuma tebak-tebakan, apalagi fee
+          // bergeser ikut beban jaringan.
+          const pasar = ((M8.strategy1 || {}).tasks || [{}])[0].market || 'EDELx-cETH';
+          process.stdout.write('\n' + paint(`Fee yang berlaku sekarang (${pasar}):`, COLOR.gray) + '\n');
+          const feeNowMap = {};
           try {
-            // Lewat estimateAtomicFeeAction, bukan RFQ: endpoint ini yang dipakai UI
-            // Silvana buat nampilin fee walau kolom jumlahnya masih 0, jadi gak perlu
-            // bikin quote cuma buat lihat fee.
             const { sv: svF, partyId: pidF } = await buildSwapClients(makeStates()[0]);
             for (const tok of FEE_TOKEN_IDS) {
               const f = await svF.feeNow(pidF, pasar, [tok]).catch(() => null);
-              if (f && f.usd > 0) feeSekarang.push({ tok, amount: f.amount, sym: f.sym, usd: f.usd });
-              const txt = (f && f.usd > 0) ? `${f.amount} ${f.sym}  ≈ $${f.usd.toFixed(2)}` : 'gak kebaca';
-              process.stdout.write(`  ${String(tok).padEnd(7)} ${paint(txt, (f && f.usd > 0) ? COLOR.green : COLOR.gray)}\n`);
+              if (f && f.amount > 0) feeNowMap[tok] = f;
+              const txt = (f && f.amount > 0) ? `${f.amount} ${f.sym}  (≈$${f.usd.toFixed(2)})` : 'gak kebaca';
+              process.stdout.write(`  ${String(tok).padEnd(7)} ${paint(txt, (f && f.amount > 0) ? COLOR.green : COLOR.gray)}\n`);
             }
-            const ok = feeSekarang.filter(f => f.usd != null).sort((a, b) => a.usd - b.usd);
-            if (ok.length) process.stdout.write(paint(`  termurah sekarang: ${ok[0].tok} $${ok[0].usd.toFixed(3)} di ${pasar}\n`, COLOR.cyan));
           } catch (e) { process.stdout.write(paint(`  gagal ngukur: ${e.message}\n`, COLOR.yellow)); }
 
-          const cara = await pickList({
-            title: 'Mau nyetel batas gimana?',
-            items: [
-              { label: 'Satu angka USD ', detail: paint('paling gampang — strategi 1 pakai apa adanya, engine lain dikonversi ke satuan token', COLOR.gray) },
-              { label: 'Strategi 1 saja', detail: paint(`cuma mode8.strategy1.maxFeeUsd (sekarang $${S1c.maxFeeUsd})`, COLOR.gray) },
-              { label: 'Satuan token   ', detail: paint(`cara lama — angka bersatuan ${unit} buat swap/ping-pong`, COLOR.gray) },
-              { label: 'Plafon mutlak  ', detail: paint(`swap.hardMaxFeeCC (${unit}) — berlaku walau yg lain ditrabas`, COLOR.gray) },
-            ],
+          const pilihMode = await pickList({
+            title: 'Batas fee buat mode yang mana?',
+            items: MODES.map(md => ({ label: md.label.padEnd(20), detail: paint(tampil(md.get()), COLOR.gray) })),
+            multi: true,
           });
-          if (!cara.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
+          if (!pilihMode.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
 
-          const satuan = (cara[0] === 0 || cara[0] === 1) ? 'USD' : unit;
-          const raw = (await prompt(paint(`batas baru dalam ${satuan} (angka): `, COLOR.bold))).trim();
-          const n = Number(raw);
-          if (!Number.isFinite(n) || n <= 0) { process.stdout.write(paint('angka gak valid — dibatalin.\n', COLOR.red)); continue; }
+          const pilihTok = await pickList({
+            title: 'Token fee yang mau diatur batasnya:',
+            items: FEE_TOKEN_IDS.map(t => {
+              const f = feeNowMap[t];
+              const now = f ? `fee sekarang ${f.amount} ${t}` : 'fee sekarang gak kebaca';
+              return { label: String(t).padEnd(7), detail: paint(now, f ? COLOR.green : COLOR.gray) };
+            }),
+            multi: true,
+          });
+          if (!pilihTok.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
+
+          // Satu angka per token — ditanya satu per satu supaya satuannya jelas.
+          const nilai = {};
+          for (const ti of pilihTok) {
+            const tok = FEE_TOKEN_IDS[ti];
+            const f = feeNowMap[tok];
+            const acuan = f ? ` (fee sekarang ${f.amount} ${tok})` : '';
+            const raw = (await prompt(paint(`batas ${tok}${acuan}: `, COLOR.bold))).trim();
+            if (!raw) { process.stdout.write(paint(`  ${tok} dilewati\n`, COLOR.gray)); continue; }
+            const n = Number(raw);
+            if (!Number.isFinite(n) || n <= 0) { process.stdout.write(paint(`  angka ${tok} gak valid — dilewati\n`, COLOR.red)); continue; }
+            nilai[tok] = n;
+          }
+          if (!Object.keys(nilai).length) { process.stdout.write(paint('gak ada yg diubah.\n', COLOR.gray)); continue; }
 
           try {
             const cfg = JSON.parse(fs.readFileSync(CFG_PATH, 'utf8'));
-            cfg.swap = cfg.swap || {}; cfg.mode8 = cfg.mode8 || {};
-            cfg.mode8.strategy1 = cfg.mode8.strategy1 || {};
-            const pesan = [];
-            if (cara[0] === 0) {
-              cfg.mode8.strategy1.maxFeeUsd = n; M8.strategy1.maxFeeUsd = n;
-              pesan.push(`strategi 1 = $${n}`);
-              // Konversi ke satuan token buat engine lain. Harga token fee dibaca live;
-              // kalau gagal, angkanya TIDAK ditulis — lebih baik tidak berubah daripada
-              // menulis batas yg salah satuan.
-              let px = 0;
-              try { const { sv: svP } = await buildSwapClients(makeStates()[0]); px = await usdPriceOf(svP, unit); } catch (_) { }
-              if (px > 0) {
-                const tok = Math.round((n / px) * 1e6) / 1e6;
-                cfg.swap.maxFeeCC = tok; SWAP.maxFeeCC = tok;
-                cfg.mode8.maxFeeCC = tok; M8.maxFeeCC = tok;
-                pesan.push(`swap & ping-pong = ${tok} ${unit} ($${n} ÷ harga ${unit} $${px})`);
-              } else pesan.push(paint(`harga ${unit} gak kebaca — swap & ping-pong TIDAK diubah`, COLOR.yellow));
-            } else if (cara[0] === 1) {
-              cfg.mode8.strategy1.maxFeeUsd = n; M8.strategy1.maxFeeUsd = n;
-              pesan.push(`strategi 1 = $${n}`);
-            } else if (cara[0] === 2) {
-              cfg.swap.maxFeeCC = n; SWAP.maxFeeCC = n;
-              cfg.mode8.maxFeeCC = n; M8.maxFeeCC = n;
-              pesan.push(`swap & ping-pong = ${n} ${unit}`);
-            } else {
-              cfg.swap.hardMaxFeeCC = n; SWAP.hardMaxFeeCC = n;
-              pesan.push(`plafon mutlak = ${n} ${unit}`);
+            for (const mi of pilihMode) {
+              const md = MODES[mi];
+              let node = cfg;
+              for (const k of md.path.slice(0, -1)) { node[k] = node[k] || {}; node = node[k]; }
+              const leaf = md.path[md.path.length - 1];
+              const map = Object.assign({}, node[leaf] || md.get() || {}, nilai);
+              node[leaf] = map;
+              md.set(map);
             }
             fs.writeFileSync(CFG_PATH, JSON.stringify(cfg, null, 2) + '\n');
-            process.stdout.write(paint(`\n✓ tersimpan — ${pesan.join(' · ')}\n`, COLOR.green));
-            // Peringatan kalau batasnya justru di BAWAH fee yg berlaku sekarang: swapnya
-            // bakal ditolak terus dan itu bukan hal yg kelihatan sampai sesi jalan.
-            const termurah = feeSekarang.filter(f => f.usd != null).sort((a, b) => a.usd - b.usd)[0];
-            const batasUsd = (cara[0] === 0 || cara[0] === 1) ? n : null;
-            if (termurah && batasUsd != null && batasUsd < termurah.usd) {
-              process.stdout.write(paint(`⚠ batas $${batasUsd} DI BAWAH fee termurah sekarang ($${termurah.usd.toFixed(3)} ${termurah.tok}) — semua swap bakal ditolak sampai fee turun.\n`, COLOR.yellow));
+            process.stdout.write(paint('\n✓ tersimpan:\n', COLOR.green));
+            for (const mi of pilihMode) process.stdout.write(paint(`  ${MODES[mi].label.padEnd(20)} ${tampil(MODES[mi].get())}\n`, COLOR.green));
+
+            // Peringatan kalau batasnya di BAWAH fee yang berlaku sekarang: swapnya bakal
+            // ditolak terus, dan itu tidak kelihatan sampai sesi berjalan.
+            for (const [tok, n] of Object.entries(nilai)) {
+              const f = feeNowMap[tok];
+              if (f && n < f.amount) {
+                process.stdout.write(paint(`⚠ batas ${n} ${tok} DI BAWAH fee sekarang (${f.amount} ${tok}) — swap pakai ${tok} bakal ditunda sampai fee turun.\n`, COLOR.yellow));
+              }
             }
-            if (satuan === unit && n > SWAP.hardMaxFeeCC) {
-              process.stdout.write(paint(`⚠ batas ${n} di ATAS plafon mutlak ${SWAP.hardMaxFeeCC} — yg berlaku tetap plafonnya.\n`, COLOR.yellow));
+            const adaYgLolos = Object.entries(nilai).some(([tok, n]) => { const f = feeNowMap[tok]; return f && n >= f.amount; });
+            if (!adaYgLolos && Object.keys(feeNowMap).length) {
+              process.stdout.write(paint('⚠ gak ada satu pun token yg batasnya di atas fee sekarang — bot bakal nunggu terus.\n', COLOR.yellow));
             }
           } catch (e) { console.error(paint('gagal nulis config.json: ' + e.message, COLOR.red)); }
           continue;

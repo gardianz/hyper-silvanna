@@ -329,6 +329,17 @@ Yang perlu diketahui sebelum mengubahnya:
   CC:USDCx:TUSDT ~22:2:1) lalu dikoreksi dari fee yang benar-benar ditagih tiap quote.
   Jangan kembalikan pola "kutip tiap kandidat lalu bandingkan" — itu 4 RFQ per market
   hanya untuk memilih, dan tetap salah begitu saldonya habis di tengah jalan.
+- **Batas fee disimpan PER TOKEN, bukan satu angka dan bukan USD.** Pada beban jaringan yang
+  sama fee itu 6.66 CC / 0.6 USDCx / 0.3 TUSDT / 0.3 USD8 — satu angka yang ketat untuk TUSDT
+  mustahil dipenuhi CC. Bentuknya map `{CC, USDCx, TUSDT, USD8}` di `swap.maxFeeTok`,
+  `swap.hardMaxFeeTok`, `mode8.maxFeeTok`, dan `mode8.strategy1.maxFeeTok`.
+  `effFeeCap(ctxCap, unit)` membaca yang cocok dengan token yang **benar-benar ditagih quote**
+  (`feeUnit` dari `lpFees[0].instrumentId`), bukan token yang kebetulan aktif di config, dan
+  jatuh balik ke `maxFeeCC` lama kalau map-nya kosong. `ctxCap` boleh map, angka (override
+  per-call), atau null. **`Infinity` bukan berarti "belum diset"** — itu override sengaja mode
+  8 malam; memperlakukannya sebagai kosong membuat mode malam justru lebih ketat dari siang.
+- **Versi USD sudah dibuang.** `strategy1.maxFeeUsd` dulu dikonversi ke satuan token memakai
+  harga live, sehingga batasnya ikut bergeser mengikuti harga dan tidak bisa diatur per token.
 - **Batas fee strategi 1 TERPISAH dari `swap.maxFeeCC`.** Menu `w → Batas max fee` dulu hanya
   menyetel angka bersatuan token untuk daytrader/ping-pong; strategi 1 tidak membacanya sama
   sekali, sehingga menyetel `swap.maxFeeCC = 0.16` tidak berpengaruh dan fee 0.3 TUSDT tetap
