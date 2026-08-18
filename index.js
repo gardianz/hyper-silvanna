@@ -756,6 +756,7 @@ const M8 = {
       seedUsd: _m8num(s.seedUsd, 16),
       maxFeeUsd: _m8num(s.maxFeeUsd, 1),
       swapTimeoutSec: _m8num(s.swapTimeoutSec, 240),
+      feeWaitSec: _m8num(s.feeWaitSec, 300),
       tasks: Array.isArray(s.tasks) ? s.tasks.filter(t => t && t.code && t.market) : [],
     };
   })(),
@@ -2358,9 +2359,31 @@ async function s1Balances(ctx) {
   return get;
 }
 
+const s1Durasi = (dtk) => (dtk < 90 ? `${Math.round(dtk)} dtk` : `${Math.round(dtk / 60)} mnt`);
+
+// Swap yang MENUNGGU kalau fee lagi di atas batas, bukan menyerah. Dipakai untuk
+// swap di luar loop utama (seed & pulang ke hub) — dua-duanya dulu menggugurkan akun
+// begitu fee naik, padahal fee turun sendiri dalam hitungan menit.
+async function s1SwapTungguFee(ctx, mk, deliver, qty, feeList, log, isCancelled) {
+  for (; ;) {
+    try { return await s1Swap(ctx, mk, deliver, qty, feeList); }
+    catch (e) {
+      if (!(e && e.feeSpike)) throw e;
+      if (isCancelled && isCancelled()) { e.aborted = true; throw e; }
+      const waitS = Math.max(30, Number((M8.strategy1 || {}).feeWaitSec) || Number(SWAP.feeSpikeWaitSec) || 300);
+      log(`  ${(e.message || '').slice(0, 60)} — nunggu fee turun ${s1Durasi(waitS)}`);
+      const sampai = Date.now() + waitS * 1000;
+      while (Date.now() < sampai) {
+        if (isCancelled && isCancelled()) { e.aborted = true; throw e; }
+        await sleep(Math.min(5000, Math.max(500, sampai - Date.now())));
+      }
+    }
+  }
+}
+
 // Balikin SELURUH saldo satu token ke hub. Sisa di bawah minimum order dibiarkan
 // jadi dust — memaksanya cuma bikin quote ditolak server.
-async function s1ToHub(ctx, sym, hub, feeTok, log) {
+async function s1ToHub(ctx, sym, hub, feeTok, log, isCancelled) {
   if (String(sym).toUpperCase() === String(hub).toUpperCase()) return;
   const get = await s1Balances(ctx);
   const px = await usdPriceOf(ctx.sv, sym);
@@ -2371,7 +2394,8 @@ async function s1ToHub(ctx, sym, hub, feeTok, log) {
   const mkR = { id: `${sym}-${hub}`, base: sym, quote: hub };
   log(`  balikin ${sym} $${usd.toFixed(2)} ke ${hub} lewat ${mkR.id}`);
   // sym = base market ini, jadi jual jumlah persisnya — nol sisa.
-  await s1Swap(ctx, mkR, sym, floor6(jml), feeTok).catch(e => log(`  gagal balikin ${sym}: ${((e && e.message) || '').slice(0, 70)}`));
+  await s1SwapTungguFee(ctx, mkR, sym, floor6(jml), feeTok, log, isCancelled)
+    .catch(e => log(`  gagal balikin ${sym}: ${((e && e.message) || '').slice(0, 70)}`));
 }
 
 // Ukur spread RFQ sebuah market: kutip DUA arah di ukuran base yg sama persis,
@@ -2552,14 +2576,14 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
       const qty = pxSeed > 0 ? floor6(Number(cfg.seedUsd) / pxSeed) : 0;
       if (!(qty > 0)) throw new Error(`gak bisa hitung seed ${mk.base}`);
       log(`danai ${mk.base} $${cfg.seedUsd} dari ${hub} lewat ${seedMk.id}`);
-      const rs = await s1Swap(ctx, seedMk, hub, qty, s1UrutFee(semua, memo.usd));
+      const rs = await s1SwapTungguFee(ctx, seedMk, hub, qty, s1UrutFee(semua, memo.usd), log, isCancelled);
       if (rs && rs.feeSym) { memo.jml[rs.feeSym.toUpperCase()] = rs.feeCC; feeTok = rs.feeSym; }
       lapor({ langkah: (ctx.s1lapor && ctx.s1lapor.langkah) || 0 });
       await sleep(2500);
     }
   }
 
-  let langkah = 0, dibatalin = false, alasan = '', gagalProxy = 0, gagalSizing = 0, qtyPaksa = 0;
+  let langkah = 0, dibatalin = false, alasan = '', gagalProxy = 0, gagalSizing = 0, qtyPaksa = 0, tungguFeeS = 0;
   // Akuntansi biaya.
   //
   // Spread TIDAK diukur dgn menilai tiap swap pakai harga pasar: `getPrice` itu harga
@@ -2693,10 +2717,31 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
         log(`  LP minta ${e.tokenNeeded.toFixed(4)} tapi punya ${e.tokenHave.toFixed(4)} — ukuran dikecilin ke ${qtyPaksa} (${gagalSizing}/3)`);
         continue;                       // langkah TIDAK naik: swapnya belum terjadi
       }
+      // Fee di atas batas BUKAN kegagalan akun — fee memang naik-turun ikut beban
+      // jaringan (terukur 0.15 lalu 0.30 di hari yang sama). Dulu ini menggugurkan akun
+      // sehingga seluruh putaran batal dan bot menganggur sampai reset besok, padahal
+      // cukup menunggu. Pola sama dengan mode 8: tunda, cek lagi, ulangi SAMPAI turun.
+      // Berhentinya cuma lewat q / Ctrl+C.
+      if (e && e.feeSpike) {
+        const waitS = Math.max(30, Number(cfg.feeWaitSec) || Number(SWAP.feeSpikeWaitSec) || 300);
+        tungguFeeS += waitS;
+        log(`  ${(e.message || '').slice(0, 60)} — nunggu fee turun, cek lagi ${s1Durasi(waitS)} (total nunggu ${s1Durasi(tungguFeeS)})`);
+        lapor({ feeWait: true, feeInfo: `${e.feeCC} ${e.feeUnit || ''}`.trim() });
+        // Ditunggu potong-potong supaya q tetap responsif.
+        const sampai = Date.now() + waitS * 1000;
+        while (Date.now() < sampai) {
+          if (isCancelled && isCancelled()) { dibatalin = true; break; }
+          await sleep(Math.min(5000, Math.max(500, sampai - Date.now())));
+        }
+        lapor({ feeWait: false });
+        if (dibatalin) break;
+        putaran--;                      // nunggu fee jangan makan jatah putaran
+        continue;                       // langkah TIDAK naik: swapnya belum terjadi
+      }
       if (e && (e.noLiquidity || e.transient)) { log(`  ${(e.message || '').slice(0, 70)} — ulang`); await sleep(5000); langkah++; continue; }
       throw e;
     }
-    gagalProxy = 0; gagalSizing = 0;
+    gagalProxy = 0; gagalSizing = 0; tungguFeeS = 0;
     // Belajar dari fee yg benar-benar ditagih: nilai USD-nya menentukan urutan
     // kandidat berikutnya, jumlahnya menentukan kapan token itu dianggap habis.
     // Harga eksekusi (quote per base) disimpan per market: dipakai menyusun ukuran
@@ -2729,7 +2774,7 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
   // Pulang ke hub. Task yg gak nyentuh hub (HECTO-EDELx saat hub cETH) nyisain DUA
   // token, jadi dua-duanya dibalikin — bukan cuma sisi lawan.
   for (const sym of (bukanHub ? [mk.base, mk.quote] : [other])) {
-    await s1ToHub(ctx, sym, hub, s1UrutFee(s1FeeSiap(semua, await saldo(), memo.jml), memo.usd), log);
+    await s1ToHub(ctx, sym, hub, s1UrutFee(s1FeeSiap(semua, await saldo(), memo.jml), memo.usd), log, isCancelled);
     lapor({ langkah });
   }
 
@@ -4424,6 +4469,7 @@ function statusInfo(state) {
   const d = state.dayTrader;
   const o = state.overcap;
   if (SESSION_ENGINE === 'strategi1' && state.s1) {
+    if (state.s1.feeWait) return ['◷ Fee', COLOR.yellow];
     const m = { tunggu: ['○ Antre', COLOR.gray], nunggu: ['◷ Tunggu', COLOR.cyan], jalan: ['● Swap', COLOR.yellow], selesai: ['● Selesai', COLOR.green], lewat: ['● Lewat', COLOR.gray], batal: ['● Batal', COLOR.yellow], gagal: ['● Error', COLOR.red] };
     if (m[state.s1.status]) return m[state.s1.status];
   }
@@ -8855,6 +8901,7 @@ Usage:
                 st2.s1.cur = p.cur != null ? p.cur : st2.s1.cur;
                 st2.s1.tgt = p.tgt != null ? p.tgt : st2.s1.tgt;
                 st2.s1.jalan = true;
+                if (p.feeWait != null) st2.s1.feeWait = !!p.feeWait;
                 if (p.raw) st2.balances = p.raw;
               },
             };

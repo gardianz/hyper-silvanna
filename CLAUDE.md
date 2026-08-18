@@ -351,6 +351,13 @@ Yang perlu diketahui sebelum mengubahnya:
   dipakai mengecilkan `qty` secara **persis** lalu langkah diulang (maks 3×). Kegagalan ini
   terjadi **sebelum penandatanganan**, jadi tidak ada proposal nyangkut dan tidak ada fee
   terbuang; menggugurkan akun karenanya adalah reaksi yang salah.
+- **Fee di atas batas = TUNGGU, bukan gagal.** Fee bergerak ikut beban jaringan (terukur
+  0.15 lalu 0.30 di hari yang sama), jadi swap yang ditolak sekarang biasanya lolos beberapa
+  menit kemudian. `e.feeSpike` ditunda `strategy1.feeWaitSec` lalu langkah yang sama diulang
+  tanpa batas — berhentinya hanya lewat `q`/Ctrl+C, pola yang sama dengan mode 8. Sebelumnya
+  ini menggugurkan akun sehingga seluruh putaran batal dan bot menganggur sampai reset besok.
+  Swap di luar loop utama (seed dan pulang-ke-hub) memakai `s1SwapTungguFee()` supaya tidak
+  jadi celah yang tetap menggugurkan akun.
 - **Satu swap punya batas waktu** (`strategy1.swapTimeoutSec`, default 240 dtk). Tanpa itu
   RFQ/settle yang diam membekukan akun tanpa satu baris log pun dan dari luar terlihat macet.
   Lewat batas ditandai `transient` sehingga langkah yang sama diulang, bukan akun digugurkan.
