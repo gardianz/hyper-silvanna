@@ -2302,6 +2302,15 @@ async function privyRefreshSession(refreshToken, accessToken, proxy) {
 // Serialize OTP prompt secara GLOBAL. Banyak akun bisa butuh OTP barengan
 // (tickAll/keepAlive paralel), tapi stdin cuma satu → readline tabrakan & prompt
 // numpuk. Lock bikin init+prompt OTP antri 1-per-1 di manapun dipanggil.
+// Mode tanpa OTP interaktif. Sesi yang jalan lama tanpa ditunggui (strategi 1
+// menunggu reset harian belasan jam) TIDAK boleh jatuh ke prompt OTP: promptnya
+// merebut stdin, dashboard mati, tombol q gak jalan, dan kalau tidak ada orang di
+// depan layar prosesnya cuma diam di prompt sampai pagi. Di mode ini refresh yang
+// gagal dilempar sebagai e.needOtp supaya pemanggilnya bisa melaporkan dengan jelas
+// dan mencoba lagi nanti — bukan menggantung.
+let OTP_INTERACTIVE = true;
+function setOtpInteractive(v) { OTP_INTERACTIVE = !!v; }
+
 let _otpChain = Promise.resolve();
 function withOtpLock(fn) {
   const result = _otpChain.then(fn, fn);
@@ -3190,6 +3199,12 @@ async function ensurePrivyToken(state) {
     if (lastErr) { state.message = `refresh gagal: ${(lastErr.message || '').slice(0, 40)}`; render(global.__states); }
   }
 
+  if (!OTP_INTERACTIVE) {
+    const e = new Error('token Privy mati & refresh gagal — butuh login OTP manual');
+    e.needOtp = true; e.unauthorized = true;
+    state.status = 'error'; state.message = 'butuh OTP manual';
+    throw e;
+  }
   // OTP manual (IMAP dihapus) — serialize global biar prompt gak tabrakan paralel.
   return await withOtpLock(async () => {
     // Re-cek cache: bisa jadi sesi keisi sementara nunggu giliran lock.
@@ -4587,8 +4602,9 @@ function statusInfo(state) {
   const d = state.dayTrader;
   const o = state.overcap;
   if (SESSION_ENGINE === 'strategi1' && state.s1) {
+    if (state.needOtp || state.s1.status === 'otp') return ['✱ OTP', COLOR.red];
     if (state.s1.feeWait) return ['◷ Fee', COLOR.yellow];
-    const m = { tunggu: ['○ Antre', COLOR.gray], nunggu: ['◷ Tunggu', COLOR.cyan], jalan: ['● Swap', COLOR.yellow], selesai: ['● Selesai', COLOR.green], lewat: ['● Lewat', COLOR.gray], batal: ['● Batal', COLOR.yellow], gagal: ['● Error', COLOR.red] };
+    const m = { tunggu: ['○ Antre', COLOR.gray], nunggu: ['◷ Tunggu', COLOR.cyan], jalan: ['● Swap', COLOR.yellow], selesai: ['● Selesai', COLOR.green], lewat: ['● Lewat', COLOR.gray], batal: ['● Batal', COLOR.yellow], gagal: ['● Error', COLOR.red], otp: ['✱ OTP', COLOR.red] };
     if (m[state.s1.status]) return m[state.s1.status];
   }
   if (state.status === 'error') return ['● Error', COLOR.red];
@@ -5208,8 +5224,20 @@ async function refreshExpiringTokens(states) {
     try {
       if (supaStale) await ensurePrivyToken(s);
       if (silvStale) await ensureSilvanaSession(s);
+      s.needOtp = false; s.__otpLogMs = 0;
     } catch (e) {
-      logActivity(`[${s.label || s.email}] token refresh gagal: ${((e && e.message) || e).toString().slice(0, 50)}`, COLOR.yellow);
+      if (e && e.needOtp) {
+        s.needOtp = true;
+        // Dilog sekali tiap 10 menit saja — watcher jalan tiap 30 dtk dan akun yg
+        // tokennya mati bakal gagal terus sampai dilogin ulang manual.
+        const now2 = Date.now();
+        if (!s.__otpLogMs || now2 - s.__otpLogMs > 600_000) {
+          s.__otpLogMs = now2;
+          logActivity(`[${s.label || s.email}] token Privy mati — butuh login OTP manual (akun ini dilewati sampai dilogin ulang)`, COLOR.red);
+        }
+      } else {
+        logActivity(`[${s.label || s.email}] token refresh gagal: ${((e && e.message) || e).toString().slice(0, 50)}`, COLOR.yellow);
+      }
     } finally { s.__tokenBusy = false; }
   });
 }
@@ -7528,7 +7556,7 @@ async function runRegister() {
 const argv = process.argv.slice(2);
 // buildSwapClients/SWAP/transferCC ikut diekspor biar bisa diprobe dari skrip luar
 // tanpa nyalain bot (require aman: runMain kegate `require.main === module`).
-module.exports = { effFeeCap, capFromMap, s1TungguFeeTurun, setSessionEngine, renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
+module.exports = { setOtpInteractive, ensurePrivyToken, refreshExpiringTokens, effFeeCap, capFromMap, s1TungguFeeTurun, setSessionEngine, renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
 
 if (require.main === module) {
   if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
@@ -8964,6 +8992,10 @@ Usage:
         logActivity(`Strategi 1 — hub ${hub} · fee ${kandidatUrut.join(' → ')} · ${pilihAkun.length} akun`, COLOR.cyan);
         logActivity('q = berhenti setelah swap yg lagi jalan · ↑/↓ = ganti panel log', COLOR.gray);
         const batal = watchCancelKey();
+        // Sesi ini jalan belasan jam tanpa ditunggui. Prompt OTP di tengah jalan bakal
+        // merebut stdin dari dashboard dan menggantung semuanya, jadi dimatikan; akun
+        // yang tokennya mati dilaporkan dan dilewati, lalu dicoba lagi putaran berikut.
+        setOtpInteractive(false);
         render(global.__states);
         const timerUI = setInterval(() => render(global.__states), 1000);
 
@@ -9057,8 +9089,14 @@ Usage:
               else { st2.s1.status = 'selesai'; sukses++; log(st2.s1.swap ? `selesai — ${st2.s1.swap} swap` : 'semua task sudah penuh'); }
             } else log('dihentikan user');
           } catch (e) {
-            gagal++; st2.s1.status = 'gagal';
-            log(paint(`GAGAL: ${(e && e.message) || e}`, COLOR.red));
+            gagal++;
+            if (e && e.needOtp) {
+              st2.s1.status = 'otp'; st2.needOtp = true;
+              log(paint('token Privy mati — butuh login OTP manual, akun ini dilewati putaran ini', COLOR.red));
+            } else {
+              st2.s1.status = 'gagal';
+              log(paint(`GAGAL: ${(e && e.message) || e}`, COLOR.red));
+            }
           }
           st2.s1.jalan = false;
         });
@@ -9092,6 +9130,7 @@ Usage:
         clearInterval(timerUI);
         clearInterval(timerKA);
         clearInterval(timerTW);
+        setOtpInteractive(true);
         batal.stop();
         render(global.__states);
         process.stdout.write('\n' + paint('strategi dihentikan', COLOR.yellow) + '\n');

@@ -508,6 +508,23 @@ menyimpulkan bot tidak membayar fee.
 Kolom `FEE/SN` yang besar (ratusan sampai ribuan CC) itu warisan sesi ping-pong/day-trader
 sebelumnya, bukan biaya strategi 1.
 
+### Sesi panjang tanpa penunggu tidak boleh jatuh ke prompt OTP
+
+`ensurePrivyToken` punya jalur terakhir berupa **OTP interaktif**: kalau refresh token
+gagal permanen (`notRefreshable`, atau 401 persisten 4× walau proxy dirotasi), dia meminta
+kode OTP lewat `prompt()`. Itu benar untuk menu manual, tapi fatal buat sesi yang jalan
+belasan jam tanpa ditunggui — strategi 1 menunggu reset harian, lalu token Privy mati di
+tengah malam dan promptnya merebut stdin dari dashboard: layar berhenti diperbarui, `q`
+tidak berfungsi, dan prosesnya diam di prompt sampai ada orang.
+
+`setOtpInteractive(false)` mematikan jalur itu; refresh yang gagal dilempar sebagai
+`e.needOtp` supaya pemanggilnya bisa melaporkan dengan jelas dan mencoba lagi nanti.
+Strategi 1 menyalakannya untuk seluruh sesi dan mengembalikannya saat keluar. Akun yang
+tokennya mati ditandai `state.needOtp`, tampil `✱ OTP` di kolom STATUS, dilewati putaran
+itu, dan tetap dicoba ulang tiap 30 detik oleh `refreshExpiringTokens` (lognya diredam jadi
+sekali per 10 menit — kalau tidak, satu akun mati membanjiri panel). Memulihkannya tetap
+manual: hentikan bot, `menu 3` untuk login OTP, jalankan lagi.
+
 ### Resilience patterns worth preserving
 
 Errors are tagged rather than string-matched at the call site: `e.transient`, `e.unauthorized`,
