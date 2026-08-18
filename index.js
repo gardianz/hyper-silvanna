@@ -2639,7 +2639,11 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
   // Pengait dashboard. Dipanggil tiap ada kemajuan; kalau ctx.onProgress gak dipasang
   // (mis. dipanggil dari skrip) semuanya jadi no-op.
   const lapor = (extra) => {
-    ctx.s1lapor = { task: task.code, market: mk.id, ...(ctx.s1lapor || {}), ...(extra || {}) };
+    // Urutan merge PENTING: s1lapor lama disebar DULU, baru ditimpa task/market yang
+    // sekarang. Kebalik (task/market di depan) bikin nilai task PERTAMA nempel selamanya
+    // — kolom SWAP di dashboard nunjukin progres task lama, mis. 5/10 padahal semua
+    // task sudah 10/10.
+    ctx.s1lapor = { ...(ctx.s1lapor || {}), task: task.code, market: mk.id, ...(extra || {}) };
     if (typeof ctx.onProgress === 'function') { try { ctx.onProgress(ctx.s1lapor); } catch (_) { } }
   };
 
@@ -2647,6 +2651,10 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
   if (!st) { log(`task ${task.code} gak ketemu di earn-hub — dilewati`); return { done: 0, skipped: true, alasan: 'task gak ada' }; }
   if (st.cur >= st.tgt) { log(`${task.code} udah ${st.cur}/${st.tgt} — dilewati`); return { done: 0, skipped: true, alasan: 'penuh', cur: st.cur, tgt: st.tgt }; }
   log(`${task.code} ${st.cur}/${st.tgt} di ${mk.id}`);
+  // Progres task ini dilaporkan EKSPLISIT di awal. Tanpa ini, cur/tgt task sebelumnya
+  // masih menempel sampai swap pertama selesai — dashboard sempat menampilkan progres
+  // task lama untuk task yang baru mulai.
+  lapor({ cur: st.cur, tgt: st.tgt, langkah: 0 });
 
   // Task yg gak nyentuh hub (mis. HECTO-EDELx saat hub cETH): danai dulu dari hub.
   if (bukanHub) {
@@ -2842,13 +2850,19 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
     // Volume dari nilai yg BENAR-BENAR dieksekusi (quoteQty × harga quote), bukan dari
     // kirimUsd yg cuma target sebelum quote keluar.
     volumeUsd += (hasil && Number.isFinite(hasil.quoteQty) && pxQ > 0) ? hasil.quoteQty * pxQ : kirimUsd;
-    // Tunggu counter task naik (settle async). Polling 2 dtk, bukan 5: counter biasanya
-    // sudah naik dalam ~4 dtk, dan tiap detik nunggu di sini dikali 30-an swap.
-    for (let i = 0; i < 25; i++) {
+    // Tunggu counter task naik (settle async). Polling 2 dtk, tapi anggarannya 90 dtk:
+    // kalau bot menyerah kecepatan lalu swap lagi padahal settle-nya sudah masuk, task
+    // target 10 bisa makan 18 swap (batas maxLangkah) — 8 swap terbuang percuma,
+    // masing-masing bayar fee + spread. Terlihat nyata di log: "18 swap, volume $215".
+    const curSebelum = st.cur;
+    for (let i = 0; i < 45; i++) {
       await sleep(2000);
       const s2 = await bacaTask();
-      if (s2 && s2.cur > st.cur) { st = s2; break; }
+      if (s2 && s2.cur > curSebelum) { st = s2; break; }
       if (s2) st = s2;
+    }
+    if (st.cur === curSebelum) {
+      log(`  counter task belum naik setelah 90 dtk (masih ${st.cur}/${st.tgt}) — swap ini mungkin gak kehitung`);
     }
     // Saldo ikut dilaporkan supaya kolom token di dashboard hidup tiap swap. `get.raw`
     // itu hasil baca saldo di awal iterasi ini — tidak ada permintaan tambahan.
@@ -2862,7 +2876,24 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
     lapor({ langkah });
   }
 
-  const getAkhir = await saldo().catch(() => (() => 0));
+  // Saldo akhir WAJIB benar-benar terbaca. Versi lama jatuh ke getter yang selalu
+  // mengembalikan 0 saat pembacaan gagal — akibatnya `feeAwal - 0` membukukan SELURUH
+  // saldo token fee sebagai fee satu task (terlihat sebagai FEE/hr 18.75 TUSDT untuk
+  // 38 swap, padahal fee sebenarnya ~0.15/swap), dan `totalAwal - 0` membukukan seluruh
+  // portofolio sebagai spread. Lebih baik tidak membukukan apa pun daripada angka palsu.
+  let getAkhir = null;
+  for (let i = 0; i < 3 && !getAkhir; i++) {
+    getAkhir = await saldo().catch(() => null);
+    if (!getAkhir && i < 2) await sleep(2000);
+  }
+  if (!getAkhir) {
+    log(`gagal baca saldo akhir ${task.code} — fee & spread task ini TIDAK dibukukan (angkanya bakal ngawur)`);
+    return {
+      done: langkah, cancelled: dibatalin, feeTok, feePakai: [], alasan,
+      cur: st.cur, tgt: st.tgt,
+      spreadUsd: 0, volumeUsd, feeUsd: 0, biayaTask: 0, totalUsd: 0, takTerbukukan: true,
+    };
+  }
   lapor({ langkah, raw: getAkhir.raw });
   const totalAkhir = nilaiTotal(getAkhir);
   const biayaTask = totalAwal - totalAkhir;   // termasuk seed + balik ke hub
@@ -9045,7 +9076,14 @@ Usage:
           if (batal.cancelled()) break;
           const sisa = habisPada - Date.now();
           const j = Math.floor(sisa / 3600000), m = Math.floor(sisa / 60000) % 60;
-          for (const st3 of dstates) { st3.s1.status = 'nunggu'; st3.s1.task = `${j}j${String(m).padStart(2, '0')}m lagi`; st3.s1.jalan = false; }
+          for (const st3 of dstates) {
+            st3.s1.status = 'nunggu';
+            st3.s1.task = `${j}j${String(m).padStart(2, '0')}m lagi`;
+            st3.s1.jalan = false;
+            // Kolom SWAP dikosongkan: lagi gak ngerjain task apa pun, dan progres task
+            // terakhir kalau ditinggal terbaca seolah masih ada yang belum kelar.
+            st3.s1.cur = 0; st3.s1.tgt = 0;
+          }
           await sleep(Math.min(30000, Math.max(1000, sisa)));
         }
         if (batal.cancelled()) break;

@@ -313,6 +313,11 @@ oleh swap apa pun). `s1RunTask` mengerjakannya berurutan dan selalu pulang ke sa
 
 Yang perlu diketahui sebelum mengubahnya:
 
+- **`lapor()` harus menyebar state lama DULU, baru menimpanya.** Ditulis terbalik
+  (`{task, market, ...lama}`) nilai task **pertama** menempel selamanya, dan kolom SWAP di
+  dashboard menampilkan progres task lama — terlihat sebagai `5/10` padahal semua task sudah
+  10/10. Progres juga dilaporkan eksplisit di awal tiap task, kalau tidak cur/tgt task
+  sebelumnya masih menempel sampai swap pertama selesai.
 - **Progres task itu STRING.** `GET /api/earn-hub/tasks` mengembalikan `progress: "3/10"`,
   bukan `current`/`target` numerik. Membaca `it.current` menghasilkan `0` selamanya dan
   loop tidak pernah berhenti — `s1Progress()` mem-parse string itu seperti `parseDayTrader`.
@@ -431,6 +436,16 @@ tanpa jalur akuntansi kedua. Versi berurutan + cetak baris membuat 15 akun berar
 yang sedang jalan yang terlihat. Harga USD di-cache 30 detik (`usdPriceOf`): tiap swap butuh
 harga base dan quote, jadi tanpa cache satu putaran menembak ~64 request harga yang jawabannya
 praktis sama.
+
+### Akuntansi fee/spread: jangan pernah membukukan dari pembacaan saldo yang gagal
+
+`s1RunTask` menghitung fee satu task dari **selisih saldo token fee** (`feeAwal - feeAkhir`)
+dan spread dari selisih nilai portofolio. Keduanya runtuh kalau pembacaan saldo akhir gagal:
+versi lama jatuh ke `catch(() => (() => 0))`, sehingga tiap token terbaca 0 dan yang
+terbukukan adalah **seluruh saldo** — nyata terlihat sebagai `FEE/hr 18.75 TUSDT` untuk 38
+swap yang fee sebenarnya ~0.15/swap (≈5.7). Sekarang pembacaan diulang 3×, dan kalau tetap
+gagal task itu **tidak dibukukan sama sekali** (`takTerbukukan: true`) — angka kosong jauh
+lebih baik daripada angka palsu yang ikut masuk ember season.
 
 ### Spread: proporsional, sedangkan fee flat — ini yang menentukan ukuran swap
 
