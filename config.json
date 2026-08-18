@@ -56,8 +56,8 @@
       "maxFeeUsd": 1,
       "_help_swapTimeoutSec": "Batas waktu satu swap strategi 1 (detik). Kalau RFQ atau settle diam lebih lama dari ini, swap dilepas dan langkah yang sama diulang, bukan akunnya digugurkan. Tanpa batas ini satu swap yang menggantung membekukan seluruh akun tanpa satu baris log pun sehingga dari luar terlihat macet. Swap normal selesai 20-40 detik.",
       "swapTimeoutSec": 240,
-      "_help_feeWaitSec": "Jeda sebelum mencoba lagi ketika fee di atas maxFeeUsd (detik). Fee bergerak ikut beban jaringan, jadi swap yang ditolak sekarang biasanya lolos beberapa menit kemudian. Bot menunggu dan mengulang TANPA batas sampai fee turun; berhentinya hanya lewat q atau Ctrl+C. Sebelum ada ini fee spike menggugurkan akun sehingga seluruh putaran batal dan bot menganggur sampai reset besok.",
-      "feeWaitSec": 300,
+      "_help_feePollSec": "Selang pengecekan fee saat menunggu fee turun (detik). Yang dipanggil estimateAtomicFeeAction — endpoint yang dipakai UI Silvana untuk menampilkan fee walau kolom jumlahnya masih 0, jadi mengecek fee tidak membuat RFQ sama sekali dan boleh sering. Begitu fee turun swap langsung disambung, tidak menunggu sisa jeda.",
+      "feePollSec": 30,
       "_help_tasks": "Urutan task earn-hub yang dikerjakan. `code` harus persis kode dari GET /api/earn-hub/tasks (cek: CETH_EDELX_DAY_TRADER, HECTO_CETH_DAY_TRADER, HECTO_EDELX_DAY_TRADER), `market` adalah market_id Silvana, `target` cuma cadangan kalau field progress tidak terbaca. Progres dibaca ulang dari server tiap swap sehingga tidak mungkin kelebihan.",
       "tasks": [
         {

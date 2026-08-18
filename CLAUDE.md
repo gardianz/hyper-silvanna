@@ -214,6 +214,19 @@ Two more things the same sweep settled:
   at different times. The **ratio** CC : USDCx : TUSDT stays ~22 : 2 : 1, so a cap that is sane for one
   token is wildly wrong for another — `maxFeeCC` is denominated in whichever token `feeTokens` selects.
 
+**Fee bisa dibaca TANPA quote.** `estimateAtomicFeeAction({partyId, marketId, feeTokens?})`
+mengembalikan fee yang berlaku sekarang tanpa `quantity` sama sekali — ini yang dipakai UI
+Silvana untuk menampilkan "Fee in ≈ $0.30" padahal kolom jumlahnya masih 0. Balasannya
+`{success, feeUsd:"0.30", settlementFee:{instrumentId, amount, receiver, instrumentAdmin},
+belowMinValue}`. `feeTokens` di sini juga **urutan preferensi**, dan dihilangkan = CC.
+Terukur bersamaan: CC 6.66 ($0.60), USDCx 0.6 ($0.60), TUSDT 0.3 ($0.30), USD8 0.3 ($0.30).
+
+Bedakan dari dua endpoint fee yang lain: `estimateSettlementFees` (`SWAP.actionIds.estimateFee`)
+**wajib** `baseQuantity` + `price` — dipanggil tanpa itu jawabannya `Missing required fields`;
+dan `requestQuotesV2` yang memang membuat RFQ. Jadi untuk sekadar memantau fee (menunggu fee
+turun, menu batas fee), pakai `sv.feeNow()` yang membungkus `estimateAtomicFeeAction` — jangan
+membuat quote hanya untuk melihat angkanya.
+
 `feeTokens` accepts `CC`, `USDCx`, `TUSDT`; `USD8` and `EDELx` return no quote. The request name is not
 the instrument id — `TUSDT` settles as instrument `tf-usdt`, so holdings lookups must go through
 `FEE_TOKEN_INSTRUMENT` or they find nothing and blame the wrong token.
@@ -353,11 +366,12 @@ Yang perlu diketahui sebelum mengubahnya:
   terbuang; menggugurkan akun karenanya adalah reaksi yang salah.
 - **Fee di atas batas = TUNGGU, bukan gagal.** Fee bergerak ikut beban jaringan (terukur
   0.15 lalu 0.30 di hari yang sama), jadi swap yang ditolak sekarang biasanya lolos beberapa
-  menit kemudian. `e.feeSpike` ditunda `strategy1.feeWaitSec` lalu langkah yang sama diulang
-  tanpa batas — berhentinya hanya lewat `q`/Ctrl+C, pola yang sama dengan mode 8. Sebelumnya
-  ini menggugurkan akun sehingga seluruh putaran batal dan bot menganggur sampai reset besok.
-  Swap di luar loop utama (seed dan pulang-ke-hub) memakai `s1SwapTungguFee()` supaya tidak
-  jadi celah yang tetap menggugurkan akun.
+  menit kemudian. `e.feeSpike` memicu `s1TungguFeeTurun()` yang **mem-poll fee** tiap
+  `strategy1.feePollSec` (default 30 dtk) sampai turun ke bawah `maxFeeUsd`, lalu langkah yang
+  sama diulang — tanpa batas, berhentinya hanya lewat `q`/Ctrl+C. Sebelumnya ini menggugurkan
+  akun sehingga seluruh putaran batal dan bot menganggur sampai reset besok. Swap di luar loop
+  utama (seed dan pulang-ke-hub) memakai `s1SwapTungguFee()` supaya tidak jadi celah yang
+  tetap menggugurkan akun.
 - **Satu swap punya batas waktu** (`strategy1.swapTimeoutSec`, default 240 dtk). Tanpa itu
   RFQ/settle yang diam membekukan akun tanpa satu baris log pun dan dari luar terlihat macet.
   Lewat batas ditandai `transient` sehingga langkah yang sama diulang, bukan akun digugurkan.

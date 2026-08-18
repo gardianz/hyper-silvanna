@@ -756,7 +756,7 @@ const M8 = {
       seedUsd: _m8num(s.seedUsd, 16),
       maxFeeUsd: _m8num(s.maxFeeUsd, 1),
       swapTimeoutSec: _m8num(s.swapTimeoutSec, 240),
-      feeWaitSec: _m8num(s.feeWaitSec, 300),
+      feePollSec: _m8num(s.feePollSec, 30),
       tasks: Array.isArray(s.tasks) ? s.tasks.filter(t => t && t.code && t.market) : [],
     };
   })(),
@@ -1778,6 +1778,34 @@ class SilvanaClient {
     if (r.status !== 200) throw new Error(`tasks status=${r.status}`);
     return r.json;
   }
+  /**
+   * Fee settlement yang BERLAKU SEKARANG, tanpa quote dan tanpa jumlah.
+   * Ini yang dipakai UI Silvana buat nampilin "Fee in ≈ $0.30" padahal kolom
+   * jumlahnya masih 0 — jadi ngecek fee gak perlu bikin RFQ sama sekali.
+   *   estimateAtomicFeeAction({partyId, marketId, feeTokens?})
+   *     → {success, feeUsd:"0.30", settlementFee:{instrumentId, amount, receiver,
+   *        instrumentAdmin}, belowMinValue}
+   * feeTokens dihilangkan = CC (Amulet). Sama seperti di RFQ, isinya URUTAN
+   * PREFERENSI, bukan daftar buat dibandingkan.
+   */
+  async feeNow(partyId, market, feeTokens) {
+    const args = { partyId, marketId: market };
+    const ft = (Array.isArray(feeTokens) ? feeTokens : (feeTokens ? [feeTokens] : []))
+      .filter(Boolean).map(String).filter(t => t.toUpperCase() !== 'CC');
+    if (ft.length) args.feeTokens = ft;
+    const r = await this.swapAction(SWAP.actionIds.estimateAtomicFee, [args]);
+    if (!r || r.success === false) {
+      throw new Error(`estimateAtomicFee: ${(r && (r.error || r.message)) || 'gagal'}`);
+    }
+    const f = r.settlementFee || {};
+    return {
+      usd: Number(r.feeUsd),
+      amount: Number(f.amount),
+      sym: symbolOfInstrument(f.instrumentId),
+      instrumentId: f.instrumentId,
+      belowMinValue: !!r.belowMinValue,
+    };
+  }
   async earnStats() {
     // Earn-hub stats: { displayName, totalPoints, activityCount, totalVolume, achievements }
     const r = await request('GET', `${APP_BASE}/api/earn-hub/stats`, this._opts({ headers: this._hdr({ 'Referer': APP_BASE + '/earn-hub' }) }));
@@ -2361,6 +2389,38 @@ async function s1Balances(ctx) {
 
 const s1Durasi = (dtk) => (dtk < 90 ? `${Math.round(dtk)} dtk` : `${Math.round(dtk / 60)} mnt`);
 
+// Tunggu sampai fee turun ke bawah batas. Yang di-poll `estimateAtomicFeeAction` —
+// endpoint yang dipakai UI buat nampilin "Fee in ≈ $0.30" padahal jumlahnya masih 0.
+// Jadi ngecek fee TIDAK perlu bikin RFQ: satu panggilan ringan, boleh sering, dan
+// begitu fee turun swapnya langsung disambung (bukan nunggu sisa jeda 5 menit).
+// Balikin true = fee sudah aman, false = dibatalin user.
+async function s1TungguFeeTurun(ctx, market, kandidatFee, cfg, log, isCancelled, onTotal) {
+  const capUsd = Number(cfg.maxFeeUsd) > 0 ? Number(cfg.maxFeeUsd) : Infinity;
+  const pollS = Math.max(10, Number(cfg.feePollSec) || 30);
+  let total = 0, lapor = 0;
+  for (; ;) {
+    if (isCancelled && isCancelled()) return false;
+    const sampai = Date.now() + pollS * 1000;
+    while (Date.now() < sampai) {
+      if (isCancelled && isCancelled()) return false;
+      await sleep(Math.min(2000, Math.max(250, sampai - Date.now())));
+    }
+    total += pollS;
+    if (typeof onTotal === 'function') onTotal(total);
+    const f = await ctx.sv.feeNow(ctx.partyId, market, kandidatFee).catch(() => null);
+    if (!f || !(f.usd > 0)) continue;              // gagal baca → coba lagi, jangan lanjut buta
+    if (f.usd <= capUsd) {
+      log(`  fee turun ke $${f.usd.toFixed(2)} (${f.amount} ${f.sym}) ≤ batas $${capUsd} — lanjut (nunggu ${s1Durasi(total)})`);
+      return true;
+    }
+    // Jangan spam log tiap poll: cukup tiap ~5 menit sekali.
+    if (total - lapor >= 300) {
+      lapor = total;
+      log(`  fee masih $${f.usd.toFixed(2)} (${f.amount} ${f.sym}) > batas $${capUsd} — nunggu ${s1Durasi(total)}`);
+    }
+  }
+}
+
 // Swap yang MENUNGGU kalau fee lagi di atas batas, bukan menyerah. Dipakai untuk
 // swap di luar loop utama (seed & pulang ke hub) — dua-duanya dulu menggugurkan akun
 // begitu fee naik, padahal fee turun sendiri dalam hitungan menit.
@@ -2370,13 +2430,9 @@ async function s1SwapTungguFee(ctx, mk, deliver, qty, feeList, log, isCancelled)
     catch (e) {
       if (!(e && e.feeSpike)) throw e;
       if (isCancelled && isCancelled()) { e.aborted = true; throw e; }
-      const waitS = Math.max(30, Number((M8.strategy1 || {}).feeWaitSec) || Number(SWAP.feeSpikeWaitSec) || 300);
-      log(`  ${(e.message || '').slice(0, 60)} — nunggu fee turun ${s1Durasi(waitS)}`);
-      const sampai = Date.now() + waitS * 1000;
-      while (Date.now() < sampai) {
-        if (isCancelled && isCancelled()) { e.aborted = true; throw e; }
-        await sleep(Math.min(5000, Math.max(500, sampai - Date.now())));
-      }
+      log(`  ${(e.message || '').slice(0, 60)} — nunggu fee turun`);
+      const ok = await s1TungguFeeTurun(ctx, mk.id, feeList, M8.strategy1 || {}, log, isCancelled);
+      if (!ok) { e.aborted = true; throw e; }
     }
   }
 }
@@ -2723,18 +2779,11 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
       // cukup menunggu. Pola sama dengan mode 8: tunda, cek lagi, ulangi SAMPAI turun.
       // Berhentinya cuma lewat q / Ctrl+C.
       if (e && e.feeSpike) {
-        const waitS = Math.max(30, Number(cfg.feeWaitSec) || Number(SWAP.feeSpikeWaitSec) || 300);
-        tungguFeeS += waitS;
-        log(`  ${(e.message || '').slice(0, 60)} — nunggu fee turun, cek lagi ${s1Durasi(waitS)} (total nunggu ${s1Durasi(tungguFeeS)})`);
+        log(`  ${(e.message || '').slice(0, 60)} — nunggu fee turun`);
         lapor({ feeWait: true, feeInfo: `${e.feeCC} ${e.feeUnit || ''}`.trim() });
-        // Ditunggu potong-potong supaya q tetap responsif.
-        const sampai = Date.now() + waitS * 1000;
-        while (Date.now() < sampai) {
-          if (isCancelled && isCancelled()) { dibatalin = true; break; }
-          await sleep(Math.min(5000, Math.max(500, sampai - Date.now())));
-        }
+        const turun = await s1TungguFeeTurun(ctx, mk.id, semua, cfg, log, isCancelled, (n) => { tungguFeeS = n; });
         lapor({ feeWait: false });
-        if (dibatalin) break;
+        if (!turun) { dibatalin = true; break; }   // dibatalin user
         putaran--;                      // nunggu fee jangan makan jatah putaran
         continue;                       // langkah TIDAK naik: swapnya belum terjadi
       }
@@ -7410,7 +7459,7 @@ async function runRegister() {
 const argv = process.argv.slice(2);
 // buildSwapClients/SWAP/transferCC ikut diekspor biar bisa diprobe dari skrip luar
 // tanpa nyalain bot (require aman: runMain kegate `require.main === module`).
-module.exports = { setSessionEngine, renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
+module.exports = { s1TungguFeeTurun, setSessionEngine, renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
 
 if (require.main === module) {
   if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
@@ -9059,11 +9108,15 @@ Usage:
           const pasar = (S1c.tasks && S1c.tasks[0] && S1c.tasks[0].market) || 'EDELx-cETH';
           let feeSekarang = [];
           try {
+            // Lewat estimateAtomicFeeAction, bukan RFQ: endpoint ini yang dipakai UI
+            // Silvana buat nampilin fee walau kolom jumlahnya masih 0, jadi gak perlu
+            // bikin quote cuma buat lihat fee.
             const { sv: svF, partyId: pidF } = await buildSwapClients(makeStates()[0]);
-            feeSekarang = await feeQuotesUsd(svF, pidF, pasar, FEE_TOKEN_IDS, Number(S1c.stepUsd) || 12);
-            for (const f of feeSekarang) {
-              const txt = f.usd != null ? `${f.amount} ${f.sym || f.tok}  ≈ $${f.usd.toFixed(3)}` : (f.note || 'gak ada quote');
-              process.stdout.write(`  ${String(f.tok).padEnd(7)} ${paint(txt, f.usd != null ? COLOR.green : COLOR.gray)}\n`);
+            for (const tok of FEE_TOKEN_IDS) {
+              const f = await svF.feeNow(pidF, pasar, [tok]).catch(() => null);
+              if (f && f.usd > 0) feeSekarang.push({ tok, amount: f.amount, sym: f.sym, usd: f.usd });
+              const txt = (f && f.usd > 0) ? `${f.amount} ${f.sym}  ≈ $${f.usd.toFixed(2)}` : 'gak kebaca';
+              process.stdout.write(`  ${String(tok).padEnd(7)} ${paint(txt, (f && f.usd > 0) ? COLOR.green : COLOR.gray)}\n`);
             }
             const ok = feeSekarang.filter(f => f.usd != null).sort((a, b) => a.usd - b.usd);
             if (ok.length) process.stdout.write(paint(`  termurah sekarang: ${ok[0].tok} $${ok[0].usd.toFixed(3)} di ${pasar}\n`, COLOR.cyan));
