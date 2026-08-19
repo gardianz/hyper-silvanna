@@ -4723,8 +4723,21 @@ function renderAccountsTable(states) {
     // Di strategi 1 kolom FEE/hr sudah menampilkan ember token yg sama, jadi FEE-TOK
     // cuma mengulang informasi; tempatnya dipakai SPREAD/HARI — biaya spread hari ini,
     // yg sebelumnya ada di LOSS$/hr tapi prio 3 sehingga hampir selalu kedrop duluan.
+    // Spread PER TASK — satu kolom tiap task yang dipilih, judulnya market-nya.
+    // Spread antar market beda jauh (0.61% / 2.02% / 4.05%), jadi kalau digabung
+    // jadi satu angka, task termahal tidak kelihatan sebagai penyebab biaya.
+    ...(SESSION_ENGINE === 'strategi1' ? S1TASKLIST.map(t => ({
+      title: String(t.market), prio: 1, cap: 12,
+      cell: (s) => {
+        const p = s.s1 && s.s1.perTask && s.s1.perTask[t.code];
+        if (!p) return ['-', COLOR.gray];
+        if (p.takTerbukukan) return ['?', COLOR.yellow];
+        const v = Number(p.spreadUsd) || 0;
+        return [`$${v.toFixed(2)}`, v > 0 ? COLOR.red : COLOR.gray];
+      },
+    })) : []),
     ...(SESSION_ENGINE === 'strategi1'
-      ? [{ title: 'SPREAD/HARI', prio: 2, cap: 11, cell: s => [Number(s.spreadToday) > 0 ? '$' + Number(s.spreadToday).toFixed(2) : '$0', COLOR.red] }]
+      ? [{ title: 'SPREAD/HARI', prio: 3, cap: 11, cell: s => [Number(s.spreadToday) > 0 ? '$' + Number(s.spreadToday).toFixed(2) : '$0', COLOR.red] }]
       : ((Array.isArray(states) && states.some(x => Number(x && x.feeTokSeason) > 0))
         ? [{ title: 'FEE-TOK', prio: 2, cap: 12, cell: s => [Number(s.feeTokSeason) > 0 ? `${fmtSeason(s.feeTokSeason)} ${s.feeTokUnit || ''}`.trim() : '-', Number(s.feeTokSeason) > 0 ? COLOR.cyan : COLOR.gray] }]
         : [])),
@@ -7061,8 +7074,11 @@ async function runEdelCethSession(reason) {
 let SESSION_ENGINE = 'daytrader';
 // Token yg dipakai strategi 1 — jadi kolom saldo di dashboard.
 let S1TOKENS = [];
+// Task yg dipilih buat sesi ini — tiap task dapat kolom spread SENDIRI. Digabung jadi
+// satu angka, biaya task termahal (HECTO-EDELx, spread 4%) tersamar oleh yang murah.
+let S1TASKLIST = [];
 // Dipakai dari luar modul (uji tampilan) tanpa mengekspor variabelnya langsung.
-function setSessionEngine(v, tokens) { SESSION_ENGINE = v; if (Array.isArray(tokens)) S1TOKENS = tokens; }
+function setSessionEngine(v, tokens, tasks) { SESSION_ENGINE = v; if (Array.isArray(tokens)) S1TOKENS = tokens; if (Array.isArray(tasks)) S1TASKLIST = tasks; }
 async function runSwapSession(reason) {
   return SESSION_ENGINE === 'pingpong' ? runEdelCethSession(reason) : runDayTraderSession(reason);
 }
@@ -8913,13 +8929,50 @@ Usage:
 
       if (ans === '1') {
         const S1 = (M8.strategy1 || {});
-        const tasks = Array.isArray(S1.tasks) ? S1.tasks : [];
+        const semuaTask = Array.isArray(S1.tasks) ? S1.tasks : [];
         const hub = S1.hub || 'cETH';
-        if (!tasks.length) { console.error(paint('mode8.strategy1.tasks kosong di config.json', COLOR.red)); continue; }
+        if (!semuaTask.length) { console.error(paint('mode8.strategy1.tasks kosong di config.json', COLOR.red)); continue; }
 
         process.stdout.write('\n' + paint(`Strategi 1 — hub ${hub}`, COLOR.bold + COLOR.cyan) + '\n');
-        tasks.forEach((t, i) => process.stdout.write(paint(`  ${i + 1}. ${t.code}  (${t.market}, target ${t.target || 10})`, COLOR.gray) + '\n'));
         process.stdout.write(paint(`  ukuran: swap-1 $${S1.firstUsd} · berikutnya $${S1.stepUsd} · seed $${S1.seedUsd} · swap terakhir = semua`, COLOR.gray) + '\n');
+
+        // 0) pilih task. Spread tiap market beda jauh (diukur bersamaan: HECTO-cETH
+        // 0.61%, EDELx-cETH 2.02%, HECTO-EDELx 4.05%), jadi mengerjakan semua task
+        // belum tentu masuk akal — task termahal bisa menelan separuh biaya harian.
+        // Progres hari ini ikut ditampilkan biar kelihatan mana yang masih perlu.
+        process.stdout.write('\n' + paint('Ngukur spread tiap task…', COLOR.gray) + '\n');
+        const infoTask = [];
+        try {
+          const { sv: svT, partyId: pidT } = await buildSwapClients(makeStates()[0]);
+          const tArr = await svT.earnTasks(pidT).catch(() => null);
+          for (const t of semuaTask) {
+            const it = s1FindTask(tArr, t.code);
+            const pr = it ? s1Progress(it, t.target) : null;
+            const sp = await rfqSpread(svT, pidT, t.market, S1.stepUsd).catch(() => null);
+            infoTask.push({ t, pr, spreadPct: (sp && !sp.err) ? sp.spreadPct : null, perSwapUsd: (sp && !sp.err) ? sp.perSwapUsd : null });
+          }
+        } catch (e) {
+          process.stdout.write(paint(`  gagal ngukur: ${e.message}\n`, COLOR.yellow));
+          for (const t of semuaTask) infoTask.push({ t, pr: null, spreadPct: null, perSwapUsd: null });
+        }
+        const pilihTask = await pickList({
+          title: 'Task mana yang mau dikerjain?',
+          items: infoTask.map(x => {
+            const sisa = x.pr ? Math.max(0, x.pr.tgt - x.pr.cur) : null;
+            const prog = x.pr ? `${x.pr.cur}/${x.pr.tgt}` : '?';
+            const sp = x.spreadPct != null ? `spread ${x.spreadPct.toFixed(2)}%` : 'spread ?';
+            const est = (x.perSwapUsd != null && sisa != null) ? ` · sisa ${sisa} swap ≈ $${(x.perSwapUsd * sisa).toFixed(2)}` : '';
+            const warna = x.spreadPct == null ? COLOR.gray : (x.spreadPct > 3 ? COLOR.red : (x.spreadPct > 1.5 ? COLOR.yellow : COLOR.green));
+            return {
+              label: `${x.t.code.replace(/_DAY_TRADER$/, '').padEnd(12)} ${String(x.t.market).padEnd(12)}`,
+              detail: paint(`${prog} · ${sp}${est}`, warna),
+            };
+          }),
+          multi: true,
+        });
+        if (!pilihTask.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
+        const tasks = pilihTask.map(i => semuaTask[i]);
+        process.stdout.write(paint(`  dipilih: ${tasks.map(t => t.code.replace(/_DAY_TRADER$/, '')).join(' → ')}\n`, COLOR.cyan));
 
         // 1) pilih akun
         const states = makeStates();
@@ -8981,10 +9034,11 @@ Usage:
         let mkAll = await fetchMarkets((await buildSwapClients(states[pilihAkun[0]])).sv);
         SESSION_ENGINE = 'strategi1';
         S1TOKENS = [...new Set([hub, ...tasks.flatMap(t => String(t.market).split('-')), ...kandidatUrut].map(String))];
+        S1TASKLIST = tasks.slice();
         // Dashboard cuma menampilkan akun yg dipilih — kalau semua akun ikut, barisnya
         // penuh akun nganggur dan yg penting kedorong.
         const dstates = pilihAkun.map(i => states[i]);
-        for (const st2 of dstates) { st2.log = []; st2.s1 = { status: 'tunggu', taskIdx: 0, taskTotal: tasks.length, swap: 0, cur: 0, tgt: 0 }; }
+        for (const st2 of dstates) { st2.log = []; st2.s1 = { status: 'tunggu', taskIdx: 0, taskTotal: tasks.length, swap: 0, cur: 0, tgt: 0, perTask: {} }; }
         global.__states = dstates;
         selView = 0;
         setupKeyNav();
@@ -9013,7 +9067,7 @@ Usage:
         for (; ;) {
         putaranHari++;
         if (putaranHari > 1) {
-          for (const st3 of dstates) st3.s1 = { status: 'tunggu', taskIdx: 0, taskTotal: tasks.length, swap: 0, cur: 0, tgt: 0 };
+          for (const st3 of dstates) st3.s1 = { status: 'tunggu', taskIdx: 0, taskTotal: tasks.length, swap: 0, cur: 0, tgt: 0, perTask: {} };
           // Daftar market bisa berubah antar hari (market baru / dinonaktifkan).
           mkAll = await fetchMarkets((await buildSwapClients(states[pilihAkun[0]])).sv).catch(() => mkAll);
           logActivity(`putaran ${putaranHari} mulai — task harian sudah reset`, COLOR.cyan);
@@ -9068,6 +9122,17 @@ Usage:
               alasanTask.push(hasil.alasan || (hasil.skipped ? 'dilewati' : ''));
               if (hasil.cur != null) { st2.s1.cur = hasil.cur; st2.s1.tgt = hasil.tgt; }
               st2.s1.swap += hasil.done || 0;
+              // Disimpan per task, bukan dijumlah: tiap market punya spread sendiri dan
+              // yang mahal harus kelihatan siapa.
+              st2.s1.perTask = st2.s1.perTask || {};
+              st2.s1.perTask[t.code] = {
+                swap: hasil.done || 0,
+                spreadUsd: hasil.spreadUsd || 0,
+                feeUsd: hasil.feeUsd || 0,
+                volumeUsd: hasil.volumeUsd || 0,
+                feeStr: (hasil.feePakai || []).map(f => `${f.jml.toFixed(2)} ${f.tok}`).join('+'),
+                takTerbukukan: !!hasil.takTerbukukan,
+              };
               // Fee & spread masuk ember yg SAMA dengan mode lain (persistDaily), jadi
               // kolom FEE/hr, FEE/SN, LOSS$/hr, LOSS/SN dan footer season langsung isi.
               if (hasil.done) {
@@ -9086,7 +9151,25 @@ Usage:
             if (st2.s1.status !== 'batal') {
               const hambatan = alasanTask.filter(x => x && x !== 'penuh');
               if (!st2.s1.swap && hambatan.length) { st2.s1.status = 'lewat'; log(`dilewati — ${hambatan[0]}`); }
-              else { st2.s1.status = 'selesai'; sukses++; log(st2.s1.swap ? `selesai — ${st2.s1.swap} swap` : 'semua task sudah penuh'); }
+              else {
+                st2.s1.status = 'selesai'; sukses++;
+                if (st2.s1.swap) {
+                  // Rekap DIPISAH per task — biaya tiap market beda jauh, digabung jadi
+                  // satu angka penyebabnya tidak kelihatan.
+                  const pt = st2.s1.perTask || {};
+                  const baris = tasks.map(t => {
+                    const p = pt[t.code];
+                    if (!p) return `${t.market} -`;
+                    if (p.takTerbukukan) return `${t.market} ? (gagal baca saldo)`;
+                    return `${t.market} ${p.swap}sw $${(p.spreadUsd || 0).toFixed(2)} spread${p.feeStr ? ' + ' + p.feeStr : ''}`;
+                  });
+                  const totSpread = tasks.reduce((a2, t) => a2 + ((pt[t.code] && !pt[t.code].takTerbukukan) ? (pt[t.code].spreadUsd || 0) : 0), 0);
+                  const totFee = tasks.reduce((a2, t) => a2 + ((pt[t.code] && !pt[t.code].takTerbukukan) ? (pt[t.code].feeUsd || 0) : 0), 0);
+                  log(`selesai — ${st2.s1.swap} swap`);
+                  for (const b2 of baris) log(`  · ${b2}`);
+                  log(`  TOTAL spread $${totSpread.toFixed(2)} + fee $${totFee.toFixed(2)} = $${(totSpread + totFee).toFixed(2)}`);
+                } else log('semua task sudah penuh');
+              }
             } else log('dihentikan user');
           } catch (e) {
             gagal++;

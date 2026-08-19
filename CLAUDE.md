@@ -414,6 +414,14 @@ Yang perlu diketahui sebelum mengubahnya:
 Biaya terukur satu putaran penuh 3 task pada satu akun: 29 swap, fee 4.35 TUSDT (29 × 0.15,
 flat), modal cETH susut $77.70 → $73.48 termasuk spread. Durasi ~21 menit.
 
+Task yang dikerjakan **dipilih di menu**, bukan selalu semua. Sebelum memilih, menu
+mengukur spread tiap market lewat `rfqSpread()` dan menampilkan progres hari ini plus
+perkiraan biaya sisa swap-nya — spread antar market beda jauh (0.61 % / 2.02 % / 4.05 %),
+jadi mengerjakan semua task belum tentu masuk akal. Task terpilih disimpan di `S1TASKLIST`
+dan **tiap task dapat kolom spread sendiri** di dashboard (judulnya market-nya); digabung
+jadi satu angka membuat task termahal tersamar oleh yang murah. Rekap saat akun selesai
+juga dipecah per task, bukan satu total.
+
 Menu 1 **tidak berhenti** setelah semua task penuh: task earn-hub reset tiap hari 07:00 WIB,
 jadi setelah satu putaran bot menunggu sampai `schedule.hour`/`minute` berikutnya lalu jalan
 lagi. Yang harus ikut hidup selama menunggu adalah `keepAliveAll` dan `refreshExpiringTokens`
