@@ -390,7 +390,10 @@ Yang perlu diketahui sebelum mengubahnya:
   yang sama-sama menunggu membanjiri panel utama tiap 30 detik — tanpa batas, berhentinya hanya lewat `q`/Ctrl+C. Sebelumnya ini menggugurkan
   akun sehingga seluruh putaran batal dan bot menganggur sampai reset besok. Swap di luar loop
   utama (seed dan pulang-ke-hub) memakai `s1SwapTungguFee()` supaya tidak jadi celah yang
-  tetap menggugurkan akun.
+  tetap menggugurkan akun. Menu **swap 1x** memakai `s1TungguFeeTurun()` yang sama — dulu
+  ia tidur `feeSpikeWaitSec` (5 menit) lalu mengulang seluruh swap hanya untuk melihat
+  feenya, sehingga fee yang turun semenit setelah percobaan gagal tetap menunggu empat
+  menit sisanya.
 - **Satu swap punya batas waktu** (`strategy1.swapTimeoutSec`, default 240 dtk). Tanpa itu
   RFQ/settle yang diam membekukan akun tanpa satu baris log pun dan dari luar terlihat macet.
   Lewat batas ditandai `transient` sehingga langkah yang sama diulang, bukan akun digugurkan.
