@@ -8863,8 +8863,12 @@ Usage:
         const conf = (await prompt(paint('Ketik "swap" buat jalan, Enter buat batal: ', COLOR.bold + COLOR.yellow))).trim().toLowerCase();
         if (conf !== 'swap') { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
 
+        // Pengawas tombol q dipasang SETELAH prompt terakhir, kalau tidak dia berebut
+        // stdin dengan readline dan konfirmasinya jadi tidak terbaca.
+        const batalKey = watchCancelKey();
         let ok = 0, gagal = 0;
         for (const i of pilih) {
+          if (batalKey.cancelled()) { process.stdout.write(paint('distop user — sisa akun dilewati\n', COLOR.yellow)); break; }
           const a = ACCOUNTS[i], tag = a.label || a.email;
           try {
             const clients = await buildSwapClients(states[i]);
@@ -8909,10 +8913,19 @@ Usage:
               catch (e) {
                 // Fee di atas batas + mode tunggu → ulangi sampai turun. Bisa distop q.
                 if (e && e.feeSpike && feeMode === 'wait') {
-                  const w = Math.max(15, Number(SWAP.feeSpikeWaitSec) || 60);
-                  process.stdout.write(paint(`  [${tag}] fee ${e.feeCC} > batas ${feeCap} ${feeUnit} — tunggu ${w}s lalu coba lagi (#${att}) · tekan q buat stop`, COLOR.yellow) + '\n');
-                  const res = await sleepInterruptible(w * 1000);
-                  if (res === 'cancel') { batalUser = true; break; }
+                  // Dulu tidur feeSpikeWaitSec (5 mnt) lalu mengulang SELURUH swap hanya
+                  // untuk melihat feenya — kalau fee turun semenit setelah gagal, sisa
+                  // empat menitnya terbuang. Sekarang pakai jalur yang sama dengan
+                  // strategi 1: poll estimateAtomicFeeAction (tanpa RFQ) tiap feePollSec
+                  // dan langsung menyambung begitu fee di bawah batas.
+                  process.stdout.write(paint(`  [${tag}] fee ${e.feeCC} ${feeUnit} > batas ${feeCap} ${feeUnit} — pantau fee (percobaan #${att}) · tekan q buat stop`, COLOR.yellow) + '\n');
+                  const turun = await s1TungguFeeTurun(
+                    ctx, pr.market, (SWAP.feeTokens && SWAP.feeTokens.length ? SWAP.feeTokens : [feeUnit]),
+                    { maxFeeTok: null, feePollSec: (M8.strategy1 || {}).feePollSec },
+                    (m) => process.stdout.write(paint(`  [${tag}] ${m}`, COLOR.gray) + '\n'),
+                    batalKey.cancelled,
+                  );
+                  if (!turun) { batalUser = true; break; }
                   continue;
                 }
                 throw e;
@@ -8923,6 +8936,7 @@ Usage:
             else { gagal++; process.stdout.write(paint(`  ✗ ${tag} — gagal tanpa keterangan`, COLOR.red) + '\n'); }
           } catch (e) { gagal++; process.stdout.write(paint(`  ✗ ${tag} — ${(e && e.message) || e}`, COLOR.red) + '\n'); }
         }
+        batalKey.stop();
         process.stdout.write('\n' + paint(`selesai — ${ok} sukses, ${gagal} gagal`, gagal ? COLOR.yellow : COLOR.green) + '\n');
         continue;
       }
