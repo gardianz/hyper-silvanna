@@ -536,6 +536,20 @@ itu, dan tetap dicoba ulang tiap 30 detik oleh `refreshExpiringTokens` (lognya d
 sekali per 10 menit — kalau tidak, satu akun mati membanjiri panel). Memulihkannya tetap
 manual: hentikan bot, `menu 3` untuk login OTP, jalankan lagi.
 
+### `InsufficientHoldings` / "gak ada quote" = stok LP habis, bukan salah akun
+
+Diukur live: 8 akun swap `cETH → USD8` berturut-turut, dua sukses lalu sisanya ditolak
+`LP rejected the confirm: InsufficientHoldings`, dan setelahnya `requestQuotesV2` tidak
+memberi quote sama sekali. Market itu hanya punya **satu** LP yang mengutip (`1 quote`),
+dan stok USD8-nya habis setelah ~76 USD8 terjual. Beberapa menit kemudian market yang sama
+sudah menjawab 2 quote lagi — jadi ini kondisi sementara, bukan akun yang bermasalah.
+
+Karena itu `e.noLiquidity` **ditunggu lalu diulang**, tidak langsung menggugurkan:
+`swap.noLiqRetry` (default 3) × `swap.noLiqWaitSec` (default 30 dtk) di swap 1x, dan di
+strategi 1 dibatasi 5 kali berturut. Penting: percobaan yang gagal karena LP kosong terjadi
+**sebelum penandatanganan**, jadi `langkah` tidak boleh dinaikkan — kalau dinaikkan, jatah
+langkah habis oleh percobaan yang tidak menghasilkan swap dan task berhenti sebelum penuh.
+
 ### Resilience patterns worth preserving
 
 Errors are tagged rather than string-matched at the call site: `e.transient`, `e.unauthorized`,

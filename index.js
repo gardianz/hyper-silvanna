@@ -583,6 +583,10 @@ const SWAP = {
   maxFeeTok: ((CONFIG.swap || {}).maxFeeTok && typeof (CONFIG.swap || {}).maxFeeTok === 'object') ? (CONFIG.swap || {}).maxFeeTok : null,
   hardMaxFeeTok: ((CONFIG.swap || {}).hardMaxFeeTok && typeof (CONFIG.swap || {}).hardMaxFeeTok === 'object') ? (CONFIG.swap || {}).hardMaxFeeTok : null,
   feeSpikeWaitSec: Number((CONFIG.swap || {}).feeSpikeWaitSec) || 300,
+  // LP kehabisan stok itu sementara — ditunggu sebentar lalu diulang, bukan langsung
+  // digagalkan. 0 = matikan (langsung gagal seperti dulu).
+  noLiqRetry: Number.isFinite(Number((CONFIG.swap || {}).noLiqRetry)) ? Number((CONFIG.swap || {}).noLiqRetry) : 3,
+  noLiqWaitSec: Number((CONFIG.swap || {}).noLiqWaitSec) || 30,
   // === ANTI-DEADLOCK ===
   // Loop sync (tunggu counter earn-hub naik) dulu default 0 = TANPA batas. Fatal pas
   // reset harian lewat: count balik ke 0 sedangkan pembanding masih 10, jadi syarat
@@ -2691,7 +2695,7 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
     }
   }
 
-  let langkah = 0, dibatalin = false, alasan = '', gagalProxy = 0, gagalSizing = 0, qtyPaksa = 0, tungguFeeS = 0;
+  let langkah = 0, dibatalin = false, alasan = '', gagalProxy = 0, gagalSizing = 0, qtyPaksa = 0, tungguFeeS = 0, gagalLiq = 0;
   // Akuntansi biaya.
   //
   // Spread TIDAK diukur dgn menilai tiap swap pakai harga pasar: `getPrice` itu harga
@@ -2839,10 +2843,28 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
         putaran--;                      // nunggu fee jangan makan jatah putaran
         continue;                       // langkah TIDAK naik: swapnya belum terjadi
       }
-      if (e && (e.noLiquidity || e.transient)) { log(`  ${(e.message || '').slice(0, 70)} — ulang`); await sleep(5000); langkah++; continue; }
+      // LP kosong: swapnya BELUM terjadi, jadi `langkah` tidak dinaikkan — kalau
+      // dinaikkan, jatah langkah habis oleh percobaan yang tidak menghasilkan apa pun
+      // dan task berhenti sebelum targetnya penuh. Dibatasi hitungan berturut supaya
+      // market yang benar-benar mati tidak diulang selamanya.
+      if (e && e.noLiquidity) {
+        gagalLiq++;
+        const w = Math.max(5, Number(SWAP.noLiqWaitSec) || 30);
+        if (gagalLiq > 5) { log(`  LP kosong ${gagalLiq}x berturut — task dihentikan`); alasan = 'LP kosong'; break; }
+        log(`  ${(e.message || '').slice(0, 60)} — LP lagi kosong, tunggu ${s1Durasi(w)} (${gagalLiq}/5)`);
+        const sampai = Date.now() + w * 1000;
+        while (Date.now() < sampai) {
+          if (isCancelled && isCancelled()) { dibatalin = true; break; }
+          await sleep(Math.min(2000, Math.max(250, sampai - Date.now())));
+        }
+        if (dibatalin) break;
+        putaran--;
+        continue;
+      }
+      if (e && e.transient) { log(`  ${(e.message || '').slice(0, 70)} — ulang`); await sleep(5000); langkah++; continue; }
       throw e;
     }
-    gagalProxy = 0; gagalSizing = 0; tungguFeeS = 0;
+    gagalProxy = 0; gagalSizing = 0; tungguFeeS = 0; gagalLiq = 0;
     // Belajar dari fee yg benar-benar ditagih: nilai USD-nya menentukan urutan
     // kandidat berikutnya, jumlahnya menentukan kapan token itu dianggap habis.
     // Harga eksekusi (quote per base) disimpan per market: dipakai menyusun ukuran
@@ -8908,6 +8930,7 @@ Usage:
             const ctx = { ...clients, email: a.email, label: tag, userServiceCid, leg, minUsd: M8.minUsd, log: (m) => process.stdout.write(paint(`  [${tag}] ${m}\n`, COLOR.gray)) };
             if (feeMode === 'bypass') ctx.maxFeeCC = Infinity;   // plafon mutlak tetap nempel
             let r = null, batalUser = false;
+            let liqSisa = Math.max(0, Number(SWAP.noLiqRetry) != null && Number.isFinite(Number(SWAP.noLiqRetry)) ? Number(SWAP.noLiqRetry) : 3);
             for (let att = 1; ; att++) {
               try { r = await swapOnceAtomic(ctx, side, fmt10(String(qty))); break; }
               catch (e) {
@@ -8928,10 +8951,28 @@ Usage:
                   if (!turun) { batalUser = true; break; }
                   continue;
                 }
+                // LP kehabisan stok (InsufficientHoldings) atau market lagi tanpa quote.
+                // Ini kondisi SEMENTARA di sisi LP, bukan kesalahan akun: LP mengisi
+                // ulang stoknya beberapa saat kemudian. Terlihat nyata waktu 8 akun
+                // swap cETH->USD8 berturut — dua sukses, sisanya "InsufficientHoldings"
+                // lalu "gak ada quote" karena stok USD8 LP habis. Dulu langsung
+                // digagalkan; sekarang ditunggu sebentar dan diulang, bisa distop q.
+                if (e && e.noLiquidity && liqSisa > 0) {
+                  liqSisa--;
+                  const w = Math.max(5, Number(SWAP.noLiqWaitSec) || 30);
+                  process.stdout.write(paint(`  [${tag}] ${(e.message || '').slice(0, 60)} — LP lagi kosong, tunggu ${w}s (sisa ${liqSisa} percobaan) · q buat stop`, COLOR.yellow) + '\n');
+                  const sampai = Date.now() + w * 1000;
+                  while (Date.now() < sampai) {
+                    if (batalKey.cancelled()) { batalUser = true; break; }
+                    await sleep(Math.min(2000, Math.max(250, sampai - Date.now())));
+                  }
+                  if (batalUser) break;
+                  continue;
+                }
                 throw e;
               }
             }
-            if (batalUser) { process.stdout.write(paint(`  ⊘ ${tag} — distop user pas nunggu fee`, COLOR.gray) + '\n'); break; }
+            if (batalUser) { process.stdout.write(paint(`  ⊘ ${tag} — distop user pas nunggu`, COLOR.gray) + '\n'); break; }
             if (r && r.ok) { ok++; process.stdout.write(paint(`  ✓ ${tag} — ${qty} ${pr.base} (${side}) fee ${r.feeCC}`, COLOR.green) + '\n'); }
             else { gagal++; process.stdout.write(paint(`  ✗ ${tag} — gagal tanpa keterangan`, COLOR.red) + '\n'); }
           } catch (e) { gagal++; process.stdout.write(paint(`  ✗ ${tag} — ${(e && e.message) || e}`, COLOR.red) + '\n'); }
