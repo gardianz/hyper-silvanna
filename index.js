@@ -2494,6 +2494,24 @@ async function s1TungguFeeTurun(ctx, market, kandidatFee, cfg, log, isCancelled,
   }
 }
 
+// Poin earn-hub (halaman /earn-hub). Sumbernya GET /api/earn-hub/stats → totalPoints;
+// kalau field itu tidak ada, dicari di /api/earn-hub/tasks lewat extractUnclaimedPoints.
+// Dipakai strategi 1 supaya kolom POIN terisi tanpa perlu tick engine lain.
+async function s1AmbilPoin(sv, state) {
+  try {
+    const stats = await sv.earnStats().catch(() => null);
+    let pts = (stats && stats.totalPoints != null && Number.isFinite(Number(stats.totalPoints)))
+      ? Number(stats.totalPoints) : null;
+    if (pts == null) {
+      const tasks = await sv.earnTasks(state.__partyId || undefined).catch(() => null);
+      pts = extractUnclaimedPoints(tasks);
+    }
+    if (pts != null) { state.points = pts; updatePointsDiff(state); }
+    if (stats && stats.totalVolume != null && Number.isFinite(Number(stats.totalVolume))) state.volume = Number(stats.totalVolume);
+    return pts;
+  } catch (_) { return null; }
+}
+
 // Swap yang MENUNGGU kalau fee lagi di atas batas, bukan menyerah. Dipakai untuk
 // swap di luar loop utama (seed & pulang ke hub) — dua-duanya dulu menggugurkan akun
 // begitu fee naik, padahal fee turun sendiri dalam hitungan menit.
@@ -4730,9 +4748,21 @@ function renderAccountsTable(states) {
     ...overcapCols,
     { title: 'CC', prio: 1, cap: 12, cell: s => { const b = balOf(s, 'AMULET'); return [b ? fmtCC(b.unlocked) + (b.locked > 1e-8 ? '+' + fmtCC(b.locked) : '') : '-', COLOR.green]; } },
     ...tokenCols,
-    // POIN/ΔPOIN/STREAK cuma diisi engine yg memang menarik earn-hub stats tiap tick.
-    // Strategi 1 tidak, jadi kolomnya kosong melompong — disembunyikan saja.
-    ...(SESSION_ENGINE === 'strategi1' ? [] : [
+    // POIN dari /api/earn-hub/stats. Strategi 1 sekarang ikut menariknya (di awal akun,
+    // tiap task selesai, dan berkala selama menunggu reset), jadi kolomnya tidak lagi
+    // kosong dan prioritasnya dinaikkan supaya tidak ikut terdrop duluan.
+    ...(SESSION_ENGINE === 'strategi1' ? [
+      { title: 'POIN', prio: 1, cap: 9, cell: s => [s.points != null ? fmtThousand(s.points) : '-', COLOR.mag] },
+      {
+        title: 'ΔPOIN', prio: 2, cap: 10, cell: s => {
+          const d = Number(s.pointsDiff);
+          if (s.pointsDiff == null || !Number.isFinite(d)) return ['-', COLOR.gray];
+          if (d > 0) return ['▲' + fmtThousand(d), COLOR.green];
+          if (d < 0) return ['▼' + fmtThousand(-d), COLOR.red];
+          return ['▲0', COLOR.gray];
+        }
+      },
+    ] : [
     { title: 'POIN', prio: 3, cap: 9, cell: s => [s.points != null ? fmtThousand(s.points) : '-', COLOR.mag] },
     // ΔPOIN = gain poin harian (segitiga ▲ naik / ▼ turun). Reset 0 tiap 07 WIB, persist.
     {
@@ -4752,7 +4782,7 @@ function renderAccountsTable(states) {
     // di mode itu yang ditampilkan ember token.
     (SESSION_ENGINE === 'strategi1'
       ? {
-        title: 'FEE/hr', prio: 3, cap: 12, cell: s => {
+        title: 'FEE/hr', prio: 1, cap: 12, cell: s => {
           const tok = Number(s.feeTokToday) || 0;
           if (tok > 0) return [`${tok.toFixed(2)} ${s.feeTokUnit || ''}`.trim(), COLOR.yellow];
           return [Number(s.feeToday) > 0 ? Number(s.feeToday).toFixed(1) : '0', COLOR.yellow];
@@ -7652,7 +7682,7 @@ async function runRegister() {
 const argv = process.argv.slice(2);
 // buildSwapClients/SWAP/transferCC ikut diekspor biar bisa diprobe dari skrip luar
 // tanpa nyalain bot (require aman: runMain kegate `require.main === module`).
-module.exports = { setOtpInteractive, ensurePrivyToken, refreshExpiringTokens, effFeeCap, capFromMap, s1TungguFeeTurun, setSessionEngine, renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
+module.exports = { s1AmbilPoin, setOtpInteractive, ensurePrivyToken, refreshExpiringTokens, effFeeCap, capFromMap, s1TungguFeeTurun, setSessionEngine, renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
 
 if (require.main === module) {
   if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
@@ -9223,6 +9253,9 @@ Usage:
               },
             };
             segar(await s1Balances(ctx).catch(() => null));
+            st2.__partyId = clients.partyId;
+            st2.__sv = clients.sv;           // dipakai nyegerin poin selama nunggu reset
+            await s1AmbilPoin(clients.sv, st2);
             const alasanTask = [];
             for (let ti = 0; ti < tasks.length; ti++) {
               if (batal.cancelled()) { st2.s1.status = 'batal'; break; }
@@ -9259,6 +9292,7 @@ Usage:
                 fp.forEach((f, k) => bumpDaily(st2, f.jml, k === 0 ? (hasil.spreadUsd || 0) : 0, f.tok));
               }
               segar(await s1Balances(ctx).catch(() => null));
+              await s1AmbilPoin(ctx.sv, st2);
               if (hasil.cancelled) { st2.s1.status = 'batal'; break; }
             }
             if (st2.s1.status !== 'batal') {
@@ -9306,8 +9340,15 @@ Usage:
         let sisaMs = msUntilNext(Number(SCHED.hour) || 7, Number(SCHED.minute) || 0, SCHED.timezone || 'Asia/Jakarta');
         logActivity(`nunggu reset task berikutnya ${jamJadwal} ${SCHED.timezone || 'Asia/Jakarta'} — ${Math.round(sisaMs / 60000)} menit lagi · q buat berhenti`, COLOR.cyan);
         const habisPada = Date.now() + sisaMs;
+        let poinBerikut = 0;
         while (Date.now() < habisPada) {
           if (batal.cancelled()) break;
+          // Poin tetap disegarkan selama menunggu (tiap 10 menit) — kalau tidak, angka
+          // di dashboard beku semalaman padahal earn-hub-nya jalan terus.
+          if (Date.now() >= poinBerikut) {
+            poinBerikut = Date.now() + 600_000;
+            for (const st3 of dstates) { if (st3.__sv) await s1AmbilPoin(st3.__sv, st3); }
+          }
           const sisa = habisPada - Date.now();
           const j = Math.floor(sisa / 3600000), m = Math.floor(sisa / 60000) % 60;
           for (const st3 of dstates) {

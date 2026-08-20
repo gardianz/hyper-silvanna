@@ -440,8 +440,15 @@ tabel sendiri; yang didapat gratis dari jalur ini adalah drop kolom otomatis saa
 sempit (`prio`), sorot baris terpilih, panel log per akun dengan navigasi ↑/↓, dan total
 season di footer. Kolom khusus strategi (TASK/SWAP/TAHAP/TOTAL) ditambahkan lewat cabang
 `SESSION_ENGINE === 'strategi1'` di `renderAccountsTable`, kolom saldonya dari `S1TOKENS`
-(hub + kedua sisi tiap market task + token fee). POIN/ΔPOIN/STREAK disembunyikan di mode ini
-karena strategi tidak menarik earn-hub stats tiap tick. Fee dan spread dibukukan lewat
+(hub + kedua sisi tiap market task + token fee). POIN/ΔPOIN diisi `s1AmbilPoin()` yang membaca
+`GET /api/earn-hub/stats` → `totalPoints` (fallback `extractUnclaimedPoints` dari
+`/api/earn-hub/tasks`), dipanggil di awal tiap akun, tiap task selesai, dan tiap 10 menit
+selama menunggu reset — kalau tidak, angkanya beku semalaman padahal earn-hub jalan terus.
+Klien `sv` per akun disimpan di `state.__sv` supaya penyegaran saat menunggu tidak perlu
+membangun ulang klien. STREAK tetap disembunyikan.
+
+Prioritas kolom penting di mode ini: `FEE/hr` dan `POIN` prio 1 — keduanya sempat terdorong
+keluar layar oleh kolom spread per-task (juga prio 1) waktu prionya masih 3. Fee dan spread dibukukan lewat
 `bumpDaily`, ember yang sama dengan engine lain, sehingga FEE/SN, FEE-TOK dan LOSS/SN terisi
 tanpa jalur akuntansi kedua. Versi berurutan + cetak baris membuat 15 akun berarti 15 × ~20 menit dan hanya akun
 yang sedang jalan yang terlihat. Harga USD di-cache 30 detik (`usdPriceOf`): tiap swap butuh
