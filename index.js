@@ -4780,9 +4780,22 @@ function renderAccountsTable(states) {
     // supaya tidak mengubah tampilan engine lain. Di strategi 1 fee dibayar TUSDT/USD8,
     // yang masuk ember feeTokToday, jadi kolom CC-nya akan selalu 0 dan menyesatkan:
     // di mode itu yang ditampilkan ember token.
+    // FEE/SESI = fee sejak proses ini mulai, sebanding dengan kolom TOTAL (jumlah swap
+    // sesi ini). Tanpa ini yang terlihat cuma ember HARIAN yang ikut menghitung putaran
+    // sebelumnya dan sisa run kemarin-pagi, sehingga "14 swap tapi fee 7.95" terbaca
+    // seperti salah hitung padahal beda cakupan.
+    ...(SESSION_ENGINE === 'strategi1' ? [{
+      title: 'FEE/SESI', prio: 1, cap: 13, cell: s => {
+        const f = (s.s1 && s.s1.feeSesi) || null;
+        if (!f) return ['-', COLOR.gray];
+        const isi = Object.entries(f).filter(([, v]) => Number(v) > 1e-9);
+        if (!isi.length) return ['0', COLOR.gray];
+        return [isi.map(([t, v]) => `${Number(v).toFixed(2)} ${t}`).join('+'), COLOR.yellow];
+      },
+    }] : []),
     (SESSION_ENGINE === 'strategi1'
       ? {
-        title: 'FEE/hr', prio: 1, cap: 12, cell: s => {
+        title: 'FEE/HARI', prio: 2, cap: 12, cell: s => {
           const tok = Number(s.feeTokToday) || 0;
           if (tok > 0) return [`${tok.toFixed(2)} ${s.feeTokUnit || ''}`.trim(), COLOR.yellow];
           return [Number(s.feeToday) > 0 ? Number(s.feeToday).toFixed(1) : '0', COLOR.yellow];
@@ -7682,7 +7695,7 @@ async function runRegister() {
 const argv = process.argv.slice(2);
 // buildSwapClients/SWAP/transferCC ikut diekspor biar bisa diprobe dari skrip luar
 // tanpa nyalain bot (require aman: runMain kegate `require.main === module`).
-module.exports = { s1AmbilPoin, setOtpInteractive, ensurePrivyToken, refreshExpiringTokens, effFeeCap, capFromMap, s1TungguFeeTurun, setSessionEngine, renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
+module.exports = { bumpDaily, persistDaily, s1AmbilPoin, setOtpInteractive, ensurePrivyToken, refreshExpiringTokens, effFeeCap, capFromMap, s1TungguFeeTurun, setSessionEngine, renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
 
 if (require.main === module) {
   if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
@@ -9279,6 +9292,11 @@ Usage:
                 feeStr: (hasil.feePakai || []).map(f => `${f.jml.toFixed(2)} ${f.tok}`).join('+'),
                 takTerbukukan: !!hasil.takTerbukukan,
               };
+              // Fee SESI ini, dijumlah per token — sebanding dengan kolom TOTAL.
+              st2.s1.feeSesi = st2.s1.feeSesi || {};
+              for (const f of (hasil.feePakai || [])) {
+                st2.s1.feeSesi[f.tok] = (st2.s1.feeSesi[f.tok] || 0) + (Number(f.jml) || 0);
+              }
               // Fee & spread masuk ember yg SAMA dengan mode lain (persistDaily), jadi
               // kolom FEE/hr, FEE/SN, LOSS$/hr, LOSS/SN dan footer season langsung isi.
               if (hasil.done) {

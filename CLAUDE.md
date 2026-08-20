@@ -505,7 +505,8 @@ Empat kolom itu dipakai bersama semua engine dan gampang disalahartikan:
 
 | kolom | isi | reset |
 | --- | --- | --- |
-| `FEE/hr` | fee **hari ini** — namanya menyesatkan, bukan per jam | otomatis 07:00 WIB |
+| `FEE/SESI` | fee sejak proses ini mulai (strategi 1) — **satu-satunya** yang sebanding dengan kolom `TOTAL` | tiap bot dijalankan |
+| `FEE/hr` (`FEE/HARI` di strategi 1) | fee **hari ini**, ikut menghitung putaran & run sebelumnya | otomatis 07:00 WIB |
 | `FEE/SN` | fee **CC** sejak awal season | manual, menu 5 → b |
 | `FEE-TOK` | fee **non-CC** season (TUSDT/USD8) + satuannya | manual, sama |
 | `LOSS$/hr` / `LOSS/SN` | spread USD harian / season | 07:00 WIB / manual |
@@ -515,6 +516,12 @@ di mode itu menampilkan ember token), tempatnya dipakai `SPREAD/HARI` = `spreadT
 Kolom itu memang sudah ada sebagai `LOSS$/hr`, tapi prionya 3 sehingga hampir selalu didrop
 duluan saat terminal sempit; di `strategi1` ia naik ke prio 2 dan `LOSS$/hr` disembunyikan
 supaya tidak dobel.
+
+Jebakan yang sudah memakan waktu sekali: `TOTAL` (jumlah swap) di-reset tiap proses mulai,
+sedangkan ember fee harian tidak. Berdampingan keduanya terbaca sebanding — "14 swap tapi
+fee 7.95 TUSDT" terlihat seperti salah hitung padahal 7.95 mencakup seluruh run hari itu.
+Sudah dipastikan bukan double-booking: `bumpDaily` dua kali (0.60 lalu 1.50) menghasilkan
+tepat 2.10. Karena itu ada kolom `FEE/SESI` yang cakupannya sama dengan `TOTAL`.
 
 `persistDaily` memisahkan ember CC (`feeToday`/`feeSeason`) dari ember non-CC
 (`feeTokToday`/`feeTokSeason` + `feeTokUnit`) supaya angkanya tidak tertimbun jadi satu.
