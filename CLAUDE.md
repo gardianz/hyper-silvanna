@@ -519,6 +519,32 @@ menyimpulkan bot tidak membayar fee.
 Kolom `FEE/SN` yang besar (ratusan sampai ribuan CC) itu warisan sesi ping-pong/day-trader
 sebelumnya, bukan biaya strategi 1.
 
+### Akun Walley tidak butuh Privy sama sekali
+
+Walley memegang kuncinya sendiri: seluruh operasi Canton (prepare/submit/ACS/saldo) lewat
+`api.walley.cc` dan tanda tangannya lokal. Yang tersisa cuma server action Silvana — dan
+**itu jalan dengan cookie saja**, terverifikasi live dengan header Bearer dikosongkan:
+`requestQuotesV2`, `getMultiCall`, `estimateAtomicFeeAction` semuanya tetap sukses.
+
+Karena itu `buildSwapClients` tidak memanggil `ensurePrivyToken` untuk akun Walley
+(`butuhPrivy(email)`), `partyId` diambil dari file wallet alih-alih `supaMe`, dan
+`privy.authenticate()` ke TEE dilewati. Token yang kebetulan masih valid di cache tetap
+dipakai sebagai bearer karena gratis, tapi ketiadaannya bukan kegagalan — akun terverifikasi
+membaca task, fee, quote, dan saldo tanpa bearer sama sekali. `keepAliveTokens` dan
+`refreshExpiringTokens` juga melewati bagian Privy untuk akun Walley; sebelumnya keduanya
+menandai akun Walley `✱ OTP` dan membanjiri log dengan "butuh login OTP manual" padahal
+akun itu berswap normal.
+
+### `walley … status=404` itu error Canton, bukan route hilang
+
+Balasannya membawa `trace_id`/`request_id` — artinya error backend yang dipetakan ke
+NOT_FOUND: kontrak input keburu dikonsumsi transaksi lain atau disclosed contract sudah
+basi. Sama sifatnya dengan 409 dan 5xx: **sementara**. `walleyReq` menandainya
+`e.transient` (juga saat body memuat `CONTRACT_NOT_FOUND`/`ABORTED`/`contention`), dan
+`submitPrepared` membuang cache MultiCall plus menulis body lengkapnya ke `swap-debug.log`
+— di dashboard barisnya kepotong dan yang tersisa cuma `trace_id`. Tanpa tanda transient,
+satu 404 menghentikan akun di tengah task (terlihat sebagai `● Error` di 6/10).
+
 ### Sesi panjang tanpa penunggu tidak boleh jatuh ke prompt OTP
 
 `ensurePrivyToken` punya jalur terakhir berupa **OTP interaktif**: kalau refresh token

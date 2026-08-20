@@ -154,7 +154,19 @@ async function walleyReq(method, path_, { body = null, token = null, proxy = nul
   if (r.status === 401 || r.status === 403) { const e = new Error(`walley ${path_} ${r.status}`); e.unauthorized = true; throw e; }
   // Pesan DAML_FAILURE-nya panjang dan justru ekornya yg nerangin kontrak/choice mana
   // yg nolak — jangan dipotong pendek.
-  if (r.status < 200 || r.status >= 300) throw new Error(`walley ${path_} status=${r.status} body=${(r.text || '').replace(/\s+/g, ' ').slice(0, 900)}`);
+  if (r.status < 200 || r.status >= 300) {
+    const e = new Error(`walley ${path_} status=${r.status} body=${(r.text || '').replace(/\s+/g, ' ').slice(0, 900)}`);
+    e.status = r.status;
+    // 404 di sini BUKAN "route gak ada" — balasannya bawa trace_id/request_id, artinya
+    // error backend Canton yang dipetakan ke NOT_FOUND: kontrak input keburu dikonsumsi
+    // transaksi lain, atau disclosed contract sudah basi. Sama halnya 409 (konflik) dan
+    // 5xx. Semuanya SEMENTARA: prepare ulang biasanya lolos. Ditandai transient supaya
+    // pemanggil mengulang, bukan menggugurkan akun — dulu satu 404 menghentikan akun
+    // di tengah task (terlihat sebagai "Error" di 6/10).
+    if (r.status === 404 || r.status === 409 || r.status === 425 || r.status === 429 || r.status >= 500) e.transient = true;
+    if (/CONTRACT_NOT_FOUND|NOT_FOUND|ABORTED|contention|already archived/i.test(r.text || '')) e.transient = true;
+    throw e;
+  }
   return r.json != null ? r.json : (() => { try { return JSON.parse(r.text); } catch (_) { return null; } })();
 }
 
@@ -399,7 +411,18 @@ class WalleyCantonClient {
     const token = await walleyToken(this.w, this.proxy);
     const body = { party_id: this.w.party_id, transaction: walleySignPrepared(this.w, prep.transaction), token: prep.token };
     if (prep.fee_transaction) body.fee_transaction = walleySignPrepared(this.w, prep.fee_transaction);
-    const res = await walleyReq('POST', '/v1/transactions/submit-and-wait', { body, token, proxy: this.proxy });
+    let res;
+    try {
+      res = await walleyReq('POST', '/v1/transactions/submit-and-wait', { body, token, proxy: this.proxy });
+    } catch (e) {
+      // Body lengkapnya dibuang ke swap-debug.log: di dashboard barisnya kepotong dan
+      // yang tersisa cuma trace_id, tidak cukup buat mendiagnosa.
+      logDebug('walley submit-and-wait gagal', { tag: this.tag, hash, status: e && e.status, pesan: (e && e.message) || String(e) });
+      // Disclosed contract kemungkinan basi → buang cache MultiCall biar prepare
+      // berikutnya ngambil yang baru, pola yang sama dipakai jalur prepare.
+      if (e && e.transient) { this._prep.delete(hash); clearMultiCallCache(); }
+      throw e;
+    }
     // submit-and-wait udah NUNGGU selesai, jadi submissionId cuma penanda lokal.
     const id = (res && (res.submission_id || res.submissionId)) || `walley-${hash.slice(0, 16)}`;
     this._done.set(id, res);
@@ -5228,9 +5251,21 @@ async function tickAll(states) {
 //  Lebih sering & ringan dari tickAll (gak fetch balance/tasks), khusus jaga
 //  token gak expired antar-sesi. Per-akun try/catch biar 1 gagal gak blok lain.
 // ============================================================================
+// Wallet aktif akun ini. Menentukan apakah token Privy masih relevan sama sekali.
+function walletKindOf(email) {
+  const w = (acctSession(email) || {}).wallet;
+  return (w && w.kind) || 'supanova';
+}
+// Akun Walley TIDAK butuh token Privy: seluruh operasi Canton (prepare/submit/ACS/
+// saldo) lewat API Walley dan tanda tangannya lokal, sedangkan server action Silvana
+// jalan dengan cookie saja — diuji live, requestQuotesV2/getMultiCall/estimateAtomicFee
+// tetap sukses dengan header Bearer dikosongkan. Jadi refresh Privy yang gagal di akun
+// Walley bukan masalah, dan menandainya "butuh OTP" itu menyesatkan.
+function butuhPrivy(email) { return walletKindOf(email) !== 'walley'; }
+
 async function keepAliveTokens(state) {
   try {
-    await ensurePrivyToken(state);       // refresh Privy/Supa (update state.tokenExpMs)
+    if (butuhPrivy(state.email)) await ensurePrivyToken(state);   // update state.tokenExpMs
     await ensureSilvanaSession(state);   // re-login Silvana kalau mendekati expired
     if (state.status === 'login') state.status = 'ok';
     if (/login|keep-alive/i.test(state.message || '')) state.message = '';
@@ -5252,7 +5287,8 @@ async function refreshExpiringTokens(states) {
   const SOON = 300_000; // sisa <5 mnt / expired → refresh proaktif
   await mapLimit(states, ACCT_CONCURRENCY, async (s) => {
     if (s.__tokenBusy) return;
-    const supaStale = !s.tokenExpMs || (s.tokenExpMs - now < SOON);
+    const perluPrivy = butuhPrivy(s.email);
+    const supaStale = perluPrivy && (!s.tokenExpMs || (s.tokenExpMs - now < SOON));
     const silvStale = !s.silvanaExpMs || (s.silvanaExpMs - now < SOON);
     if (!supaStale && !silvStale) return;
     s.__tokenBusy = true;
@@ -5382,26 +5418,46 @@ function shortSwapReason(err) {
 async function buildSwapClients(state) {
   const email = state.email;
   const proxy = getProxy(email);
-  const identityToken = await ensurePrivyToken(state);
+  // Akun Walley sama sekali tidak bergantung pada Privy: Canton lewat API Walley,
+  // tanda tangan lokal, dan server action Silvana jalan dengan cookie saja (diuji live
+  // dengan Bearer dikosongkan). Jadi jangan panggil ensurePrivyToken di jalur ini —
+  // refresh yang gagal dulu bikin akun Walley berhenti minta OTP padahal tidak perlu.
+  // Token yang KEBETULAN masih valid di cache tetap dipakai sebagai bearer, gratis.
+  const pakaiPrivy = butuhPrivy(email);
+  let identityToken = null;
+  if (pakaiPrivy) identityToken = await ensurePrivyToken(state);
+  else {
+    const c0 = getValidPrivySession(email);
+    identityToken = (c0 && c0.token) || null;
+    if (c0) { state.tokenExpMs = c0.expMs; state.identityExpMs = c0.identityExpMs; }
+  }
   const pat = (acctSession(email).privy || {}).privy_access_token;
   // Akun kunci-mentah: token Privy (Bearer) TETAP dibutuhin buat auth API canton
   // (prepare/submit), tapi `pat` (buat TEE raw_sign) TIDAK — sign-nya lokal.
   const rawCantonKey = loadRawKey(email);
-  if (!pat && !rawCantonKey) throw new Error('privy_access_token tidak ada di session');
+  if (pakaiPrivy && !pat && !rawCantonKey) throw new Error('privy_access_token tidak ada di session');
   const sv = await ensureSilvanaSession(state);
   if (!sv) throw new Error('passkey belum di-set (paste dulu)');
   // Server action /swap & /connect skrg butuh Canton Bearer (supa identity token).
   // Pakai fungsi biar selalu baca token terbaru dari session (auto-refresh).
   sv.bearer = () => { try { return acctSession(email).privy.token || identityToken; } catch (_) { return identityToken; } };
-  const me = await supaMe(identityToken, proxy);
-  const partyId = me.data && me.data.partyId;
+  // partyId: akun Walley ambil dari file wallet (tidak perlu supaMe / token Privy).
+  let partyId;
+  if (pakaiPrivy) {
+    const me = await supaMe(identityToken, proxy);
+    partyId = me.data && me.data.partyId;
+  } else {
+    const wsel0 = acctSession(email).wallet || {};
+    const w0 = loadWalleyWallets().find(x => x.party_id === wsel0.partyId || x.party_hint === wsel0.partyHint);
+    partyId = w0 && w0.party_id;
+  }
   if (!partyId) throw new Error('partyId tidak ditemukan');
   sv.partyId = partyId; // dipakai swapAction self-heal (auto re-discover on 404)
 
   // Invalidate cached userServiceCid kalau partyId user berubah (mis. bind wallet baru).
   // Tanpa ini, bot pakai userServiceCid party lama → swap finalize gagal silent.
   const cached = acctSession(email);
-  if (cached.partyId && cached.partyId !== partyId) {
+  if (pakaiPrivy && cached.partyId && cached.partyId !== partyId) {
     patchAcctSession(email, { partyId, userServiceCid: null, privyWalletId: null });
     logActivity(`[${state.label || email}] partyId berubah → cache userServiceCid+walletId direset`, COLOR.yellow);
   } else if (!cached.partyId) {
@@ -5412,7 +5468,9 @@ async function buildSwapClients(state) {
   // Akun kunci-mentah: lewati pemilihan wallet TEE, pakai key lokal.
   const preferredWalletId = acctSession(email).privyWalletId || null;
   const privy = new PrivyWallet({ accessToken: pat, timeoutMs: REQ.timeoutMs, proxy, preferredWalletId, partyId, rawCantonKey });
-  await privy.authenticate();
+  // Walley menandatangani lokal; authenticate() ke TEE Privy cuma bikin gagal kalau
+  // patnya sudah mati, padahal hasilnya tidak dipakai sama sekali di jalur itu.
+  if (pakaiPrivy) await privy.authenticate();
   if (rawCantonKey) logActivity(`[${state.label || email}] mode kunci-mentah (pub ${rawCantonKey.pub.slice(0, 12)}…) — sign lokal, bukan Privy TEE`, COLOR.cyan);
 
   // Auto-cache walletId yg terpilih biar konsisten across runs. (Skip mode kunci-mentah:
