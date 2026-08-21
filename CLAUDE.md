@@ -493,8 +493,16 @@ mahal di bawah ambang ~$10), **spread** menghukum swap besar (proporsional). Tit
 termurah adalah ukuran **sekecil mungkin yang masih di atas ambang tier $10** — bukan
 swap besar seperti yang disarankan logika fee sendirian.
 
-Spread berbeda jauh antar market, jadi memilih market itu keputusan biaya: diukur
-bersamaan, `HECTO-cETH` 0.61 %, `EDELx-cETH` 2.02 %, `HECTO-EDELx` 4.05 %.
+Spread berbeda jauh antar market **dan bergerak jauh antar hari**: `HECTO-cETH` terukur
+0.61 % suatu hari lalu **5.50 %** hari berikutnya, dan `HECTO-EDELx` pernah **37.6 %**.
+Karena spread proporsional terhadap volume, satu task di market selebar itu menelan belasan
+dolar — terlihat nyata sebagai `spread $6.41 (5.571% volume)` untuk satu task 10 swap.
+
+Karena itu strategi 1 punya **gerbang spread**: `strategy1.maxSpreadPct` (default 3 %).
+Sebelum sebuah task dimulai spreadnya diukur lewat `rfqSpread()` (gratis, kutip dua arah);
+kalau di atas batas task itu **ditunda**, task lain dikerjakan dulu, lalu spreadnya dipantau
+tiap `strategy1.spreadPollSec` (default 120 dtk) sampai turun. Spread yang tidak terukur
+tidak pernah dipakai memblokir — kalau `rfqSpread` gagal, task tetap jalan.
 
 Model ini sudah dicocokkan dengan realisasi: satu putaran penuh 3 task diprediksi
 9×$0.121 + 9×$0.037 + 11×$0.243 = **$4.10**, realisasinya **$4.22** (selisih 3 %).

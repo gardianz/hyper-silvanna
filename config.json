@@ -63,6 +63,10 @@
       "swapTimeoutSec": 240,
       "_help_feePollSec": "Selang pengecekan fee saat menunggu fee turun (detik). Yang dipanggil estimateAtomicFeeAction — endpoint yang dipakai UI Silvana untuk menampilkan fee walau kolom jumlahnya masih 0, jadi mengecek fee tidak membuat RFQ sama sekali dan boleh sering. Begitu fee turun swap langsung disambung, tidak menunggu sisa jeda.",
       "feePollSec": 30,
+      "_help_maxSpreadPct": "Batas spread RFQ sebuah market (persen) untuk strategi 1. Task di market yang spreadnya di atas ini DITUNDA — task lain dikerjakan dulu, lalu spreadnya dipantau sampai turun. Spread bergerak jauh dan itu biaya terbesar: HECTO-cETH terukur 0.61 persen suatu hari lalu 5.50 persen hari berikutnya, dan HECTO-EDELx pernah 37.6 persen. Karena spread proporsional terhadap volume, satu task di market selebar itu bisa menelan belasan dolar. 0 = matikan gerbangnya.",
+      "maxSpreadPct": 3,
+      "_help_spreadPollSec": "Selang pemantauan spread untuk task yang ditunda (detik). Diukur lewat rfqSpread yang mengutip dua arah tanpa biaya.",
+      "spreadPollSec": 120,
       "_help_tasks": "Urutan task earn-hub yang dikerjakan. `code` harus persis kode dari GET /api/earn-hub/tasks (cek: CETH_EDELX_DAY_TRADER, HECTO_CETH_DAY_TRADER, HECTO_EDELX_DAY_TRADER), `market` adalah market_id Silvana, `target` cuma cadangan kalau field progress tidak terbaca. Progres dibaca ulang dari server tiap swap sehingga tidak mungkin kelebihan.",
       "tasks": [
         {

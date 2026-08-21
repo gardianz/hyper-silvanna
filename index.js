@@ -789,6 +789,8 @@ const M8 = {
       maxFeeTok: (s.maxFeeTok && typeof s.maxFeeTok === 'object') ? s.maxFeeTok : null,
       swapTimeoutSec: _m8num(s.swapTimeoutSec, 240),
       feePollSec: _m8num(s.feePollSec, 30),
+      maxSpreadPct: _m8num(s.maxSpreadPct, 3),
+      spreadPollSec: _m8num(s.spreadPollSec, 120),
       tasks: Array.isArray(s.tasks) ? s.tasks.filter(t => t && t.code && t.market) : [],
     };
   })(),
@@ -4666,6 +4668,7 @@ function statusInfo(state) {
   const o = state.overcap;
   if (SESSION_ENGINE === 'strategi1' && state.s1) {
     if (state.needOtp || state.s1.status === 'otp') return ['✱ OTP', COLOR.red];
+    if (state.s1.spreadWait) return ['◷ Spread', COLOR.yellow];
     if (state.s1.feeWait) return ['◷ Fee', COLOR.yellow];
     const m = { tunggu: ['○ Antre', COLOR.gray], nunggu: ['◷ Tunggu', COLOR.cyan], jalan: ['● Swap', COLOR.yellow], selesai: ['● Selesai', COLOR.green], lewat: ['● Lewat', COLOR.gray], batal: ['● Batal', COLOR.yellow], gagal: ['● Error', COLOR.red], otp: ['✱ OTP', COLOR.red] };
     if (m[state.s1.status]) return m[state.s1.status];
@@ -9270,13 +9273,23 @@ Usage:
             st2.__sv = clients.sv;           // dipakai nyegerin poin selama nunggu reset
             await s1AmbilPoin(clients.sv, st2);
             const alasanTask = [];
-            for (let ti = 0; ti < tasks.length; ti++) {
-              if (batal.cancelled()) { st2.s1.status = 'batal'; break; }
-              const t = tasks[ti];
+            // Gerbang spread. Spread bergerak jauh: HECTO-cETH terukur 0.61% suatu hari
+            // dan 5.50% hari berikutnya, HECTO-EDELx sampai 37.6%. Karena spread itu
+            // proporsional terhadap volume, task di market selebar itu bisa menelan
+            // belasan dolar untuk satu task. Jadi task yang spreadnya di atas batas
+            // DITUNDA dulu — kerjakan task lain — lalu dipantau sampai turun.
+            const capSpread = Number(S1.maxSpreadPct) > 0 ? Number(S1.maxSpreadPct) : Infinity;
+            const cekSpread = async (t) => {
+              if (!(capSpread < Infinity)) return { ok: true };
+              const r = await rfqSpread(ctx.sv, ctx.partyId, t.market, S1.stepUsd).catch(() => null);
+              if (!r || r.err || !(r.spreadPct > 0)) return { ok: true, tak: true };   // gak keukur → jangan ngeblok
+              return { ok: r.spreadPct <= capSpread, pct: r.spreadPct, perSwapUsd: r.perSwapUsd };
+            };
+            const jalankanTask = async (t, ti) => {
               st2.s1.taskIdx = ti + 1;
               st2.s1.task = t.code.replace(/_DAY_TRADER$/, '');
               const mk = mkAll.find(x => x.id === t.market);
-              if (!mk) { log(`market ${t.market} gak ada — dilewati`); continue; }
+              if (!mk) { log(`market ${t.market} gak ada — dilewati`); return null; }
               const hasil = await s1RunTask(ctx, t, mk, hub, kandidatUrut, S1, log, batal.cancelled);
               alasanTask.push(hasil.alasan || (hasil.skipped ? 'dilewati' : ''));
               if (hasil.cur != null) { st2.s1.cur = hasil.cur; st2.s1.tgt = hasil.tgt; }
@@ -9311,8 +9324,53 @@ Usage:
               }
               segar(await s1Balances(ctx).catch(() => null));
               await s1AmbilPoin(ctx.sv, st2);
-              if (hasil.cancelled) { st2.s1.status = 'batal'; break; }
+              return hasil;
+            };
+
+            // Putaran 1: kerjakan yang spreadnya wajar, tunda yang lebar.
+            const ditunda = [];
+            for (let ti = 0; ti < tasks.length; ti++) {
+              if (batal.cancelled()) { st2.s1.status = 'batal'; break; }
+              const t = tasks[ti];
+              const sp = await cekSpread(t);
+              if (!sp.ok) {
+                log(`${t.code.replace(/_DAY_TRADER$/, '')} spread ${sp.pct.toFixed(2)}% > batas ${capSpread}% — ditunda, kerjakan task lain dulu`);
+                ditunda.push({ t, ti });
+                continue;
+              }
+              const hasil = await jalankanTask(t, ti);
+              if (hasil && hasil.cancelled) { st2.s1.status = 'batal'; break; }
             }
+
+            // Putaran 2: task yang ditunda dipantau sampai spreadnya turun.
+            const pollS = Math.max(30, Number(S1.spreadPollSec) || 120);
+            while (ditunda.length && !batal.cancelled() && st2.s1.status !== 'batal') {
+              const sisa = [];
+              for (const { t, ti } of ditunda) {
+                if (batal.cancelled()) break;
+                st2.s1.taskIdx = ti + 1;
+                st2.s1.task = t.code.replace(/_DAY_TRADER$/, '');
+                st2.s1.spreadWait = true;
+                const sp = await cekSpread(t);
+                if (!sp.ok) {
+                  log(`  spread ${t.market} masih ${sp.pct.toFixed(2)}% > ${capSpread}% — cek lagi ${s1Durasi(pollS)}`);
+                  sisa.push({ t, ti });
+                  continue;
+                }
+                st2.s1.spreadWait = false;
+                log(`  spread ${t.market} turun ke ${sp.pct != null ? sp.pct.toFixed(2) + '%' : '?'} ≤ ${capSpread}% — dikerjakan sekarang`);
+                const hasil = await jalankanTask(t, ti);
+                if (hasil && hasil.cancelled) { st2.s1.status = 'batal'; break; }
+              }
+              ditunda.length = 0; ditunda.push(...sisa);
+              if (!ditunda.length || batal.cancelled()) break;
+              const sampai = Date.now() + pollS * 1000;
+              while (Date.now() < sampai) {
+                if (batal.cancelled()) break;
+                await sleep(Math.min(3000, Math.max(500, sampai - Date.now())));
+              }
+            }
+            st2.s1.spreadWait = false;
             if (st2.s1.status !== 'batal') {
               const hambatan = alasanTask.filter(x => x && x !== 'penuh');
               if (!st2.s1.swap && hambatan.length) { st2.s1.status = 'lewat'; log(`dilewati — ${hambatan[0]}`); }
