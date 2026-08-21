@@ -67,6 +67,8 @@
       "maxSpreadPct": 3,
       "_help_spreadPollSec": "Selang pemantauan spread untuk task yang ditunda (detik). Diukur lewat rfqSpread yang mengutip dua arah tanpa biaya.",
       "spreadPollSec": 120,
+      "_help_cekSpreadTiapSwap": "true = spread diukur ulang tepat sebelum SETIAP swap, bukan sekali di awal task. Spread bergerak dalam hitungan menit, jadi pengecekan sekali di awal membiarkan sisa swap jalan di harga yang jauh lebih buruk. Biayanya dua kuotasi per swap (gratis, tidak membuat proposal) dan tambahan beberapa detik per swap. false = kembali ke pengecekan per task saja.",
+      "cekSpreadTiapSwap": true,
       "_help_tasks": "Urutan task earn-hub yang dikerjakan. `code` harus persis kode dari GET /api/earn-hub/tasks (cek: CETH_EDELX_DAY_TRADER, HECTO_CETH_DAY_TRADER, HECTO_EDELX_DAY_TRADER), `market` adalah market_id Silvana, `target` cuma cadangan kalau field progress tidak terbaca. Progres dibaca ulang dari server tiap swap sehingga tidak mungkin kelebihan.",
       "tasks": [
         {

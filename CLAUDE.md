@@ -504,6 +504,16 @@ kalau di atas batas task itu **ditunda**, task lain dikerjakan dulu, lalu spread
 tiap `strategy1.spreadPollSec` (default 120 dtk) sampai turun. Spread yang tidak terukur
 tidak pernah dipakai memblokir — kalau `rfqSpread` gagal, task tetap jalan.
 
+Gerbangnya berlaku **per swap**, bukan sekali per task: spread bergerak dalam hitungan menit,
+jadi pengecekan di awal task membiarkan sisa swap jalan di harga yang jauh lebih buruk. Supaya
+tidak mahal, spread per-swap dihitung dari **harga yang benar-benar dieksekusi** yang sudah
+dicatat tiap quote (`memo.px["<market>|buy"|"|sell"]`, lihat sizing swap kuras) — nol
+permintaan tambahan, dan tervalidasi: harga eksekusi `EDELx-cETH` memberi 2.021 % sementara
+`rfqSpread` live memberi 2.020 %. `rfqSpread` hanya dipakai kalau salah satu arah belum ada
+atau sudah lebih tua dari 10 menit; hasil cek pra-task pun diseed ke memo supaya swap pertama
+tidak perlu mengukur. Ini penting karena satu `rfqSpread` makan 12–24 detik — kalau ditempel
+ke tiap swap, durasi task naik ~50 %.
+
 Batasnya diubah lewat menu `w → Batas spread`: menu mengukur spread tiap market task lebih
 dulu, lalu setelah angka baru disimpan menampilkan mana yang bakal dikerjakan dan mana yang
 ditunda — termasuk peringatan kalau tidak ada satu pun market yang lolos.

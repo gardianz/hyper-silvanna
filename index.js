@@ -791,6 +791,7 @@ const M8 = {
       feePollSec: _m8num(s.feePollSec, 30),
       maxSpreadPct: _m8num(s.maxSpreadPct, 3),
       spreadPollSec: _m8num(s.spreadPollSec, 120),
+      cekSpreadTiapSwap: (s.cekSpreadTiapSwap !== false),
       tasks: Array.isArray(s.tasks) ? s.tasks.filter(t => t && t.code && t.market) : [],
     };
   })(),
@@ -2514,6 +2515,54 @@ async function s1AmbilPoin(sv, state) {
   } catch (_) { return null; }
 }
 
+// Spread dari harga yang BENAR-BENAR dieksekusi, tanpa permintaan tambahan sama sekali.
+// Tiap swap sudah mencatat harganya per arah (memo.px["<market>|buy"|"|sell"]), dan
+// selisih dua arah itu persis definisi spread. Dipakai buat gerbang per-swap: mengukur
+// ulang lewat rfqSpread makan 12-24 dtk per swap — hampir menggandakan durasi task.
+// Balikin null kalau salah satu arah belum ada atau sudah basi.
+function s1SpreadDariMemo(memo, market, maxAgeMs = 600_000) {
+  const b = memo && memo.px && memo.px[`${market}|buy`];
+  const j = memo && memo.px && memo.px[`${market}|sell`];
+  if (!b || !j || !(b.v > 0) || !(j.v > 0)) return null;
+  const umur = Date.now() - Math.min(b.t || 0, j.t || 0);
+  if (umur > maxAgeMs) return null;
+  const mid = (b.v + j.v) / 2;
+  if (!(mid > 0)) return null;
+  return ((b.v - j.v) / mid) * 100;
+}
+
+// Tunggu sampai spread market turun ke bawah batas. Dipakai SEBELUM tiap swap:
+// spread bergerak dalam hitungan menit (HECTO-cETH terukur 0.61% suatu hari, 5.95%
+// hari berikutnya), jadi mengeceknya sekali di awal task tidak cukup — sisa swap
+// bisa jalan di harga yang jauh lebih buruk. Pengukurannya gratis (kutip dua arah,
+// tanpa membuat proposal). Balikin true = sudah aman, false = dibatalin user.
+async function s1TungguSpread(ctx, market, cfg, log, isCancelled) {
+  const cap = Number(cfg.maxSpreadPct) > 0 ? Number(cfg.maxSpreadPct) : Infinity;
+  if (!(cap < Infinity)) return true;
+  const pollS = Math.max(15, Number(cfg.spreadPollSec) || 120);
+  const detail = (typeof ctx.log === 'function') ? ctx.log : log;
+  let total = 0, cek = 0, pernahLapor = false;
+  for (; ;) {
+    if (isCancelled && isCancelled()) return false;
+    const r = await rfqSpread(ctx.sv, ctx.partyId, market, cfg.stepUsd).catch(() => null);
+    // Gagal ukur JANGAN memblokir: gangguan sesaat tidak boleh membekukan task.
+    if (!r || r.err || !(r.spreadPct > 0)) { if (cek) log(`  spread ${market} gak keukur — lanjut apa adanya`); return true; }
+    cek++;
+    if (r.spreadPct <= cap) {
+      if (pernahLapor) log(`  spread ${market} turun ke ${r.spreadPct.toFixed(2)}% ≤ ${cap}% — lanjut (nunggu ${s1Durasi(total)})`);
+      return true;
+    }
+    if (!pernahLapor) { log(`  spread ${market} ${r.spreadPct.toFixed(2)}% > batas ${cap}% — tunda swap, pantau tiap ${s1Durasi(pollS)}`); pernahLapor = true; }
+    else detail(`cek spread #${cek}: ${r.spreadPct.toFixed(2)}% > ${cap}% (1 swap ≈ $${r.perSwapUsd.toFixed(2)}) — nunggu ${s1Durasi(total)}`);
+    const sampai = Date.now() + pollS * 1000;
+    while (Date.now() < sampai) {
+      if (isCancelled && isCancelled()) return false;
+      await sleep(Math.min(3000, Math.max(500, sampai - Date.now())));
+    }
+    total += pollS;
+  }
+}
+
 // Swap yang MENUNGGU kalau fee lagi di atas batas, bukan menyerah. Dipakai untuk
 // swap di luar loop utama (seed & pulang ke hub) — dua-duanya dulu menggugurkan akun
 // begitu fee naik, padahal fee turun sendiri dalam hitungan menit.
@@ -2827,7 +2876,7 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
       // Kunci per ARAH. Harga jual dan harga beli berbeda persis sebesar spread —
       // memakai harga jual terakhir buat menyusun BELI overshoot sebesar spread penuh
       // (di HECTO-EDELx 4%), justru kegagalan yang mau dihindari.
-      const pxPasar = memo.px[`${mk.id}|buy`];
+      const pxPasar = (memo.px[`${mk.id}|buy`] || {}).v;
       const punyaQuote = get(mk.quote);
       qty = pxPasar > 0
         ? floor6((punyaQuote / pxPasar) * 0.999)
@@ -2835,6 +2884,32 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
     } else qty = floor6(kirimUsd / pxB);
     if (qtyPaksa > 0) { qty = qtyPaksa; qtyPaksa = 0; }
     log(`  ${st.cur}/${st.tgt} · kirim ${deliver} ~$${kirimUsd.toFixed(2)}${kurasHabis ? ' (terakhir — dikuras habis)' : ''}`);
+    // Gerbang spread PER SWAP. Dicek tepat sebelum quote, bukan sekali di awal task:
+    // spread bisa melebar di tengah task dan sisa swapnya jadi jauh lebih mahal.
+    if (cfg.cekSpreadTiapSwap !== false) {
+      const capSp = Number(cfg.maxSpreadPct) > 0 ? Number(cfg.maxSpreadPct) : Infinity;
+      // Sumber pertama: harga eksekusi dua arah yang sudah tercatat — gratis dan justru
+      // lebih relevan karena itu harga yang benar-benar kita bayar. Baru kalau salah satu
+      // arah belum ada (awal task) diukur lewat rfqSpread.
+      let pctSekarang = s1SpreadDariMemo(memo, mk.id);
+      if (pctSekarang == null && capSp < Infinity) {
+        const pra = await rfqSpread(ctx.sv, ctx.partyId, mk.id, cfg.stepUsd).catch(() => null);
+        if (pra && !pra.err && pra.spreadPct > 0) {
+          pctSekarang = pra.spreadPct;
+          // Hasil ukurnya diseed ke memo supaya swap berikutnya tidak perlu mengukur lagi.
+          memo.px[`${mk.id}|buy`] = { v: pra.beli.px, t: Date.now() };
+          memo.px[`${mk.id}|sell`] = { v: pra.jual.px, t: Date.now() };
+        }
+      }
+      if (pctSekarang != null && pctSekarang > capSp) {
+        lapor({ spreadWait: true });
+        const turun = await s1TungguSpread(ctx, mk.id, cfg, log, isCancelled);
+        lapor({ spreadWait: false });
+        if (!turun) { dibatalin = true; break; }
+        putaran--;                    // nunggu spread jangan makan jatah putaran
+        continue;                     // ulang dari atas: saldo & harga dibaca lagi
+      }
+    }
     // Token fee ditentukan DI SINI, saat quote: kirim daftar kandidat berurutan
     // (termurah dulu, sudah dibuang yg saldonya tak sanggup bayar sekali fee lagi),
     // server memilih yg pertama didukung market ini.
@@ -2912,7 +2987,7 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
     // kandidat berikutnya, jumlahnya menentukan kapan token itu dianggap habis.
     // Harga eksekusi (quote per base) disimpan per market: dipakai menyusun ukuran
     // swap kuras berikutnya tanpa menebak lewat harga USD silang.
-    if (hasil && Number.isFinite(hasil.price) && hasil.price > 0) memo.px[`${mk.id}|${hasil.direction}`] = hasil.price;
+    if (hasil && Number.isFinite(hasil.price) && hasil.price > 0) memo.px[`${mk.id}|${hasil.direction}`] = { v: hasil.price, t: Date.now() };
     if (hasil && hasil.feeSym && Number.isFinite(hasil.feeCC)) {
       const fs = hasil.feeSym.toUpperCase();
       memo.jml[fs] = hasil.feeCC;
@@ -7698,7 +7773,7 @@ async function runRegister() {
 const argv = process.argv.slice(2);
 // buildSwapClients/SWAP/transferCC ikut diekspor biar bisa diprobe dari skrip luar
 // tanpa nyalain bot (require aman: runMain kegate `require.main === module`).
-module.exports = { bumpDaily, persistDaily, s1AmbilPoin, setOtpInteractive, ensurePrivyToken, refreshExpiringTokens, effFeeCap, capFromMap, s1TungguFeeTurun, setSessionEngine, renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
+module.exports = { s1SpreadDariMemo, s1TungguSpread, bumpDaily, persistDaily, s1AmbilPoin, setOtpInteractive, ensurePrivyToken, refreshExpiringTokens, effFeeCap, capFromMap, s1TungguFeeTurun, setSessionEngine, renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
 
 if (require.main === module) {
   if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
@@ -9265,6 +9340,7 @@ Usage:
                 st2.s1.tgt = p.tgt != null ? p.tgt : st2.s1.tgt;
                 st2.s1.jalan = true;
                 if (p.feeWait != null) st2.s1.feeWait = !!p.feeWait;
+                if (p.spreadWait != null) st2.s1.spreadWait = !!p.spreadWait;
                 if (p.raw) st2.balances = p.raw;
               },
             };
@@ -9283,6 +9359,12 @@ Usage:
               if (!(capSpread < Infinity)) return { ok: true };
               const r = await rfqSpread(ctx.sv, ctx.partyId, t.market, S1.stepUsd).catch(() => null);
               if (!r || r.err || !(r.spreadPct > 0)) return { ok: true, tak: true };   // gak keukur → jangan ngeblok
+              // Hasilnya diseed ke memo harga milik ctx, jadi gerbang spread per-swap di
+              // dalam task tidak perlu mengukur ulang (rfqSpread makan 12-24 dtk).
+              ctx.s1fee = ctx.s1fee || { usd: {}, jml: {}, px: {} };
+              ctx.s1fee.px = ctx.s1fee.px || {};
+              ctx.s1fee.px[`${t.market}|buy`] = { v: r.beli.px, t: Date.now() };
+              ctx.s1fee.px[`${t.market}|sell`] = { v: r.jual.px, t: Date.now() };
               return { ok: r.spreadPct <= capSpread, pct: r.spreadPct, perSwapUsd: r.perSwapUsd };
             };
             const jalankanTask = async (t, ti) => {
