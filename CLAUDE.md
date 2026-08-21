@@ -514,6 +514,19 @@ atau sudah lebih tua dari 10 menit; hasil cek pra-task pun diseed ke memo supaya
 tidak perlu mengukur. Ini penting karena satu `rfqSpread` makan 12–24 detik — kalau ditempel
 ke tiap swap, durasi task naik ~50 %.
 
+Menunggu spread punya **batas waktu** (`strategy1.spreadWaitMaxMin`, default 30 mnt): selama
+menunggu di tengah task, dana mengendap di token lawan yang ongkos keluarnya justru sedang
+mahal. Lewat batas itu task dihentikan dan jalur pulang-ke-hub di akhir task tetap dijalankan
+— rugi sekali, bukan tertahan entah sampai kapan. Perlu diingat paparannya memang kecil:
+aturan beli/jual bergantian menahan posisi non-hub di sekitar satu langkah (~$12), kecuali
+task yang didanai `seedUsd` yang seluruh modalnya di luar hub.
+
+Menu **`p) pulangkan`** menyapu sisa token strategi (HECTO/EDELx) balik ke hub untuk semua
+akun sekaligus: saldo tiap akun dibaca dulu, biaya keluarnya ditaksir dari spread saat itu
+(`total × spread/2`), baru dieksekusi. Sisa di bawah `rfqMinUsd` ditandai dust dan dilewati.
+Taksiran biayanya ditampilkan lebih dulu karena keluar dari market yang sedang lebar itu
+mahal — kadang menunggu lebih murah daripada menyapu sekarang.
+
 Batasnya diubah lewat menu `w → Batas spread`: menu mengukur spread tiap market task lebih
 dulu, lalu setelah angka baru disimpan menampilkan mana yang bakal dikerjakan dan mana yang
 ditunda — termasuk peringatan kalau tidak ada satu pun market yang lolos.

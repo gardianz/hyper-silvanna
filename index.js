@@ -792,6 +792,7 @@ const M8 = {
       maxSpreadPct: _m8num(s.maxSpreadPct, 3),
       spreadPollSec: _m8num(s.spreadPollSec, 120),
       cekSpreadTiapSwap: (s.cekSpreadTiapSwap !== false),
+      spreadWaitMaxMin: _m8num(s.spreadWaitMaxMin, 30),
       tasks: Array.isArray(s.tasks) ? s.tasks.filter(t => t && t.code && t.market) : [],
     };
   })(),
@@ -2541,9 +2542,19 @@ async function s1TungguSpread(ctx, market, cfg, log, isCancelled) {
   if (!(cap < Infinity)) return true;
   const pollS = Math.max(15, Number(cfg.spreadPollSec) || 120);
   const detail = (typeof ctx.log === 'function') ? ctx.log : log;
+  // Menunggu tanpa batas berarti dana MENGENDAP di token lawan (HECTO/EDELx), yang
+  // ongkos keluarnya justru sedang mahal. Setelah batas ini bot menyerah untuk task itu
+  // supaya jalur pulang-ke-hub di akhir task tetap jalan — rugi sekali, bukan tertahan
+  // entah sampai kapan. 0 = tunggu selamanya (perilaku lama).
+  const maxMs = Math.max(0, Number(cfg.spreadWaitMaxMin) || 0) * 60000;
+  const mulai = Date.now();
   let total = 0, cek = 0, pernahLapor = false;
   for (; ;) {
     if (isCancelled && isCancelled()) return false;
+    if (maxMs && Date.now() - mulai > maxMs) {
+      log(`  spread ${market} gak turun-turun setelah ${s1Durasi((Date.now() - mulai) / 1000)} — task dihentikan, dana dipulangkan ke hub`);
+      return 'timeout';
+    }
     const r = await rfqSpread(ctx.sv, ctx.partyId, market, cfg.stepUsd).catch(() => null);
     // Gagal ukur JANGAN memblokir: gangguan sesaat tidak boleh membekukan task.
     if (!r || r.err || !(r.spreadPct > 0)) { if (cek) log(`  spread ${market} gak keukur — lanjut apa adanya`); return true; }
@@ -2905,6 +2916,7 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
         lapor({ spreadWait: true });
         const turun = await s1TungguSpread(ctx, mk.id, cfg, log, isCancelled);
         lapor({ spreadWait: false });
+        if (turun === 'timeout') { alasan = `spread ${mk.id} kelamaan di atas batas`; break; }
         if (!turun) { dibatalin = true; break; }
         putaran--;                    // nunggu spread jangan makan jatah putaran
         continue;                     // ulang dari atas: saldo & harga dibaca lagi
@@ -8919,6 +8931,7 @@ Usage:
         ['3', 'run (OTP urut)', 'login akun 1-per-1 lalu run USDCx'],
         ['4', 'change wallet', 'ganti wallet supa 1 akun'],
         ['5', 'maintenance', 'cleanup DvpProposal stale / reset season'],
+        ['p', 'pulangkan', 'sapu HECTO/EDELx sisa strategi balik ke hub (cETH)'],
         ['6', 'swap back', 'dump token (USDCx/cETH/EDELx) → CC, SEMUA akun'],
         ['7', 'EDELx manual', 'CC→EDELx multi-akun / dump EDELx→CC 1 akun'],
         ['8', 'ping-pong CLOB', 'mode 8 via /terminal (orderbook, fee ~4.3 CC)'],
@@ -9158,6 +9171,89 @@ Usage:
         }
         batalKey.stop();
         process.stdout.write('\n' + paint(`selesai — ${ok} sukses, ${gagal} gagal`, gagal ? COLOR.yellow : COLOR.green) + '\n');
+        continue;
+      }
+
+      if (ans === 'p') {
+        // Sapu token strategi yang nyangkut balik ke hub. Dana bisa mengendap di
+        // HECTO/EDELx kalau task berhenti di tengah (spread melebar, error, atau
+        // dihentikan), dan mengeluarkannya manual lewat menu swap 1x ribet karena harus
+        // tahu sisa tiap akun. Di sini semuanya dibaca dulu, biayanya ditaksir, baru
+        // dieksekusi.
+        const S1p = M8.strategy1 || {};
+        const hubP = S1p.hub || 'cETH';
+        const tokenP = [...new Set((S1p.tasks || []).flatMap(t => String(t.market).split('-')))]
+          .filter(t => String(t).toUpperCase() !== String(hubP).toUpperCase());
+        if (!tokenP.length) { console.error(paint('gak ada token non-hub di mode8.strategy1.tasks', COLOR.red)); continue; }
+
+        process.stdout.write('\n' + paint(`Pulangkan ke ${hubP} — cek sisa ${tokenP.join('/')} tiap akun…`, COLOR.bold + COLOR.cyan) + '\n');
+        const states = makeStates();
+        const rfqMinP = Math.max(0, Number(M8.rfqMinUsd) || 10);
+        const barisP = [];
+        setOtpInteractive(false);
+        await mapLimit(states.map((s2, i) => i), Math.max(1, Number((CONFIG.swap || {}).loginConcurrency) || 5), async (i) => {
+          const a2 = ACCOUNTS[i];
+          try {
+            const c2 = await buildSwapClients(states[i]);
+            const get = await s1Balances(c2);
+            const sisa = [];
+            for (const t of tokenP) {
+              const jml = get(t);
+              if (!(jml > 0)) continue;
+              const px = await usdPriceOf(c2.sv, t).catch(() => 0);
+              const usd = px > 0 ? jml * px : 0;
+              if (usd > 0.01) sisa.push({ tok: t, jml, usd });
+            }
+            if (sisa.length) barisP.push({ i, tag: a2.label || a2.email, sisa, clients: c2 });
+          } catch (e) { barisP.push({ i, tag: a2.label || a2.email, err: (e && e.message) || String(e) }); }
+        });
+        setOtpInteractive(true);
+
+        const adaIsi = barisP.filter(b => b.sisa && b.sisa.some(x => x.usd >= rfqMinP));
+        for (const b of barisP.sort((x, y) => x.i - y.i)) {
+          if (b.err) { process.stdout.write(paint(`  ${b.tag.padEnd(20)} gagal: ${b.err.slice(0, 50)}`, COLOR.red) + '\n'); continue; }
+          const txt = b.sisa.map(x => `${x.jml.toFixed(4)} ${x.tok} ($${x.usd.toFixed(2)})`).join(' · ');
+          const bisa = b.sisa.some(x => x.usd >= rfqMinP);
+          process.stdout.write(`  ${b.tag.padEnd(20)} ${paint(txt, bisa ? COLOR.yellow : COLOR.gray)}${bisa ? '' : paint('  [di bawah minimum, dust]', COLOR.gray)}\n`);
+        }
+        if (!adaIsi.length) { process.stdout.write(paint('\ngak ada yang perlu dipulangkan.\n', COLOR.green)); continue; }
+
+        // Biaya keluarnya ditaksir dulu — inti masalahnya justru di sini: keluar dari
+        // market yang spreadnya lagi lebar itu mahal, kadang lebih baik nunggu.
+        process.stdout.write('\n' + paint('Perkiraan biaya keluar (spread sekarang):', COLOR.gray) + '\n');
+        try {
+          const c0 = adaIsi[0].clients;
+          for (const t of tokenP) {
+            const r = await rfqSpread(c0.sv, c0.partyId, `${t}-${hubP}`, S1p.stepUsd).catch(() => null);
+            const total = adaIsi.reduce((n, b) => n + (b.sisa.find(x => x.tok === t && x.usd >= rfqMinP) || { usd: 0 }).usd, 0);
+            if (!r || r.err || !(r.spreadPct > 0)) { process.stdout.write(paint(`  ${t}-${hubP}: spread gak keukur\n`, COLOR.gray)); continue; }
+            const warna = r.spreadPct > Number(S1p.maxSpreadPct) ? COLOR.red : COLOR.green;
+            process.stdout.write(`  ${`${t}-${hubP}`.padEnd(13)} spread ${paint(r.spreadPct.toFixed(2) + '%', warna)} · total $${total.toFixed(2)} → biaya ≈ ${paint('$' + (total * r.spreadPct / 100 / 2).toFixed(2), warna)}\n`);
+          }
+        } catch (e) { process.stdout.write(paint(`  gagal nakser: ${e.message}\n`, COLOR.yellow)); }
+
+        const confP = (await prompt(paint(`\nKetik "go" buat pulangkan ${adaIsi.length} akun ke ${hubP}, Enter batal: `, COLOR.bold + COLOR.yellow))).trim().toLowerCase();
+        if (confP !== 'go') { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
+
+        const batalP = watchCancelKey();
+        let okP = 0, gagalP = 0;
+        for (const b of adaIsi) {
+          if (batalP.cancelled()) { process.stdout.write(paint('distop user\n', COLOR.yellow)); break; }
+          const a2 = ACCOUNTS[b.i];
+          let usc = getUserServiceCid(a2.email);
+          if (!usc) { const pty = await b.clients.sv.recoverParty(b.clients.partyId).catch(() => null); if (pty) usc = pty.userServiceCid; }
+          const ctxP = { ...b.clients, email: a2.email, label: b.tag, userServiceCid: usc, minUsd: M8.minUsd,
+            log: (m) => process.stdout.write(paint(`    ${m}`, COLOR.gray) + '\n') };
+          for (const x of b.sisa) {
+            if (x.usd < rfqMinP || batalP.cancelled()) continue;
+            try {
+              await s1ToHub(ctxP, x.tok, hubP, s1UrutFee(FEE_TOKEN_IDS, {}), (m) => process.stdout.write(paint(`  [${b.tag}] ${m}`, COLOR.gray) + '\n'), batalP.cancelled);
+              okP++;
+            } catch (e) { gagalP++; process.stdout.write(paint(`  ✗ ${b.tag} ${x.tok}: ${(e && e.message || e).toString().slice(0, 60)}`, COLOR.red) + '\n'); }
+          }
+        }
+        batalP.stop();
+        process.stdout.write('\n' + paint(`selesai — ${okP} sukses, ${gagalP} gagal`, gagalP ? COLOR.yellow : COLOR.green) + '\n');
         continue;
       }
 
