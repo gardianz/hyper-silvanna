@@ -9462,6 +9462,7 @@ Usage:
             { label: 'Tautkan Walley   ', detail: paint('hubungin wallet Walley ke akun Silvana (sekali per akun)', COLOR.gray) },
             { label: 'Daftar party ID  ', detail: paint('tabel partyId Supanova & Walley per akun (buat kirim bulk)', COLOR.gray) },
             { label: 'Batas max fee    ', detail: paint('batas fee per token per mode — lihat fee yg berlaku sekarang', COLOR.gray) },
+            { label: 'Batas spread     ', detail: paint('strategi 1: task di market yg spreadnya lebar ditunda sampai turun', COLOR.gray) },
           ],
         });
         if (!sub.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
@@ -9603,6 +9604,51 @@ Usage:
             const adaYgLolos = Object.entries(nilai).some(([tok, n]) => { const f = feeNowMap[tok]; return f && n >= f.amount; });
             if (!adaYgLolos && Object.keys(feeNowMap).length) {
               process.stdout.write(paint('⚠ gak ada satu pun token yg batasnya di atas fee sekarang — bot bakal nunggu terus.\n', COLOR.yellow));
+            }
+          } catch (e) { console.error(paint('gagal nulis config.json: ' + e.message, COLOR.red)); }
+          continue;
+        }
+
+        if (sub[0] === 5) {
+          // Batas spread strategi 1. Dipisah dari batas fee karena satuannya beda
+          // (persen, bukan token) dan pengaruhnya jauh lebih besar: fee ~$1.50 per task
+          // sedangkan spread bisa $6-22 per task di market yang lagi lebar.
+          const S1s = M8.strategy1 || {};
+          process.stdout.write('\n' + paint('Batas spread — strategi 1', COLOR.bold + COLOR.cyan) + '\n');
+          process.stdout.write(paint(`  sekarang: ${S1s.maxSpreadPct}%  ·  task di atas batas ditunda, dipantau tiap ${S1s.spreadPollSec} dtk sampai turun`, COLOR.gray) + '\n');
+
+          process.stdout.write('\n' + paint('Ngukur spread tiap market task…', COLOR.gray) + '\n');
+          const ukur = [];
+          try {
+            const { sv: svS, partyId: pidS } = await buildSwapClients(makeStates()[0]);
+            for (const t of (S1s.tasks || [])) {
+              const r = await rfqSpread(svS, pidS, t.market, S1s.stepUsd).catch(() => null);
+              const pct = (r && !r.err) ? r.spreadPct : null;
+              ukur.push({ market: t.market, pct, perSwapUsd: (r && !r.err) ? r.perSwapUsd : null });
+              const warna = pct == null ? COLOR.gray : (pct > Number(S1s.maxSpreadPct) ? COLOR.red : COLOR.green);
+              const est = (r && !r.err) ? ` · 10 swap ≈ $${(r.perSwapUsd * 10).toFixed(2)}` : '';
+              process.stdout.write(`  ${String(t.market).padEnd(13)} ${paint(pct != null ? pct.toFixed(2) + '%' : 'gak keukur', warna)}${paint(est, COLOR.gray)}\n`);
+            }
+          } catch (e) { process.stdout.write(paint(`  gagal ngukur: ${e.message}\n`, COLOR.yellow)); }
+
+          const raw = (await prompt(paint(`\nbatas spread baru dalam persen (sekarang ${S1s.maxSpreadPct}, 0 = matikan gerbangnya): `, COLOR.bold))).trim();
+          if (!raw) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
+          const n = Number(raw);
+          if (!Number.isFinite(n) || n < 0) { process.stdout.write(paint('angka gak valid — dibatalin.\n', COLOR.red)); continue; }
+          try {
+            const cfg = JSON.parse(fs.readFileSync(CFG_PATH, 'utf8'));
+            cfg.mode8 = cfg.mode8 || {}; cfg.mode8.strategy1 = cfg.mode8.strategy1 || {};
+            cfg.mode8.strategy1.maxSpreadPct = n;
+            M8.strategy1.maxSpreadPct = n;
+            fs.writeFileSync(CFG_PATH, JSON.stringify(cfg, null, 2) + '\n');
+            process.stdout.write(paint(`\n✓ tersimpan — batas spread ${n === 0 ? 'dimatikan' : n + '%'}\n`, COLOR.green));
+            // Tunjukin dampaknya sekarang juga: mana yang bakal jalan, mana yang ditunda.
+            if (n > 0 && ukur.length) {
+              const lolos = ukur.filter(x => x.pct != null && x.pct <= n);
+              const tunda = ukur.filter(x => x.pct != null && x.pct > n);
+              for (const x of lolos) process.stdout.write(paint(`  ${x.market.padEnd(13)} ${x.pct.toFixed(2)}% → dikerjakan\n`, COLOR.green));
+              for (const x of tunda) process.stdout.write(paint(`  ${x.market.padEnd(13)} ${x.pct.toFixed(2)}% → DITUNDA sampai turun\n`, COLOR.yellow));
+              if (!lolos.length) process.stdout.write(paint('⚠ gak ada market yg lolos batas ini — semua task bakal nunggu.\n', COLOR.yellow));
             }
           } catch (e) { console.error(paint('gagal nulis config.json: ' + e.message, COLOR.red)); }
           continue;

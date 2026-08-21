@@ -504,6 +504,10 @@ kalau di atas batas task itu **ditunda**, task lain dikerjakan dulu, lalu spread
 tiap `strategy1.spreadPollSec` (default 120 dtk) sampai turun. Spread yang tidak terukur
 tidak pernah dipakai memblokir — kalau `rfqSpread` gagal, task tetap jalan.
 
+Batasnya diubah lewat menu `w → Batas spread`: menu mengukur spread tiap market task lebih
+dulu, lalu setelah angka baru disimpan menampilkan mana yang bakal dikerjakan dan mana yang
+ditunda — termasuk peringatan kalau tidak ada satu pun market yang lolos.
+
 Model ini sudah dicocokkan dengan realisasi: satu putaran penuh 3 task diprediksi
 9×$0.121 + 9×$0.037 + 11×$0.243 = **$4.10**, realisasinya **$4.22** (selisih 3 %).
 
