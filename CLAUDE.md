@@ -514,6 +514,21 @@ atau sudah lebih tua dari 10 menit; hasil cek pra-task pun diseed ke memo supaya
 tidak perlu mengukur. Ini penting karena satu `rfqSpread` makan 12–24 detik — kalau ditempel
 ke tiap swap, durasi task naik ~50 %.
 
+Tiga hal yang membuat gerbang ini tidak melumpuhkan sesi, dan ketiganya pernah salah:
+
+- **Progres task dibaca DULU, sebelum gerbang spread.** Task yang sudah 10/10 tidak boleh
+  disentuh gerbang sama sekali — pernah terjadi lima akun menunggu spread `HECTO-cETH` turun
+  untuk task yang sebenarnya sudah penuh.
+- **Spread diukur SEKALI per market, bukan sekali per akun.** Spread itu sifat market; sepuluh
+  akun yang menunggu market yang sama tidak perlu sepuluh pengukuran (`spreadBersama`, TTL 60
+  dtk). Terukur: pengukuran pertama 19.6 dtk, tiga berikutnya 0–1 ms.
+- **Menunggu spread TIDAK boleh memegang slot `loginConcurrency`.** Kalau memegang, akun lain
+  menganggur di antrean — terlihat nyata sebagai 5 akun berstatus `Spread` sementara 5 sisanya
+  `Antre` tanpa pernah mulai. Fase menunggu karenanya dikeluarkan dari pool: fase 1 semua akun
+  jalan sampai habis, task yang tertunda dikumpulkan ke satu daftar, lalu dipantau terpusat dan
+  dikerjakan paralel begitu spreadnya turun. Penutup akun (`finalize`) dibuat idempoten karena
+  kini bisa dipanggil dari dua tempat.
+
 Menunggu spread punya **batas waktu** (`strategy1.spreadWaitMaxMin`, default 30 mnt): selama
 menunggu di tengah task, dana mengendap di token lawan yang ongkos keluarnya justru sedang
 mahal. Lewat batas itu task dihentikan dan jalur pulang-ke-hub di akhir task tetap dijalankan

@@ -2516,6 +2516,20 @@ async function s1AmbilPoin(sv, state) {
   } catch (_) { return null; }
 }
 
+// Spread itu sifat MARKET, bukan sifat akun — 10 akun yang menunggu market yang sama
+// tidak perlu mengukurnya sepuluh kali (terlihat di log: lima akun mengutip HECTO-cETH
+// berbarengan tiap 2 menit). Satu pengukuran dipakai bersama selama TTL.
+const _SPREADC = new Map();   // market -> {pct, perSwapUsd, beli, jual, t}
+async function spreadBersama(sv, partyId, market, usdValue, ttlMs = 60_000) {
+  const c = _SPREADC.get(market);
+  if (c && Date.now() - c.t < ttlMs) return c;
+  const r = await rfqSpread(sv, partyId, market, usdValue).catch(() => null);
+  if (!r || r.err || !(r.spreadPct > 0)) return null;
+  const v = { pct: r.spreadPct, perSwapUsd: r.perSwapUsd, beli: r.beli.px, jual: r.jual.px, t: Date.now() };
+  _SPREADC.set(market, v);
+  return v;
+}
+
 // Spread dari harga yang BENAR-BENAR dieksekusi, tanpa permintaan tambahan sama sekali.
 // Tiap swap sudah mencatat harganya per arah (memo.px["<market>|buy"|"|sell"]), dan
 // selisih dua arah itu persis definisi spread. Dipakai buat gerbang per-swap: mengukur
@@ -7785,7 +7799,7 @@ async function runRegister() {
 const argv = process.argv.slice(2);
 // buildSwapClients/SWAP/transferCC ikut diekspor biar bisa diprobe dari skrip luar
 // tanpa nyalain bot (require aman: runMain kegate `require.main === module`).
-module.exports = { s1SpreadDariMemo, s1TungguSpread, bumpDaily, persistDaily, s1AmbilPoin, setOtpInteractive, ensurePrivyToken, refreshExpiringTokens, effFeeCap, capFromMap, s1TungguFeeTurun, setSessionEngine, renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
+module.exports = { spreadBersama, s1SpreadDariMemo, s1TungguSpread, bumpDaily, persistDaily, s1AmbilPoin, setOtpInteractive, ensurePrivyToken, refreshExpiringTokens, effFeeCap, capFromMap, s1TungguFeeTurun, setSessionEngine, renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
 
 if (require.main === module) {
   if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
@@ -9384,6 +9398,10 @@ Usage:
         const timerUI = setInterval(() => render(global.__states), 1000);
 
         const conc = Math.max(1, Number((CONFIG.swap || {}).loginConcurrency) || 5);
+        // Task yang nunggu spread dikumpulin di sini, dikerjain setelah semua akun
+        // selesai fase 1 — biar nunggu spread gak makan slot paralel.
+        const tundaGlobal = [];
+        const finalisasi = new Map();
         // Task earn-hub RESET tiap hari 07:00 WIB, jadi strategi ini pekerjaan harian:
         // selesai satu putaran bukan berarti berhenti, tapi menunggu reset berikutnya.
         // Token Silvana/Privy umurnya ~1 jam sedangkan tunggunya belasan jam — makanya
@@ -9451,17 +9469,27 @@ Usage:
             // belasan dolar untuk satu task. Jadi task yang spreadnya di atas batas
             // DITUNDA dulu — kerjakan task lain — lalu dipantau sampai turun.
             const capSpread = Number(S1.maxSpreadPct) > 0 ? Number(S1.maxSpreadPct) : Infinity;
-            const cekSpread = async (t) => {
+            // Progres task dibaca SEKALI per putaran, dipakai buat semua task akun ini.
+            const bacaSemuaProgres = async () => {
+              const t0 = await ctx.sv.earnTasks(ctx.partyId).catch(() => null);
+              const m = {};
+              for (const t of tasks) {
+                const it = s1FindTask(t0, t.code);
+                m[t.code] = it ? s1Progress(it, t.target) : null;
+              }
+              return m;
+            };
+            const cekSpread = async (t, paksaUkur) => {
               if (!(capSpread < Infinity)) return { ok: true };
-              const r = await rfqSpread(ctx.sv, ctx.partyId, t.market, S1.stepUsd).catch(() => null);
-              if (!r || r.err || !(r.spreadPct > 0)) return { ok: true, tak: true };   // gak keukur → jangan ngeblok
-              // Hasilnya diseed ke memo harga milik ctx, jadi gerbang spread per-swap di
-              // dalam task tidak perlu mengukur ulang (rfqSpread makan 12-24 dtk).
+              const r = await spreadBersama(ctx.sv, ctx.partyId, t.market, S1.stepUsd, paksaUkur ? 0 : 60_000);
+              if (!r) return { ok: true, tak: true };   // gak keukur → jangan ngeblok
+              // Diseed ke memo harga milik ctx, jadi gerbang spread per-swap di dalam task
+              // tidak perlu mengukur ulang (rfqSpread makan 12-24 dtk).
               ctx.s1fee = ctx.s1fee || { usd: {}, jml: {}, px: {} };
               ctx.s1fee.px = ctx.s1fee.px || {};
-              ctx.s1fee.px[`${t.market}|buy`] = { v: r.beli.px, t: Date.now() };
-              ctx.s1fee.px[`${t.market}|sell`] = { v: r.jual.px, t: Date.now() };
-              return { ok: r.spreadPct <= capSpread, pct: r.spreadPct, perSwapUsd: r.perSwapUsd };
+              ctx.s1fee.px[`${t.market}|buy`] = { v: r.beli, t: r.t };
+              ctx.s1fee.px[`${t.market}|sell`] = { v: r.jual, t: r.t };
+              return { ok: r.pct <= capSpread, pct: r.pct, perSwapUsd: r.perSwapUsd };
             };
             const jalankanTask = async (t, ti) => {
               st2.s1.taskIdx = ti + 1;
@@ -9505,11 +9533,21 @@ Usage:
               return hasil;
             };
 
-            // Putaran 1: kerjakan yang spreadnya wajar, tunda yang lebar.
+            // Fase 1: kerjakan yang spreadnya wajar, tunda yang lebar.
             const ditunda = [];
+            const progres = await bacaSemuaProgres();
             for (let ti = 0; ti < tasks.length; ti++) {
               if (batal.cancelled()) { st2.s1.status = 'batal'; break; }
               const t = tasks[ti];
+              // Task yang SUDAH penuh jangan disentuh gerbang spread sama sekali —
+              // percuma menunggu spread turun buat pekerjaan yang tidak ada.
+              const pr = progres[t.code];
+              if (pr && pr.cur >= pr.tgt) {
+                log(`${t.code} udah ${pr.cur}/${pr.tgt} — dilewati`);
+                alasanTask.push('penuh');
+                st2.s1.cur = pr.cur; st2.s1.tgt = pr.tgt;
+                continue;
+              }
               const sp = await cekSpread(t);
               if (!sp.ok) {
                 log(`${t.code.replace(/_DAY_TRADER$/, '')} spread ${sp.pct.toFixed(2)}% > batas ${capSpread}% — ditunda, kerjakan task lain dulu`);
@@ -9520,58 +9558,49 @@ Usage:
               if (hasil && hasil.cancelled) { st2.s1.status = 'batal'; break; }
             }
 
-            // Putaran 2: task yang ditunda dipantau sampai spreadnya turun.
-            const pollS = Math.max(30, Number(S1.spreadPollSec) || 120);
-            while (ditunda.length && !batal.cancelled() && st2.s1.status !== 'batal') {
-              const sisa = [];
-              for (const { t, ti } of ditunda) {
-                if (batal.cancelled()) break;
-                st2.s1.taskIdx = ti + 1;
-                st2.s1.task = t.code.replace(/_DAY_TRADER$/, '');
-                st2.s1.spreadWait = true;
-                const sp = await cekSpread(t);
-                if (!sp.ok) {
-                  log(`  spread ${t.market} masih ${sp.pct.toFixed(2)}% > ${capSpread}% — cek lagi ${s1Durasi(pollS)}`);
-                  sisa.push({ t, ti });
-                  continue;
+            // Fase tunggu spread DIKELUARKAN dari pool paralel. Kalau akun yang menunggu
+            // tetap memegang slot concurrency, akun lain nganggur di antrean — terlihat
+            // nyata: 5 akun berstatus "Spread" sementara 5 sisanya "Antre" tanpa pernah
+            // mulai. Yang ditunggu itu spread MARKET, sama buat semua akun, jadi
+            // pemantauannya dipusatkan di luar sini.
+            // Idempoten: dipanggil di fase 1 (akun tanpa task tertunda) DAN di penutup
+            // putaran. Tanpa kunci ini rekapnya dicetak dua kali dan hitungan sukses dobel.
+            let sudahFinal = false;
+            const finalize = () => {
+              if (sudahFinal) return;
+              sudahFinal = true;
+              st2.s1.spreadWait = false;
+                if (st2.s1.status !== 'batal') {
+                const hambatan = alasanTask.filter(x => x && x !== 'penuh');
+                if (!st2.s1.swap && hambatan.length) { st2.s1.status = 'lewat'; log(`dilewati — ${hambatan[0]}`); }
+                else {
+                  st2.s1.status = 'selesai'; sukses++;
+                  if (st2.s1.swap) {
+                    // Rekap DIPISAH per task — biaya tiap market beda jauh, digabung jadi
+                    // satu angka penyebabnya tidak kelihatan.
+                    const pt = st2.s1.perTask || {};
+                    const baris = tasks.map(t => {
+                      const p = pt[t.code];
+                      if (!p) return `${t.market} -`;
+                      if (p.takTerbukukan) return `${t.market} ? (gagal baca saldo)`;
+                      return `${t.market} ${p.swap}sw $${(p.spreadUsd || 0).toFixed(2)} spread${p.feeStr ? ' + ' + p.feeStr : ''}`;
+                    });
+                    const totSpread = tasks.reduce((a2, t) => a2 + ((pt[t.code] && !pt[t.code].takTerbukukan) ? (pt[t.code].spreadUsd || 0) : 0), 0);
+                    const totFee = tasks.reduce((a2, t) => a2 + ((pt[t.code] && !pt[t.code].takTerbukukan) ? (pt[t.code].feeUsd || 0) : 0), 0);
+                    log(`selesai — ${st2.s1.swap} swap`);
+                    for (const b2 of baris) log(`  · ${b2}`);
+                    log(`  TOTAL spread $${totSpread.toFixed(2)} + fee $${totFee.toFixed(2)} = $${(totSpread + totFee).toFixed(2)}`);
+                  } else log('semua task sudah penuh');
                 }
-                st2.s1.spreadWait = false;
-                log(`  spread ${t.market} turun ke ${sp.pct != null ? sp.pct.toFixed(2) + '%' : '?'} ≤ ${capSpread}% — dikerjakan sekarang`);
-                const hasil = await jalankanTask(t, ti);
-                if (hasil && hasil.cancelled) { st2.s1.status = 'batal'; break; }
-              }
-              ditunda.length = 0; ditunda.push(...sisa);
-              if (!ditunda.length || batal.cancelled()) break;
-              const sampai = Date.now() + pollS * 1000;
-              while (Date.now() < sampai) {
-                if (batal.cancelled()) break;
-                await sleep(Math.min(3000, Math.max(500, sampai - Date.now())));
-              }
+              } else log('dihentikan user');
+            };
+            finalisasi.set(i, { finalize, jalankanTask, st2, log });
+            if (ditunda.length && !batal.cancelled() && st2.s1.status !== 'batal') {
+              st2.s1.spreadWait = true;
+              for (const x of ditunda) tundaGlobal.push({ i, t: x.t, ti: x.ti });
+              return;                       // slot dilepas, akun lain bisa jalan
             }
-            st2.s1.spreadWait = false;
-            if (st2.s1.status !== 'batal') {
-              const hambatan = alasanTask.filter(x => x && x !== 'penuh');
-              if (!st2.s1.swap && hambatan.length) { st2.s1.status = 'lewat'; log(`dilewati — ${hambatan[0]}`); }
-              else {
-                st2.s1.status = 'selesai'; sukses++;
-                if (st2.s1.swap) {
-                  // Rekap DIPISAH per task — biaya tiap market beda jauh, digabung jadi
-                  // satu angka penyebabnya tidak kelihatan.
-                  const pt = st2.s1.perTask || {};
-                  const baris = tasks.map(t => {
-                    const p = pt[t.code];
-                    if (!p) return `${t.market} -`;
-                    if (p.takTerbukukan) return `${t.market} ? (gagal baca saldo)`;
-                    return `${t.market} ${p.swap}sw $${(p.spreadUsd || 0).toFixed(2)} spread${p.feeStr ? ' + ' + p.feeStr : ''}`;
-                  });
-                  const totSpread = tasks.reduce((a2, t) => a2 + ((pt[t.code] && !pt[t.code].takTerbukukan) ? (pt[t.code].spreadUsd || 0) : 0), 0);
-                  const totFee = tasks.reduce((a2, t) => a2 + ((pt[t.code] && !pt[t.code].takTerbukukan) ? (pt[t.code].feeUsd || 0) : 0), 0);
-                  log(`selesai — ${st2.s1.swap} swap`);
-                  for (const b2 of baris) log(`  · ${b2}`);
-                  log(`  TOTAL spread $${totSpread.toFixed(2)} + fee $${totFee.toFixed(2)} = $${(totSpread + totFee).toFixed(2)}`);
-                } else log('semua task sudah penuh');
-              }
-            } else log('dihentikan user');
+            finalize();
           } catch (e) {
             gagal++;
             if (e && e.needOtp) {
@@ -9584,6 +9613,50 @@ Usage:
           }
           st2.s1.jalan = false;
         });
+        // Fase 2 TERPUSAT: spread dipantau SEKALI per market (bukan sekali per akun), dan
+        // begitu turun semua akun yang menunggu market itu dikerjakan paralel.
+        const pollS = Math.max(30, Number(S1.spreadPollSec) || 120);
+        const capSp2 = Number(S1.maxSpreadPct) > 0 ? Number(S1.maxSpreadPct) : Infinity;
+        const batasTunggu = Math.max(0, Number(S1.spreadWaitMaxMin) || 0) * 60000;
+        const mulaiTunggu = Date.now();
+        while (tundaGlobal.length && !batal.cancelled()) {
+          const pasar = [...new Set(tundaGlobal.map(x => x.t.market))];
+          const siapPasar = new Set();
+          for (const mk of pasar) {
+            const c0 = finalisasi.get(tundaGlobal.find(x => x.t.market === mk).i);
+            const sv0 = c0 && c0.st2 && c0.st2.__sv;
+            if (!sv0) { siapPasar.add(mk); continue; }        // gak bisa ukur → jangan ngeblok
+            const r = await spreadBersama(sv0, c0.st2.__partyId, mk, S1.stepUsd, 0).catch(() => null);
+            if (!r) { siapPasar.add(mk); continue; }
+            const nunggu = tundaGlobal.filter(x => x.t.market === mk).length;
+            if (r.pct <= capSp2) { logActivity(`spread ${mk} turun ke ${r.pct.toFixed(2)}% ≤ ${capSp2}% — ${nunggu} task dikerjakan`, COLOR.green); siapPasar.add(mk); }
+            else logActivity(`spread ${mk} masih ${r.pct.toFixed(2)}% > ${capSp2}% — ${nunggu} task nunggu, cek lagi ${s1Durasi(pollS)}`, COLOR.gray);
+          }
+          const siap = tundaGlobal.filter(x => siapPasar.has(x.t.market));
+          if (siap.length) {
+            await mapLimit(siap, conc, async (x) => {
+              const h = finalisasi.get(x.i);
+              if (!h || batal.cancelled()) return;
+              h.st2.s1.spreadWait = false;
+              try { await h.jalankanTask(x.t, x.ti); }
+              catch (e) { h.log(paint(`GAGAL: ${(e && e.message) || e}`, COLOR.red)); }
+            });
+            for (const x of siap) { const k = tundaGlobal.indexOf(x); if (k >= 0) tundaGlobal.splice(k, 1); }
+          }
+          if (!tundaGlobal.length || batal.cancelled()) break;
+          if (batasTunggu && Date.now() - mulaiTunggu > batasTunggu) {
+            logActivity(`spread gak turun-turun setelah ${s1Durasi((Date.now() - mulaiTunggu) / 1000)} — ${tundaGlobal.length} task ditinggal, lanjut ke jadwal berikutnya`, COLOR.yellow);
+            break;
+          }
+          const sampai2 = Date.now() + pollS * 1000;
+          while (Date.now() < sampai2) {
+            if (batal.cancelled()) break;
+            await sleep(Math.min(3000, Math.max(500, sampai2 - Date.now())));
+          }
+        }
+        // Semua akun ditutup di sini, termasuk yang tadi nunggu spread.
+        for (const [, h] of finalisasi) { try { h.st2.s1.spreadWait = false; h.finalize(); } catch (_) { } }
+
         logActivity(`putaran ${putaranHari} selesai — ${sukses} akun beres, ${gagal} gagal`, gagal ? COLOR.yellow : COLOR.green);
         if (batal.cancelled()) break;
 
