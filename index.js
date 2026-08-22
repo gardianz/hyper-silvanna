@@ -163,7 +163,10 @@ async function walleyReq(method, path_, { body = null, token = null, proxy = nul
     // 5xx. Semuanya SEMENTARA: prepare ulang biasanya lolos. Ditandai transient supaya
     // pemanggil mengulang, bukan menggugurkan akun — dulu satu 404 menghentikan akun
     // di tengah task (terlihat sebagai "Error" di 6/10).
-    if (r.status === 404 || r.status === 409 || r.status === 425 || r.status === 429 || r.status >= 500) e.transient = true;
+    // 422 juga masuk: yang dikirim bentuknya benar (bot cuma merakit ulang command yang
+    // sama tiap swap), jadi "unprocessable" praktis selalu berarti kontrak input /
+    // disclosed contract-nya sudah tidak berlaku lagi — kondisi sementara.
+    if (r.status === 404 || r.status === 409 || r.status === 422 || r.status === 425 || r.status === 429 || r.status >= 500) e.transient = true;
     if (/CONTRACT_NOT_FOUND|NOT_FOUND|ABORTED|contention|already archived/i.test(r.text || '')) e.transient = true;
     throw e;
   }
@@ -394,8 +397,10 @@ class WalleyCantonClient {
       logDebug('walley prepare REQUEST', this._toWalley(body));
       logDebug('walley prepare ERROR', (e && e.message) || String(e));
       // Kontrak MultiCall di cache bisa udah gak aktif (server ganti) — buang cache
-      // biar percobaan berikutnya ngambil yg baru.
-      if (/CONTRACT_NOT_FOUND|not found|disclosed/i.test((e && e.message) || '')) clearMultiCallCache();
+      // biar percobaan berikutnya ngambil yg baru. Berlaku buat SEMUA error sementara
+      // (404/409/422/5xx), bukan cuma yang pesannya menyebut CONTRACT_NOT_FOUND:
+      // 422 dari /prepare tidak menyebut apa pun soal kontrak tapi sebabnya sama.
+      if ((e && e.transient) || /CONTRACT_NOT_FOUND|not found|disclosed/i.test((e && e.message) || '')) clearMultiCallCache();
       throw e;
     }
     const tx = prep && prep.transaction;
@@ -4923,6 +4928,8 @@ function renderAccountsTable(states) {
       cell: (s) => {
         const p = s.s1 && s.s1.perTask && s.s1.perTask[t.code];
         if (!p) return ['-', COLOR.gray];
+        // Task gagal JANGAN tampil $0.00 — itu terbaca seolah selesai tanpa biaya.
+        if (p.gagal) return ['gagal', COLOR.red];
         if (p.takTerbukukan) return ['?', COLOR.yellow];
         const v = Number(p.spreadUsd) || 0;
         return [`$${v.toFixed(2)}`, v > 0 ? COLOR.red : COLOR.gray];
@@ -9554,7 +9561,19 @@ Usage:
                 ditunda.push({ t, ti });
                 continue;
               }
-              const hasil = await jalankanTask(t, ti);
+              // Kegagalan satu task JANGAN menggugurkan akun: task lain masih bisa
+              // dikerjakan. Dulu error dari s1RunTask naik ke catch akun, akunnya
+              // ditandai Error dan sisa tasknya tidak pernah disentuh.
+              let hasil = null;
+              try { hasil = await jalankanTask(t, ti); }
+              catch (e) {
+                if (e && e.needOtp) throw e;                 // token mati → akun memang gak bisa lanjut
+                alasanTask.push(((e && e.message) || String(e)).slice(0, 40));
+                log(paint(`${t.code} GAGAL: ${(e && e.message) || e}`, COLOR.red));
+                st2.s1.perTask = st2.s1.perTask || {};
+                st2.s1.perTask[t.code] = { swap: 0, spreadUsd: 0, feeUsd: 0, gagal: true };
+                continue;                                    // lanjut ke task berikutnya
+              }
               if (hasil && hasil.cancelled) { st2.s1.status = 'batal'; break; }
             }
 
@@ -9582,7 +9601,8 @@ Usage:
                     const baris = tasks.map(t => {
                       const p = pt[t.code];
                       if (!p) return `${t.market} -`;
-                      if (p.takTerbukukan) return `${t.market} ? (gagal baca saldo)`;
+                      if (p.gagal) return `${t.market} GAGAL`;
+                    if (p.takTerbukukan) return `${t.market} ? (gagal baca saldo)`;
                       return `${t.market} ${p.swap}sw $${(p.spreadUsd || 0).toFixed(2)} spread${p.feeStr ? ' + ' + p.feeStr : ''}`;
                     });
                     const totSpread = tasks.reduce((a2, t) => a2 + ((pt[t.code] && !pt[t.code].takTerbukukan) ? (pt[t.code].spreadUsd || 0) : 0), 0);

@@ -17,7 +17,7 @@ VPS with `npm install && node index.js`.
 
 ```bash
 npm install                  # only installs node-cron
-node index.js                # interactive menu (options 0-9), then dashboard + daily cron
+node index.js                # interactive menu (arrow keys), then dashboard + daily cron
 node index.js once            # fetch balances + render dashboard once, exit (no swap)
 node index.js swap            # force ONE DAY_TRADER session, exit
 node index.js register        # one-time: print browser Console script to enrol a passkey
@@ -26,8 +26,23 @@ node index.js wallets         # list Privy wallets per account, flag which match
 node index.js pin <walletId>  # pin a privyWalletId into session.json
 node index.js balance [idx|all]                        # read-only: every instrument, unlocked/locked/UTXO count
 node index.js transfer <idx> <token> <amt|max> <dest> [go]   # any instrument; omit `go` for a dry run
+node index.js spread [market|all|strategi] [usd] [idx] [feeTok]
+                             # ukur spread RFQ (kutip 2 arah, 0 biaya)
+node index.js pingpong / pingpong-rfq [pair] [sell|buy]      # mode 8, non-interaktif
+node index.js walley / walley-onboard                        # wallet Walley: daftar & onboarding
+node index.js privy-otp <idx>                                # login OTP satu akun
 node index.js help            # full subcommand list
 ```
+
+Menu interaktif (huruf, bukan angka berurutan — `0` dan `1` lama sudah dihapus):
+
+| | | |
+| --- | --- | --- |
+| `s` swap 1x (RFQ) | `1` strategi 1 | `2` check balance |
+| `3` run (OTP urut) | `4` change wallet | `5` maintenance |
+| `p` pulangkan | `6` swap back | `7` EDELx manual |
+| `8` ping-pong CLOB | `8r` ping-pong RFQ | `9` bulk back |
+| `t` transfer | `w` wallet (wallet aktif · token fee · batas fee · batas spread) | |
 
 Diagnostics / dry-runs (these cost 0 CC and auto-clean the proposals they create):
 
@@ -43,31 +58,35 @@ node index.js terminal-swap   [idx] [buy|sell] [go] # one full terminal swap
 ```
 
 `swap-debug.log` is appended automatically on any `prepare_transaction` / `submit_prepared`
-failure (see `logDebug`, [index.js:2578](index.js#L2578)) — read it first when a swap breaks.
+failure (see `logDebug`) — read it first when a swap breaks.
 
 ## Layout
 
-Deliberately a **single file**. `index.js` is ~5,600 lines split by `// ====` banner comments;
-navigate with `sed -n 'A,Bp'` / `grep -n` rather than reading it whole.
+Deliberately a **single file**: `index.js`, ~10.500 baris, dipisah oleh banner
+`// ====`. Baca per potongan (`sed -n 'A,Bp'` / `grep -n`), jangan sekaligus.
 
-| Lines | Section |
-| --- | --- |
-| 31–350 | Path & config loader, `SWAP` / `M8` / `PAIRS` globals |
-| 351–540 | Native HTTP w/ cookie jar, gzip/br, proxy CONNECT tunnel |
-| 486–540 | Proxy pool (sticky-deterministic per email) |
-| 540–612 | Passkey (WebAuthn ES256 assertion) |
-| 566–612 | React Server Components ("flight") parser |
-| 613–800 | Privy embedded wallet — HPKE decrypt + authorization signature |
-| 800–978 | `CantonClient` + `buildMultiCallAccept` transaction assembler |
-| 979–1338 | `SilvanaClient` — passkey login, earn-hub, server actions, RFQ, terminal |
-| 1339–1410 | `session.json` store |
-| 1411–1654 | Privy OTP login / refresh, TTY prompt & key-nav |
-| 1654–2060 | `swapOnce` — the atomic RFQ swap |
-| 2060–2282 | `terminalSwapOnce` / `settleTerminalProposal` — CLOB swap (mode 8) |
-| 2282–2780 | ANSI dashboard + per-account tick |
-| 2823–4350 | DAY_TRADER engine and EDELx↔cETH ping-pong engine |
-| 4349–4570 | Daily scheduler, web-dashboard push |
-| 4572–5570 | `runMain`, passkey register/paste, CLI dispatch |
+**Jangan pernah menulis peta nomor baris di dokumen ini.** Versi sebelumnya memuat tabel
+baris yang sudah meleset ~2× (mengklaim 5.600 baris saat filenya 10.482) — seorang pembaca
+yang mempercayainya membuka potongan yang salah. Cari lewat nama banner, yang ikut pindah
+sendiri bersama kodenya:
+
+```bash
+grep -n '^//  [A-Z]' index.js      # daftar semua banner bagian
+```
+
+Banner yang paling sering dituju, berurutan sesuai isi file:
+
+`Path & file loader` · `HTTP (native, cookie jar, gzip/br, proxy CONNECT)` · `Cookie jar` ·
+`Proxy pool` · `Passkey (WebAuthn assertion, ES256)` · `React Server Components (flight)
+parser` · `Privy embedded-wallet (TEE) signing` · `Canton / Supanova client + perakit
+prepare_transaction (MultiCall)` · `Silvana app client` · `Session store (session.json)` ·
+`Privy OTP login / refresh` · `Swap atomik` · `Terminal (CLOB) swap — mode 8` ·
+`RFQ ATOMIC (atomic-dvp-v2)` · `Dashboard (ANSI, adaptif tmux)` · `Tick dashboard data` ·
+`Keep-alive token` · `DAY_TRADER engine`
+
+Fungsi kunci dicari langsung dengan `grep -n '^\(async \)\?function <nama>' index.js`:
+`swapOnceAtomic`, `s1RunTask`, `s1TungguFeeTurun`, `s1TungguSpread`, `rfqSpread`,
+`effFeeCap`, `buildSwapClients`, `renderAccountsTable`, `persistDaily`, `logDebug`.
 
 ### Files at runtime
 
@@ -603,11 +622,20 @@ akun itu berswap normal.
 
 Balasannya membawa `trace_id`/`request_id` — artinya error backend yang dipetakan ke
 NOT_FOUND: kontrak input keburu dikonsumsi transaksi lain atau disclosed contract sudah
-basi. Sama sifatnya dengan 409 dan 5xx: **sementara**. `walleyReq` menandainya
+basi. Sama sifatnya dengan 409, **422** dan 5xx: **sementara**. 422 dari `/v1/transactions/
+prepare` masuk kategori yang sama walau pesannya tidak menyebut kontrak sama sekali — bot
+merakit command yang bentuknya identik tiap swap, jadi "unprocessable" praktis selalu berarti
+kontrak input/disclosed-nya sudah tidak berlaku. Karena itu `prepareTransaction` membuang
+cache MultiCall untuk **semua** error transient, bukan hanya yang pesannya cocok regex. `walleyReq` menandainya
 `e.transient` (juga saat body memuat `CONTRACT_NOT_FOUND`/`ABORTED`/`contention`), dan
 `submitPrepared` membuang cache MultiCall plus menulis body lengkapnya ke `swap-debug.log`
 — di dashboard barisnya kepotong dan yang tersisa cuma `trace_id`. Tanpa tanda transient,
 satu 404 menghentikan akun di tengah task (terlihat sebagai `● Error` di 6/10).
+
+Kegagalan **satu task** tidak boleh menggugurkan akun: sisa tasknya masih bisa dikerjakan.
+Error dari `s1RunTask` ditangkap per task, task itu ditandai `gagal` (tampil `gagal` di kolom
+spread-nya, bukan `$0.00` yang terbaca seolah selesai gratis), lalu lanjut ke task berikutnya.
+Pengecualiannya `e.needOtp` — tokennya mati, akun itu memang tidak bisa lanjut.
 
 ### Sesi panjang tanpa penunggu tidak boleh jatuh ke prompt OTP
 
