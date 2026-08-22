@@ -622,11 +622,22 @@ akun itu berswap normal.
 
 Balasannya membawa `trace_id`/`request_id` — artinya error backend yang dipetakan ke
 NOT_FOUND: kontrak input keburu dikonsumsi transaksi lain atau disclosed contract sudah
-basi. Sama sifatnya dengan 409, **422** dan 5xx: **sementara**. 422 dari `/v1/transactions/
-prepare` masuk kategori yang sama walau pesannya tidak menyebut kontrak sama sekali — bot
-merakit command yang bentuknya identik tiap swap, jadi "unprocessable" praktis selalu berarti
-kontrak input/disclosed-nya sudah tidak berlaku. Karena itu `prepareTransaction` membuang
-cache MultiCall untuk **semua** error transient, bukan hanya yang pesannya cocok regex. `walleyReq` menandainya
+basi. Sama sifatnya dengan 409 dan 5xx: **sementara**. `prepareTransaction` membuang cache
+MultiCall untuk semua error transient, bukan hanya yang pesannya cocok regex.
+
+**Kecuali 422 yang membawa assertion Daml `collapseAction`.** Bodinya berbunyi
+`The requirement 'collapseAction: amount must be positive and not exceed total holding
+amount' was not met` — itu **bukan** kontrak basi dan mengulanginya pasti gagal lagi.
+Artinya jumlah yang diminta melebihi saldo yang dipegang, dan hampir selalu itu token
+**fee**: terukur pada satu akun fee 0.15 TUSDT sementara saldonya 0.13 TUSDT. Pesannya tidak
+menyebut fee sama sekali, jadi gampang salah diagnosa. Ditandai `e.holdingKurang` (bukan
+transient) supaya `s1RunTask` membuang token fee itu dari kandidat lalu mengulang langkah
+yang sama dengan token berikutnya.
+
+Akar masalahnya ada di penyaring kandidat fee: `s1FeeSiap` menganggap `saldo > 0` sudah cukup
+selama jumlah feenya belum pernah teramati, sehingga 0.13 TUSDT lolos. `s1FeeSiapPasti`
+menanyakan jumlahnya lebih dulu lewat `sv.feeNow()` (murah, tanpa RFQ) dan hanya saat belum
+teramati — sekali per token per task, sesudah itu gratis. `walleyReq` menandainya
 `e.transient` (juga saat body memuat `CONTRACT_NOT_FOUND`/`ABORTED`/`contention`), dan
 `submitPrepared` membuang cache MultiCall plus menulis body lengkapnya ke `swap-debug.log`
 — di dashboard barisnya kepotong dan yang tersisa cuma `trace_id`. Tanpa tanda transient,

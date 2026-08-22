@@ -168,6 +168,14 @@ async function walleyReq(method, path_, { body = null, token = null, proxy = nul
     // disclosed contract-nya sudah tidak berlaku lagi — kondisi sementara.
     if (r.status === 404 || r.status === 409 || r.status === 422 || r.status === 425 || r.status === 429 || r.status >= 500) e.transient = true;
     if (/CONTRACT_NOT_FOUND|NOT_FOUND|ABORTED|contention|already archived/i.test(r.text || '')) e.transient = true;
+    // Assertion Daml ini BUKAN kondisi sementara: 'collapseAction: amount must be
+    // positive and not exceed total holding amount' berarti jumlah yang diminta melebihi
+    // saldo yang dipegang — hampir selalu token FEE yang kurang (mis. fee 0.15 TUSDT
+    // sementara saldonya 0.13). Mengulanginya dengan angka yang sama pasti gagal lagi,
+    // jadi ditandai khusus supaya pemanggil mengganti token fee, bukan retry buta.
+    if (/collapseAction|amount must be positive|not exceed total holding/i.test(r.text || '')) {
+      e.transient = false; e.holdingKurang = true;
+    }
     throw e;
   }
   return r.json != null ? r.json : (() => { try { return JSON.parse(r.text); } catch (_) { return null; } })();
@@ -2738,6 +2746,23 @@ function s1FeeSiap(kandidat, get, teramatJml) {
   });
 }
 
+// Versi yang MEMASTIKAN jumlah feenya, bukan menebak dari "saldo > 0". Saldo 0.13 TUSDT
+// lolos filter di atas padahal feenya 0.15, dan swapnya baru gagal jauh di belakang
+// dengan pesan Daml yang tidak menyebut fee sama sekali (422 collapseAction). Jumlah fee
+// ditanya ke estimateAtomicFeeAction — murah, tanpa RFQ — dan cuma saat belum teramati.
+async function s1FeeSiapPasti(ctx, market, kandidat, get, memo) {
+  let list = s1FeeSiap(kandidat, get, memo.jml);
+  for (let i = 0; i < 4; i++) {
+    const top = list[0];
+    if (!top || memo.jml[String(top).toUpperCase()] != null) break;
+    const f = await ctx.sv.feeNow(ctx.partyId, market, [top]).catch(() => null);
+    if (!f || !(f.amount > 0)) break;          // gak kebaca → biarkan apa adanya
+    memo.jml[String(f.sym).toUpperCase()] = f.amount;
+    list = s1FeeSiap(kandidat, get, memo.jml);
+  }
+  return list;
+}
+
 // Jalanin SATU task sampai targetnya penuh, lalu balikin saldo ke hub.
 // Aturan ukuran (dari permintaan user):
 //   swap ke-1        : firstUsd  (default $14 = min $10 + sisa $4 biar gak jatuh
@@ -2751,7 +2776,7 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
   // langsung memperbaiki urutan di task berikutnya.
   const memo = ctx.s1fee || (ctx.s1fee = { usd: {}, jml: {}, px: {} });
   if (!memo.px) memo.px = {};
-  const semua = (Array.isArray(kandidatFee) ? kandidatFee : [kandidatFee]).filter(Boolean);
+  let semua = (Array.isArray(kandidatFee) ? kandidatFee : [kandidatFee]).filter(Boolean);
   let feeTok = semua[0];   // dipakai buat pelaporan; nilai sebenarnya dari quote
 
   // Batas fee dipatok USD lalu dikonversi ke satuan token termurah yg mungkin dipakai.
@@ -2944,7 +2969,7 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
     // Token fee ditentukan DI SINI, saat quote: kirim daftar kandidat berurutan
     // (termurah dulu, sudah dibuang yg saldonya tak sanggup bayar sekali fee lagi),
     // server memilih yg pertama didukung market ini.
-    let siap = s1FeeSiap(semua, get, memo.jml);
+    let siap = await s1FeeSiapPasti(ctx, mk.id, semua, get, memo);
     if (!siap.length) {
       const habis = semua.join('/');
       log(`token fee habis semua (${habis}) — task dihentikan`);
@@ -2983,6 +3008,20 @@ async function s1RunTask(ctx, task, mk, hub, kandidatFee, cfg, log, isCancelled)
       // sehingga seluruh putaran batal dan bot menganggur sampai reset besok, padahal
       // cukup menunggu. Pola sama dengan mode 8: tunda, cek lagi, ulangi SAMPAI turun.
       // Berhentinya cuma lewat q / Ctrl+C.
+      // Saldo token fee terbukti kurang (assertion Daml, bukan tebakan) — buang token
+      // itu dari kandidat lalu ulangi langkah yang sama dengan token berikutnya.
+      if (e && e.holdingKurang) {
+        const buang = feeTok;
+        if (buang && semua.length > 1) {
+          semua = semua.filter(t => String(t).toUpperCase() !== String(buang).toUpperCase());
+          memo.jml[String(buang).toUpperCase()] = Infinity;   // jangan dipilih lagi task ini
+          log(`  saldo ${buang} gak cukup buat fee — pindah ke ${semua.join('/')}, ulangi`);
+          continue;                                          // langkah TIDAK naik
+        }
+        log(`  saldo token fee gak cukup (${semua.join('/')}) — task dihentikan`);
+        alasan = `saldo token fee kurang (${semua.join('/')})`;
+        break;
+      }
       if (e && e.feeSpike) {
         log(`  ${(e.message || '').slice(0, 60)} — nunggu fee turun`);
         lapor({ feeWait: true, feeInfo: `${e.feeCC} ${e.feeUnit || ''}`.trim() });
@@ -7806,7 +7845,7 @@ async function runRegister() {
 const argv = process.argv.slice(2);
 // buildSwapClients/SWAP/transferCC ikut diekspor biar bisa diprobe dari skrip luar
 // tanpa nyalain bot (require aman: runMain kegate `require.main === module`).
-module.exports = { spreadBersama, s1SpreadDariMemo, s1TungguSpread, bumpDaily, persistDaily, s1AmbilPoin, setOtpInteractive, ensurePrivyToken, refreshExpiringTokens, effFeeCap, capFromMap, s1TungguFeeTurun, setSessionEngine, renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
+module.exports = { s1FeeSiapPasti, s1FeeSiap, spreadBersama, s1SpreadDariMemo, s1TungguSpread, bumpDaily, persistDaily, s1AmbilPoin, setOtpInteractive, ensurePrivyToken, refreshExpiringTokens, effFeeCap, capFromMap, s1TungguFeeTurun, setSessionEngine, renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
 
 if (require.main === module) {
   if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
