@@ -444,6 +444,11 @@ dan **tiap task dapat kolom spread sendiri** di dashboard (judulnya market-nya);
 jadi satu angka membuat task termahal tersamar oleh yang murah. Rekap saat akun selesai
 juga dipecah per task, bukan satu total.
 
+Statistik per task **disimpan ke `session.json`** (`s1Stat: {date, tasks}`) dan dimuat lagi
+saat akun mulai, jadi restart tidak mengosongkan kolom spread per-task. Diakumulasi, bukan
+ditimpa — satu task bisa dilanjutkan setelah restart — dan ikut reset otomatis saat ganti
+hari, sepola dengan ember fee/spread harian.
+
 Menu 1 **tidak berhenti** setelah semua task penuh: task earn-hub reset tiap hari 07:00 WIB,
 jadi setelah satu putaran bot menunggu sampai `schedule.hour`/`minute` berikutnya lalu jalan
 lagi. Yang harus ikut hidup selama menunggu adalah `keepAliveAll` dan `refreshExpiringTokens`
@@ -575,7 +580,7 @@ Empat kolom itu dipakai bersama semua engine dan gampang disalahartikan:
 | kolom | isi | reset |
 | --- | --- | --- |
 | `FEE/SESI` | fee sejak proses ini mulai (strategi 1) — **satu-satunya** yang sebanding dengan kolom `TOTAL` | tiap bot dijalankan |
-| `FEE/hr` (`FEE/HARI` di strategi 1) | fee **hari ini**, ikut menghitung putaran & run sebelumnya | otomatis 07:00 WIB |
+| `FEE/hr` | fee **hari ini**, ikut menghitung run sebelumnya — **tidak ditampilkan di strategi 1** karena cakupannya beda dari `TOTAL`/`FEE/SESI` yang per-proses | otomatis 07:00 WIB |
 | `FEE/SN` | fee **CC** sejak awal season | manual, menu 5 → b |
 | `FEE-TOK` | fee **non-CC** season (TUSDT/USD8) + satuannya | manual, sama |
 | `LOSS$/hr` / `LOSS/SN` | spread USD harian / season | 07:00 WIB / manual |

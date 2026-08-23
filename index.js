@@ -2511,6 +2511,35 @@ async function s1TungguFeeTurun(ctx, market, kandidatFee, cfg, log, isCancelled,
   }
 }
 
+// Statistik per task disimpan ke session.json. Tanpa ini kolom spread per-task kembali
+// kosong tiap bot di-restart, padahal biayanya sudah nyata terjadi hari itu. Diakumulasi
+// (bukan ditimpa) karena satu task bisa dilanjutkan setelah restart, dan ikut reset
+// otomatis saat ganti hari — sepola dengan ember fee/spread harian.
+function s1LoadStat(email) {
+  const s = acctSession(email) || {};
+  const st = s.s1Stat;
+  if (!st || st.date !== todayStr()) return {};
+  return st.tasks || {};
+}
+function s1SaveStat(email, code, data) {
+  if (!email || !code) return {};
+  const s = acctSession(email) || {};
+  const lama = (s.s1Stat && s.s1Stat.date === todayStr()) ? (s.s1Stat.tasks || {}) : {};
+  const p = lama[code] || {};
+  const gabung = {
+    swap: (Number(p.swap) || 0) + (Number(data.swap) || 0),
+    spreadUsd: (Number(p.spreadUsd) || 0) + (Number(data.spreadUsd) || 0),
+    feeUsd: (Number(p.feeUsd) || 0) + (Number(data.feeUsd) || 0),
+    volumeUsd: (Number(p.volumeUsd) || 0) + (Number(data.volumeUsd) || 0),
+    feeStr: data.feeStr || p.feeStr || '',
+    takTerbukukan: !!data.takTerbukukan,
+    gagal: !!data.gagal,
+  };
+  const tasks = { ...lama, [code]: gabung };
+  patchAcctSession(email, { s1Stat: { date: todayStr(), tasks } });
+  return tasks;
+}
+
 // Poin earn-hub (halaman /earn-hub). Sumbernya GET /api/earn-hub/stats → totalPoints;
 // kalau field itu tidak ada, dicari di /api/earn-hub/tasks lewat extractUnclaimedPoints.
 // Dipakai strategi 1 supaya kolom POIN terisi tanpa perlu tick engine lain.
@@ -4941,15 +4970,11 @@ function renderAccountsTable(states) {
         return [isi.map(([t, v]) => `${Number(v).toFixed(2)} ${t}`).join('+'), COLOR.yellow];
       },
     }] : []),
-    (SESSION_ENGINE === 'strategi1'
-      ? {
-        title: 'FEE/HARI', prio: 2, cap: 12, cell: s => {
-          const tok = Number(s.feeTokToday) || 0;
-          if (tok > 0) return [`${tok.toFixed(2)} ${s.feeTokUnit || ''}`.trim(), COLOR.yellow];
-          return [Number(s.feeToday) > 0 ? Number(s.feeToday).toFixed(1) : '0', COLOR.yellow];
-        }
-      }
-      : { title: 'FEE/hr', prio: 3, cap: 8, cell: s => [Number(s.feeToday) > 0 ? Number(s.feeToday).toFixed(1) : '0', COLOR.yellow] }),
+    // FEE/HARI dibuang di strategi 1: cakupannya (sehari, lintas restart) beda dari
+    // TOTAL/FEE/SESI yang per-proses, dan berdampingan justru bikin salah baca. Angka
+    // hariannya masih tersimpan di session dan tetap dipakai footer season.
+    ...(SESSION_ENGINE === 'strategi1' ? []
+      : [{ title: 'FEE/hr', prio: 3, cap: 8, cell: s => [Number(s.feeToday) > 0 ? Number(s.feeToday).toFixed(1) : '0', COLOR.yellow] }]),
     // SEASON = total fee CC kebakar seumur season (gak roll harian). Persist di
     // session.json → survive re-run. Reset cuma manual: menu 5 → b) reset season.
     { title: 'FEE/SN', prio: 2, cap: 11, cell: s => [fmtSeason(s.feeSeason), COLOR.mag] },
@@ -7845,7 +7870,7 @@ async function runRegister() {
 const argv = process.argv.slice(2);
 // buildSwapClients/SWAP/transferCC ikut diekspor biar bisa diprobe dari skrip luar
 // tanpa nyalain bot (require aman: runMain kegate `require.main === module`).
-module.exports = { s1FeeSiapPasti, s1FeeSiap, spreadBersama, s1SpreadDariMemo, s1TungguSpread, bumpDaily, persistDaily, s1AmbilPoin, setOtpInteractive, ensurePrivyToken, refreshExpiringTokens, effFeeCap, capFromMap, s1TungguFeeTurun, setSessionEngine, renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
+module.exports = { s1LoadStat, s1SaveStat, s1FeeSiapPasti, s1FeeSiap, spreadBersama, s1SpreadDariMemo, s1TungguSpread, bumpDaily, persistDaily, s1AmbilPoin, setOtpInteractive, ensurePrivyToken, refreshExpiringTokens, effFeeCap, capFromMap, s1TungguFeeTurun, setSessionEngine, renderBalanceTable, rfqSpread, fetchMarkets, s1Balances, s1ToHub, s1FindTask, s1Progress, s1Swap, symbolOfInstrument, feeQuotesUsd, usdPriceOf, s1RunTask, swapOnceAtomic, getUserServiceCid, balancesFor, instrumentIdOf, render, makeStates, logActivity, computeLayout, runDayTraderSession, parseDayTrader, ensurePrivyToken, supaMe, supaBalances, getProxy, patchAcctSession, ACCOUNTS, M8, SWAP, buildSwapClients, transferToken, pickList, nowHourInTz, mode8IsNight, getEdelCethRoundUsd, setEdelCethRoundUsd };
 
 if (require.main === module) {
   if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
@@ -9506,6 +9531,8 @@ Usage:
             };
             segar(await s1Balances(ctx).catch(() => null));
             st2.__partyId = clients.partyId;
+            // Statistik hari ini dimuat dari session — restart tidak menghapus angkanya.
+            st2.s1.perTask = { ...s1LoadStat(a.email), ...(st2.s1.perTask || {}) };
             st2.__sv = clients.sv;           // dipakai nyegerin poin selama nunggu reset
             await s1AmbilPoin(clients.sv, st2);
             const alasanTask = [];
@@ -9557,6 +9584,7 @@ Usage:
                 feeStr: (hasil.feePakai || []).map(f => `${f.jml.toFixed(2)} ${f.tok}`).join('+'),
                 takTerbukukan: !!hasil.takTerbukukan,
               };
+              st2.s1.perTask = s1SaveStat(a.email, t.code, st2.s1.perTask[t.code]);
               // Fee SESI ini, dijumlah per token — sebanding dengan kolom TOTAL.
               st2.s1.feeSesi = st2.s1.feeSesi || {};
               for (const f of (hasil.feePakai || [])) {
@@ -9611,6 +9639,7 @@ Usage:
                 log(paint(`${t.code} GAGAL: ${(e && e.message) || e}`, COLOR.red));
                 st2.s1.perTask = st2.s1.perTask || {};
                 st2.s1.perTask[t.code] = { swap: 0, spreadUsd: 0, feeUsd: 0, gagal: true };
+                st2.s1.perTask = s1SaveStat(a.email, t.code, st2.s1.perTask[t.code]);
                 continue;                                    // lanjut ke task berikutnya
               }
               if (hasil && hasil.cancelled) { st2.s1.status = 'batal'; break; }
