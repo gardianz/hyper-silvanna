@@ -1881,6 +1881,52 @@ class SilvanaClient {
       belowMinValue: !!r.belowMinValue,
     };
   }
+  // GET mentah ke app.silvana.one dengan header/cookie yang sama — dipakai buat
+  // menjelajah endpoint earn-hub yang belum dibungkus metode sendiri.
+  async rawGet(path_, referer, extraHdr) {
+    const r = await request('GET', `${APP_BASE}${path_}`, this._opts({ headers: this._hdr({ 'Referer': APP_BASE + (referer || '/earn-hub'), ...(extraHdr || {}) }) }));
+    return { status: r.status, text: r.text, json: r.json };
+  }
+  /**
+   * Status konversi poin → stablecoin (halaman /earn-hub/claim).
+   *   GET /api/earn-hub/points/conversion
+   *     → {enabled, stage:"EARLY_BIRD", tokens:["USD"], pointsPerUsd:500,
+   *        minPoints:1000, totalPoints, claimablePoints}
+   * `claimablePoints` BEDA dari totalPoints: di tahap Early Bird cuma poin yang
+   * dikumpulkan sebelum tanggal batas yang bisa dikonversi, jadi akun dengan 33.570
+   * poin bisa punya 0 yang klaimabel. Jangan pakai totalPoints buat memutuskan.
+   */
+  async pointsConversion() {
+    const r = await this.rawGet('/api/earn-hub/points/conversion', '/earn-hub/claim');
+    if (r.status === 401) { const e = new Error('conversion 401'); e.unauthorized = true; throw e; }
+    if (r.status !== 200) throw new Error(`conversion status=${r.status}`);
+    return r.json;
+  }
+  /**
+   * Tukar poin jadi stablecoin. POST /api/earn-hub/points/conversion {partyId, points}
+   * Terverifikasi lewat probe aman (points 0 / akun tanpa poin klaimabel):
+   *   {}                     → 400 partyId "must not be blank", points "must not be null"
+   *   {partyId, points:0}    → 400 "points must be a positive number with at most 2 decimals"
+   *   {partyId, points:1000} → 400 "Not enough claimable points: requested 1000, claimable 0"
+   * Servernya sendiri yang memvalidasi pagu, jadi tidak mungkin over-claim dari sini.
+   * Token dikreditkan ke wallet partyId yang dikirim — untuk akun Walley itu party
+   * Walley-nya, bukan party Supanova.
+   */
+  async convertPoints(partyId, points) {
+    const r = await this.rawPost('/api/earn-hub/points/conversion', { partyId, points });
+    if (r.status >= 200 && r.status < 300) return r.json || { ok: true };
+    const pesan = (r.json && (r.json.message || r.json.error)) || String(r.text || '').slice(0, 200);
+    const e = new Error(pesan || `conversion status=${r.status}`);
+    e.status = r.status;
+    throw e;
+  }
+  async rawPost(path_, body, referer) {
+    const r = await request('POST', `${APP_BASE}${path_}`, this._opts({
+      headers: this._hdr({ 'Content-Type': 'application/json', 'Referer': APP_BASE + (referer || '/earn-hub/claim') }),
+      body: body == null ? '' : JSON.stringify(body),
+    }));
+    return { status: r.status, text: r.text, json: r.json };
+  }
   async earnStats() {
     // Earn-hub stats: { displayName, totalPoints, activityCount, totalVolume, achievements }
     const r = await request('GET', `${APP_BASE}/api/earn-hub/stats`, this._opts({ headers: this._hdr({ 'Referer': APP_BASE + '/earn-hub' }) }));
@@ -7541,7 +7587,14 @@ function renderBalanceTable(states, intervalMin, okCount, logBuf) {
   out.push(endl());
   process.stdout.write(out.join('\n') + '\n');
 }
-async function runBalanceMonitor() {
+// `pilihWallet`: 'supa' | 'walley' | 'both'. Penting bukan cuma soal tampilan —
+// membaca sisi Supanova memanggil ensurePrivyToken, yang kalau sesinya mati berujung
+// minta OTP. Wallet Walley tidak butuh itu sama sekali (kunci lokal), jadi memilih
+// 'walley' berarti cek saldo bisa jalan tanpa OTP sekali pun.
+async function runBalanceMonitor(pilihWallet) {
+  const mode = pilihWallet || 'both';
+  const pakaiSupa = mode !== 'walley';
+  const pakaiWalley = mode !== 'supa';
   const states = makeStates();
   const intervalMin = Math.max(1, Number((CONFIG.dashboard || {}).balanceRefreshMin) || 1);
   const balLog = [];
@@ -7553,15 +7606,18 @@ async function runBalanceMonitor() {
     await mapLimit(states, ACCT_CONCURRENCY, async (s) => {
       try {
         const proxy = pickProxy(s.privyEmail || s.email);
-        const token = await ensurePrivyToken(s);
-        // Ambil KEDUA wallet, jangan cuma yg aktif — kalau nggak, akun yg udah pindah
-        // ke Walley kelihatan nol padahal dananya masih di party Supanova.
-        const bs = await supaBalances(token, proxy).catch(() => null);
-        s._balSupa = (bs && bs.tokens) || null;
-        s._pidSupa = (acctSession(s.email) || {}).partyId || null;
+        s._balSupa = null; s._pidSupa = null;
+        if (pakaiSupa) {
+          // Baris ini yang bisa memicu OTP kalau sesi Privy mati — makanya dilewati
+          // sama sekali waktu user cuma mau lihat wallet Walley.
+          const token = await ensurePrivyToken(s);
+          const bs = await supaBalances(token, proxy).catch(() => null);
+          s._balSupa = (bs && bs.tokens) || null;
+          s._pidSupa = (acctSession(s.email) || {}).partyId || null;
+        }
         s._balWalley = null; s._pidWalley = null;
         const wsel = (acctSession(s.email) || {}).wallet;
-        if (wsel && wsel.partyId) {
+        if (pakaiWalley && wsel && wsel.partyId) {
           const w = loadWalleyWallets().find(x => x.party_id === wsel.partyId || x.party_hint === wsel.partyHint);
           if (w) {
             s._pidWalley = w.party_id;
@@ -7569,7 +7625,7 @@ async function runBalanceMonitor() {
             s._balWalley = (bw && bw.tokens) || null;
           }
         }
-        s.balances = s._balSupa || [];
+        s.balances = s._balSupa || s._balWalley || [];
         s._balErr = (!s._balSupa && !s._balWalley) ? 'gagal baca saldo' : null;
       } catch (e) { s._balErr = ((e && e.message) || String(e)).slice(0, 60); s.balances = s.balances || []; }
     });
@@ -9012,10 +9068,11 @@ Usage:
       const MENU = [
         ['s', 'swap 1x (RFQ)', 'swap sekali: pilih token asal → tujuan, pilih akun'],
         ['1', 'strategi 1', 'selesaiin task harian berurutan, balik ke token hub'],
-        ['2', 'check balance', 'tabel semua token yang dipegang + total, auto-refresh'],
+        ['2', 'check balance', 'pilih wallet (Supanova/Walley) lalu tabel saldo, auto-refresh'],
         ['3', 'run (OTP urut)', 'login akun 1-per-1 lalu run USDCx'],
         ['4', 'change wallet', 'ganti wallet supa 1 akun'],
         ['5', 'maintenance', 'cleanup DvpProposal stale / reset season'],
+        ['r', 'redeem poin', 'tukar poin earn-hub jadi USD stablecoin (500 poin = $1)'],
         ['p', 'pulangkan', 'sapu HECTO/EDELx sisa strategi balik ke hub (cETH)'],
         ['6', 'swap back', 'dump token (USDCx/cETH/EDELx) → CC, SEMUA akun'],
         ['7', 'EDELx manual', 'CC→EDELx multi-akun / dump EDELx→CC 1 akun'],
@@ -9256,6 +9313,100 @@ Usage:
         }
         batalKey.stop();
         process.stdout.write('\n' + paint(`selesai — ${ok} sukses, ${gagal} gagal`, gagal ? COLOR.yellow : COLOR.green) + '\n');
+        continue;
+      }
+
+      if (ans === 'r') {
+        // Redeem poin earn-hub → USD stablecoin.
+        //   GET  /api/earn-hub/points/conversion  → pagu & kurs
+        //   POST /api/earn-hub/points/conversion {partyId, points}
+        // claimablePoints BEDA dari totalPoints: di tahap Early Bird cuma poin yang
+        // dikumpulkan sebelum tanggal batas yang bisa ditukar, jadi akun dengan 33.570
+        // poin bisa punya 0 yang klaimabel. Keputusan SELALU pakai claimablePoints.
+        process.stdout.write('\n' + paint('Redeem poin — baca pagu tiap akun…', COLOR.bold + COLOR.cyan) + '\n');
+        const statesR = makeStates();
+        const barisR = [];
+        setOtpInteractive(false);
+        await mapLimit(statesR.map((_, i) => i), Math.max(1, Number((CONFIG.swap || {}).loginConcurrency) || 5), async (i) => {
+          const a2 = ACCOUNTS[i];
+          try {
+            const c2 = await buildSwapClients(statesR[i]);
+            const k = await c2.sv.pointsConversion();
+            barisR.push({ i, tag: a2.label || a2.email, k, sv: c2.sv, partyId: c2.partyId, kind: c2.walletKind });
+          } catch (e) { barisR.push({ i, tag: a2.label || a2.email, err: ((e && e.message) || String(e)).slice(0, 50) }); }
+        });
+        setOtpInteractive(true);
+        barisR.sort((x, y) => x.i - y.i);
+
+        const info0 = (barisR.find(b2 => b2.k) || {}).k;
+        if (info0) {
+          process.stdout.write(paint(`  tahap ${info0.stage} · kurs ${info0.pointsPerUsd} poin = $1 · minimum ${info0.minPoints} poin · token ${(info0.tokens || []).join('/')}`, COLOR.gray) + '\n');
+        }
+        process.stdout.write('\n');
+        for (const b2 of barisR) {
+          if (b2.err) { process.stdout.write(`  ${b2.tag.padEnd(20)} ${paint('gagal: ' + b2.err, COLOR.red)}\n`); continue; }
+          const k = b2.k;
+          const usd = k.claimablePoints > 0 ? (k.claimablePoints / (k.pointsPerUsd || 500)) : 0;
+          const bisa = k.enabled && k.claimablePoints >= (k.minPoints || 0) && k.claimablePoints > 0;
+          process.stdout.write(`  ${b2.tag.padEnd(20)} total ${String(k.totalPoints).padStart(7)} · klaimabel `
+            + paint(String(k.claimablePoints).padStart(7), bisa ? COLOR.green : COLOR.gray)
+            + (bisa ? paint(`  ≈ $${usd.toFixed(2)}`, COLOR.green) : paint(`  (min ${k.minPoints})`, COLOR.gray)) + '\n');
+        }
+
+        const siapR = barisR.filter(b2 => b2.k && b2.k.enabled && b2.k.claimablePoints > 0 && b2.k.claimablePoints >= (b2.k.minPoints || 0));
+        if (!siapR.length) {
+          process.stdout.write('\n' + paint('gak ada akun yang poinnya bisa ditukar sekarang.', COLOR.yellow) + '\n');
+          process.stdout.write(paint('di tahap Early Bird cuma poin yang dikumpulkan sebelum tanggal batas yang bisa dikonversi.\n', COLOR.gray));
+          continue;
+        }
+
+        const pilihR = await pickList({
+          title: 'Akun yang mau ditukar poinnya:',
+          items: siapR.map(b2 => ({
+            label: b2.tag.padEnd(20),
+            detail: paint(`${b2.k.claimablePoints} poin ≈ $${(b2.k.claimablePoints / (b2.k.pointsPerUsd || 500)).toFixed(2)}`, COLOR.green),
+          })),
+          multi: true,
+        });
+        if (!pilihR.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
+
+        const rawR = (await prompt(paint('\njumlah poin per akun (angka, atau ketik max): ', COLOR.bold))).trim().toLowerCase();
+        if (!rawR) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
+        const pakaiMax = /^(max|semua)$/.test(rawR);
+        const nR = pakaiMax ? null : Number(rawR);
+        if (!pakaiMax && (!Number.isFinite(nR) || nR <= 0)) { process.stdout.write(paint('angka gak valid — dibatalin.\n', COLOR.red)); continue; }
+
+        const rencana = pilihR.map(ix => {
+          const b2 = siapR[ix];
+          const poin = pakaiMax ? b2.k.claimablePoints : Math.min(nR, b2.k.claimablePoints);
+          return { b: b2, poin, usd: poin / (b2.k.pointsPerUsd || 500) };
+        }).filter(x => x.poin >= (x.b.k.minPoints || 0) && x.poin > 0);
+        if (!rencana.length) { process.stdout.write(paint(`semua di bawah minimum ${info0 ? info0.minPoints : '?'} poin — dibatalin.\n`, COLOR.yellow)); continue; }
+
+        process.stdout.write('\n' + paint('Rencana tukar:', COLOR.bold) + '\n');
+        for (const x of rencana) {
+          process.stdout.write(`  ${x.b.tag.padEnd(20)} ${String(x.poin).padStart(7)} poin → $${x.usd.toFixed(2)}  ${paint('→ ' + String(x.b.partyId).slice(0, 26) + '…', COLOR.gray)}\n`);
+        }
+        const totPoin = rencana.reduce((a2, x) => a2 + x.poin, 0);
+        const totUsd = rencana.reduce((a2, x) => a2 + x.usd, 0);
+        process.stdout.write(paint(`  TOTAL ${totPoin} poin → $${totUsd.toFixed(2)}\n`, COLOR.bold));
+        process.stdout.write(paint('konversi TIDAK BISA dibatalkan; token dikirim ke wallet party di atas.\n', COLOR.yellow));
+
+        const confR = (await prompt(paint('\nKetik "tukar" buat jalan, Enter batal: ', COLOR.bold + COLOR.yellow))).trim().toLowerCase();
+        if (confR !== 'tukar') { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
+
+        let okR = 0, gagalR = 0;
+        for (const x of rencana) {
+          try {
+            const res = await x.b.sv.convertPoints(x.b.partyId, x.poin);
+            okR++;
+            process.stdout.write(paint(`  ✓ ${x.b.tag} — ${x.poin} poin → $${x.usd.toFixed(2)} ${JSON.stringify(res).slice(0, 80)}`, COLOR.green) + '\n');
+          } catch (e) {
+            gagalR++;
+            process.stdout.write(paint(`  ✗ ${x.b.tag} — ${(e && e.message) || e}`, COLOR.red) + '\n');
+          }
+        }
+        process.stdout.write('\n' + paint(`selesai — ${okR} sukses, ${gagalR} gagal`, gagalR ? COLOR.yellow : COLOR.green) + '\n');
         continue;
       }
 
@@ -10221,7 +10372,25 @@ Usage:
       if (ans === '2') {
         // Cek balance: tabel + grand total, AUTO-REFRESH tiap N menit (default 15,
         // config.dashboard.balanceRefreshMin). Loop terus — Ctrl+C buat berhenti.
-        await runBalanceMonitor(); // infinite loop; ga balik
+        //
+        // Ditanya dulu wallet mana: bukan cuma soal tampilan. Membaca sisi Supanova
+        // memanggil ensurePrivyToken, dan kalau sesinya mati itu berujung minta OTP.
+        // Wallet Walley sama sekali tidak butuh OTP (kuncinya lokal, cuma perlu seed
+        // + party hint di walley_wallets.jsonl), jadi memilih Walley berarti cek saldo
+        // bisa jalan tanpa satu pun OTP.
+        const jmlWalley = loadWalleyWallets().length;
+        const pilihW = await pickList({
+          title: 'Wallet apa yang mau dicek?',
+          items: [
+            { label: 'Keduanya      ', detail: paint('Supanova + Walley — paling lengkap, tapi bisa minta OTP kalau sesi Supanova mati', COLOR.gray) },
+            { label: 'Walley saja   ', detail: paint(`${jmlWalley} wallet di walley_wallets.jsonl · TANPA OTP (kunci lokal)`, jmlWalley ? COLOR.green : COLOR.gray), disabled: !jmlWalley, note: paint('[walley_wallets.jsonl kosong]', COLOR.yellow) },
+            { label: 'Supanova saja ', detail: paint('perlu OTP kalau sesi Privy sudah mati', COLOR.gray) },
+          ],
+        });
+        if (!pilihW.length) { process.stdout.write(paint('dibatalin.\n', COLOR.gray)); continue; }
+        const modeW = ['both', 'walley', 'supa'][pilihW[0]];
+        if (modeW === 'walley') setOtpInteractive(false);   // jaminan: gak akan ada prompt OTP
+        await runBalanceMonitor(modeW); // infinite loop; ga balik
         return;
       }
       if (ans === '3') {

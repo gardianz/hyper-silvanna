@@ -40,7 +40,8 @@ Menu interaktif (huruf, bukan angka berurutan — `0` dan `1` lama sudah dihapus
 | --- | --- | --- |
 | `s` swap 1x (RFQ) | `1` strategi 1 | `2` check balance |
 | `3` run (OTP urut) | `4` change wallet | `5` maintenance |
-| `p` pulangkan | `6` swap back | `7` EDELx manual |
+| `r` redeem poin | `p` pulangkan | `6` swap back |
+| `7` EDELx manual | | |
 | `8` ping-pong CLOB | `8r` ping-pong RFQ | `9` bulk back |
 | `t` transfer | `w` wallet (wallet aktif · token fee · batas fee · batas spread) | |
 
@@ -606,6 +607,46 @@ menyimpulkan bot tidak membayar fee.
 
 Kolom `FEE/SN` yang besar (ratusan sampai ribuan CC) itu warisan sesi ping-pong/day-trader
 sebelumnya, bukan biaya strategi 1.
+
+### Redeem poin (menu `r`) — endpointnya tidak ketemu lewat bundle
+
+Halaman `/earn-hub/claim` **tidak punya server action sendiri**: menyisir seluruh chunk yang
+dimuatnya (juga lewat payload RSC) hanya memunculkan enam action generik — `updateParty`,
+`autoRecoverParty`, `getDsoInfoAction`, `getTransferFactoryContextAction`,
+`prepareFeeTransferCommandAction`, `getMarkets` — tidak satu pun menyebut claim/convert.
+Payload RSC-nya juga cuma cangkang tanpa data. Jalan yang berhasil: **capture browser**
+(`tools/inspect.js 0 https://app.silvana.one/earn-hub/claim`), yang langsung memperlihatkan
+satu-satunya panggilan yang relevan:
+
+```
+GET  /api/earn-hub/points/conversion
+  → {enabled, stage:"EARLY_BIRD", tokens:["USD"], pointsPerUsd:500,
+     minPoints:1000, totalPoints, claimablePoints}
+POST /api/earn-hub/points/conversion  {partyId, points}
+```
+
+Bentuk POST-nya dipastikan lewat probe yang tidak mungkin mengonversi apa pun (akun dengan
+`claimablePoints: 0`, dan `points: 0`):
+
+| body | balasan |
+| --- | --- |
+| `{}` | 400 `partyId "must not be blank"`, `points "must not be null"` |
+| `{partyId, points: 0}` | 400 `points must be a positive number with at most 2 decimals` |
+| `{partyId, points: 1000}` | 400 `Not enough claimable points: requested 1000, claimable 0` |
+
+**`claimablePoints` bukan `totalPoints`.** Di tahap Early Bird hanya poin yang dikumpulkan
+sebelum tanggal batas yang bisa dikonversi — terukur: akun dengan 33.570 poin punya **0** yang
+klaimabel. Memutuskan dari `totalPoints` akan menampilkan "bisa ditukar" untuk akun yang
+pasti ditolak server. Pagunya divalidasi server, jadi over-claim tidak mungkin dari sisi bot.
+`partyId` yang dikirim menentukan wallet penerima — untuk akun Walley itu party Walley-nya.
+
+### Cek balance menanyakan wallet lebih dulu — ini soal OTP, bukan tampilan
+
+Membaca sisi Supanova memanggil `ensurePrivyToken`, dan kalau sesinya mati itu berujung
+prompt OTP. Walley tidak butuh itu sama sekali (kunci lokal, cukup seed + party hint di
+`walley_wallets.jsonl`). Karena itu menu `2` menanyakan Supanova / Walley / keduanya, dan
+memilih Walley melewati jalur Privy seluruhnya plus memanggil `setOtpInteractive(false)`
+sebagai jaminan tidak ada prompt yang bisa muncul.
 
 ### Akun Walley tidak butuh Privy sama sekali
 
