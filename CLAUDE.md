@@ -634,6 +634,16 @@ Bentuk POST-nya dipastikan lewat probe yang tidak mungkin mengonversi apa pun (a
 | `{partyId, points: 0}` | 400 `points must be a positive number with at most 2 decimals` |
 | `{partyId, points: 1000}` | 400 `Not enough claimable points: requested 1000, claimable 0` |
 
+**Sukses POST bukan berarti cair.** Riwayatnya di `GET /api/earn-hub/points/conversions`
+→ `{items:[{id, points, usdAmount, token, partyId, walletName, status, createdAt,
+processedAt, payoutUpdateId}]}`, dan siklusnya **SUBMITTED → PROCESSED**. `SUBMITTED`
+berarti poin **sudah dipotong** tapi token belum dikirim; yang menandakan benar-benar cair
+adalah `processedAt` + `payoutUpdateId` terisi. Terukur: klaim 12/09 01:10 baru diproses
+12/09 10:09 — **~9 jam**. Jadi memeriksa keberhasilan lewat balasan POST saja menyesatkan.
+
+Payoutnya masuk sebagai **TUSDT** walau labelnya `token: "USD"` — terverifikasi cocok sampai
+angka terakhir: payout 114.5 / 59.7 / 121.7 vs saldo TUSDT 114.63 / 59.70 / 121.81.
+
 **`claimablePoints` bukan `totalPoints`.** Di tahap Early Bird hanya poin yang dikumpulkan
 sebelum tanggal batas yang bisa dikonversi — terukur: akun dengan 33.570 poin punya **0** yang
 klaimabel. Memutuskan dari `totalPoints` akan menampilkan "bisa ditukar" untuk akun yang

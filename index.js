@@ -1920,6 +1920,22 @@ class SilvanaClient {
     e.status = r.status;
     throw e;
   }
+  /**
+   * Riwayat konversi poin. GET /api/earn-hub/points/conversions
+   *   → {items:[{id, points, pointsPerUsd, usdAmount, token, partyId, walletName,
+   *              status, createdAt, processedAt, payoutUpdateId}], totalElements}
+   * Siklus statusnya SUBMITTED → PROCESSED. SUBMITTED berarti poin SUDAH dipotong
+   * tapi tokennya BELUM cair; yang menandakan cair itu `processedAt` + `payoutUpdateId`
+   * keisi. Terukur: klaim 12/09 01:10 baru diproses 12/09 10:09 — sekitar 9 jam.
+   * Nilainya masuk sebagai TUSDT walau labelnya "USD" — terverifikasi cocok sampai
+   * angka terakhir: payout 114.5 / 59.7 / 121.7 vs saldo TUSDT 114.63 / 59.70 / 121.81.
+   */
+  async pointsConversions() {
+    const r = await this.rawGet('/api/earn-hub/points/conversions', '/earn-hub/claim');
+    if (r.status !== 200) throw new Error(`conversions status=${r.status}`);
+    const j = r.json || (() => { try { return JSON.parse(r.text); } catch (_) { return null; } })();
+    return (j && j.items) || [];
+  }
   async rawPost(path_, body, referer) {
     const r = await request('POST', `${APP_BASE}${path_}`, this._opts({
       headers: this._hdr({ 'Content-Type': 'application/json', 'Referer': APP_BASE + (referer || '/earn-hub/claim') }),
@@ -9351,6 +9367,28 @@ Usage:
           process.stdout.write(`  ${b2.tag.padEnd(20)} total ${String(k.totalPoints).padStart(7)} · klaimabel `
             + paint(String(k.claimablePoints).padStart(7), bisa ? COLOR.green : COLOR.gray)
             + (bisa ? paint(`  ≈ $${usd.toFixed(2)}`, COLOR.green) : paint(`  (min ${k.minPoints})`, COLOR.gray)) + '\n');
+        }
+
+        // Riwayat + status. SUBMITTED = poin sudah dipotong tapi token BELUM cair;
+        // yang menandakan cair cuma processedAt/payoutUpdateId. Tanpa ini user tidak
+        // punya cara tahu klaimnya benar-benar dibayar atau masih antre.
+        process.stdout.write('\n' + paint('Riwayat konversi:', COLOR.bold) + '\n');
+        let adaPending = 0;
+        for (const b2 of barisR) {
+          if (!b2.sv) continue;
+          const riw = await b2.sv.pointsConversions().catch(() => []);
+          if (!riw.length) continue;
+          for (const it of riw) {
+            const cair = it.status === 'PROCESSED' && it.processedAt;
+            if (!cair) adaPending++;
+            const umur = it.createdAt ? Math.round((Date.now() - new Date(it.createdAt).getTime()) / 3600000) : null;
+            process.stdout.write(`  ${b2.tag.padEnd(20)} #${String(it.id).padEnd(6)} ${String(it.points).padStart(6)}p → $${String(it.usdAmount).padEnd(7)} `
+              + paint(cair ? 'CAIR' : (it.status || '?'), cair ? COLOR.green : COLOR.yellow)
+              + paint(cair ? `  ${String(it.processedAt).slice(0, 16).replace('T', ' ')}` : (umur != null ? `  (${umur} jam lalu, belum cair)` : ''), COLOR.gray) + '\n');
+          }
+        }
+        if (adaPending) {
+          process.stdout.write(paint(`  ${adaPending} klaim masih antre — poin sudah dipotong, token menyusul. Terukur sekali: 9 jam dari SUBMITTED ke PROCESSED.\n`, COLOR.gray));
         }
 
         const siapR = barisR.filter(b2 => b2.k && b2.k.enabled && b2.k.claimablePoints > 0 && b2.k.claimablePoints >= (b2.k.minPoints || 0));
